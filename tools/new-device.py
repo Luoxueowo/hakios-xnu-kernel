@@ -40,7 +40,7 @@ REFERENCE_DTB = os.path.join(ROOT, "devices", REFERENCE, "prebuilt", "device-tre
 
 # what is the phone's own, and the files whose head says where their numbers came from
 CHECKLIST = [
-    ("UEFI", "the firmware that starts the loader: devices/%s/uefi/ is a port of Mu-Silicium; the vendor's drivers are "
+    ("UEFI", "the firmware that starts the loader: devices/%s/uefi/ is a port of mu_aloha_platforms; the vendor's drivers are "
              "extracted from your own phone (uefi/README.md)" % REFERENCE),
     ("Display, buttons, touch", "drivers/input/hakios.input.c, hakios.buttons.c, hakios.goodix.c (the reference phone's "
                                 "controller; another phone has another)"),

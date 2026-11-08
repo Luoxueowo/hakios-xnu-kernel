@@ -5,7 +5,7 @@
 # to list the binaries.
 * text=auto eol=lf
 
-# A patch is not converted at all: the Mu-Silicium files it patches have CRLF line endings upstream, and
-# the context lines of its hunks carry them (BootManager.c, BootManagerLib.inf). Turning them into LF
-# would make the patch fail to apply.
+# A patch is not converted at all: the mu_aloha_platforms files it patches have CRLF line endings upstream
+# (MsPlatform.c, PlatformBootManagerLib.inf), and the context lines of its hunks carry them. Turning them
+# into LF would make the patch fail to apply.
 *.patch -text

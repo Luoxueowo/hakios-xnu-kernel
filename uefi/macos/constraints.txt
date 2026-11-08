@@ -1,0 +1,4 @@
+# What a Mac needs that Linux gets from apt: cryptography, which edk2-pytool-library requires, is built from
+# source (Rust, OpenSSL headers) from version 43 on when there is no macOS x86_64 wheel; 42.0.8 is the last one
+# with one, and it is what the UEFI build uses it for (nothing in the firmware is signed here).
+cryptography==42.0.8

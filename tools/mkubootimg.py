@@ -4,7 +4,7 @@ HakiOS's U-Boot as an Android boot image for `fastboot boot`: started from RAM b
 nothing flashed. U-Boot takes the HakiOS loader and its payload from the image's ramdisk and starts them from memory
 (the hakios command, uefi/u-boot/files/cmd/hakios.c); the boot partition is never read or written.
 
-  kernel  = gzip(u-boot.bin) + the phone's Android device tree   (what ABL expects, as for Silicium's image)
+  kernel  = gzip(u-boot.bin) + the phone's Android device tree   (what ABL expects, as for the UEFI's image)
   ramdisk = an "HKUB" container: loader.efi and an XNUP payload  (or nothing: U-Boot then waits for them over fastboot)
 
 The same container on its own (-c) is what the host sends to a U-Boot that is already running:

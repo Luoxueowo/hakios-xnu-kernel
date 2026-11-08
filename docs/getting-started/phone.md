@@ -17,13 +17,13 @@ that you create yourself, and nowhere else. [What is written, exactly](../concep
 - the images of [Darwin in QEMU](qemu.md#darwin-in-qemu) (`userland/system.apfs`), and `make loader` done once;
 - the phone's own firmware, pulled from it (below). It is the vendor's and is never in the repositories.
 - the firmware that starts the loader: HakiOS's U-Boot (`make u-boot`, open source only: [U-Boot](../u-boot.md)), or
-  Silicium's UEFI built with your phone's own vendor drivers (`uefi/README.md`). `xl` takes Silicium's when it is built, else
+  the UEFI of mu_aloha_platforms built with your phone's own vendor drivers (`uefi/README.md`). `xl` takes it when it is built, else
   U-Boot's (`XL_FIRMWARE=` to choose). Either is started from RAM.
 
 ## Step by step
 
 ```sh
-tools/hakios-device.py sync         # hakios-sm7325 (with its SoC layer) and hakios-uefi into devices/ and uefi/
+tools/hakios-device.py sync         # hakios-sm7325 (with its SoC layer) into devices/; the UEFI port is uefi/ here
 devices/redwood/pull-firmware.sh    # Android running, on adb: GPU, Wi-Fi, audio, haptics, modem, cameras -> fw-*/
 make redwood_defconfig              # the phone's configuration: the common kernel, the SC7280's, the phone's own
 make config                         # what it is: the drivers built in, the kernel's arguments, the firmware it wants

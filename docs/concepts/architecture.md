@@ -8,7 +8,7 @@ yours (the user space you lay out).
 
 ```
  Android's fastboot        HakiOS UEFI              xnuloader              XNU + HakiOS             launchd       user space
- (the phone's own)   -->   (Mu-Silicium with   -->  (loader.efi,     -->   (xnu/, drivers/)   -->            -->   (yours: Darwin userland 16.5,
+ (the phone's own)   -->   (mu_aloha with      -->  (loader.efi,     -->   (xnu/, drivers/)   -->            -->   (yours: Darwin userland 16.5,
   fastboot boot             HakiOS's changes,        xnuloader/)            drivers started                       or userland/hello)
                             uefi/ + the device's)    reads the payload      by boot-arguments
 ```
@@ -16,7 +16,7 @@ yours (the user space you lay out).
 | Step | What happens | Where it is |
 |---|---|---|
 | 1. into RAM | Android's fastboot receives a boot image and runs it; nothing is flashed | `./xl enter` |
-| 2. UEFI | HakiOS's UEFI (Mu-Silicium with HakiOS's changes and banner, and the phone's platform) starts on the SoC, shows the HakiOS logo, offers the framebuffer and storage, and starts the loader from the image | `uefi/`, `devices/<name>/uefi/` |
+| 2. UEFI | HakiOS's UEFI (mu_aloha_platforms with HakiOS's changes and logo, and the phone's platform) starts on the SoC, shows the HakiOS logo, offers the framebuffer and storage, and starts the loader from the image | `uefi/`, `devices/<name>/uefi/` |
 | 3. the loader | `xnuloader` reads the payload (the kernel, the command line, `kernel.ver`), lays out memory and the device tree the kernel expects, keeps a service for the storage, starts the kernel; at the end of a run it takes control back | `xnuloader/` |
 | 4. the kernel | XNU with this port: Apple's patched files (`xnu/hakios.patch`), new ones (`xnu/files/`), the drivers (`drivers/`) | [Building](../getting-started/building.md) |
 | 5. the drivers | each one does nothing until its boot-argument asks; those the configuration left out are not in the kernel at all | [Drivers in the configuration](../drivers-config.md) |
@@ -48,7 +48,7 @@ device's. A device's defconfig is three lines: the common kernel, its SoC's frag
 | common | the kernel port, every driver, the loader, user space, the tools, the documentation | this repository |
 | SoC | the SoC's facts (cores, addresses that are the family's), its drivers; carried by each device that has the SoC | `devices/redwood/soc` |
 | device | its defconfig, its status, its UEFI platform, its firmware script, drivers of its own | `devices/redwood` |
-| UEFI | Mu-Silicium with HakiOS's boot path, banner and name | `uefi` ([its README](https://github.com/oosexgang/hakios-uefi/blob/main/README.md)) |
+| UEFI | mu_aloha_platforms with HakiOS's boot path, logo and name | `uefi` ([its README](../../uefi/README.md)) |
 
 ## What is written to the phone
 

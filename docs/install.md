@@ -17,7 +17,7 @@ CI fails if another writer appears.
 Android stays, HakiOS sits beside it and is chosen at boot, and going back is a slot switch. Two things have to live
 on the phone:
 
-1. **The boot chain.** The boot image `./xl enter` builds (`mkxnuimg.py`: Project Silicium's UEFI, the shim and a
+1. **The boot chain.** The boot image `./xl enter` builds (`mkxnuimg.py`: the UEFI of mu_aloha_platforms, the shim and a
    payload) already starts with no host: the shim puts the payload in memory and the loader runs it, in one-shot mode
    when the payload carries no `usb` entry. Installed, that same kind of image would sit in the boot partition of the
    **inactive** slot.
@@ -55,7 +55,7 @@ Each one is how the project already treats writes (`darwin-write.py`, the loader
 | Read-only preflight | exists (`make doctor`): slots, `darwin`, firmware, root, bootloader as reported |
 | **Writing the boot image to a slot and switching to it** | **not done, not tried** |
 | **Booting the flash recipe's root from `darwin`** | **not verified** (the arguments it needs are not confirmed) |
-| **Project Silicium's Boot Manager behaving the same from a boot slot** | **unknown** |
+| **The UEFI's boot manager behaving the same from a boot slot** | **unknown** |
 | **Verified boot (`vbmeta`) for a modified boot image** | **unknown** |
 | An installer that chains the steps under the rules above | not written |
 

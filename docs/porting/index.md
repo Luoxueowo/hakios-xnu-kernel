@@ -9,7 +9,7 @@ configuration, then a boot with nothing of the phone's, then the drivers one at 
 
 ## What you need
 
-- a phone with an ARM64 Qualcomm SoC, its boot loader unlocked; a UEFI port for it (a Mu-Silicium port, as `devices/redwood/uefi` is, or your own);
+- a phone with an ARM64 Qualcomm SoC, its boot loader unlocked; a UEFI port for it (a mu_aloha_platforms port, as `devices/<name>/uefi` is, or your own);
 - the phone's own device tree (`adb shell` with root, or from its boot image) and its Android running, for the firmware;
 - a machine that builds the kernel ([Building from source](../getting-started/building.md)).
 

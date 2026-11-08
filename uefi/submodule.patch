@@ -1,0 +1,54 @@
+diff --git a/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c b/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
+index 170e2e2..8ab77b5 100644
+--- a/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
++++ b/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
+@@ -22,6 +22,8 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
+ #include <Library/UefiBootServicesTableLib.h>
+ #include <Library/UefiRuntimeServicesTableLib.h>
+ 
++#include "XnuLoader.h"
++
+ static BOOLEAN  mSecViolation = FALSE;
+ 
+ /**
+@@ -187,5 +189,10 @@ PlatformBootManagerUnableToBoot (
+   VOID
+   )
+ {
++  //
++  // Nothing else to boot: hand over to the XNU loader (does not return).
++  //
++  XnuLoaderMain ();
++
+   DeviceBootManagerUnableToBoot ();
+ }
+diff --git a/MsCorePkg/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf b/MsCorePkg/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
+index e8b4faf..a9ed128 100644
+--- a/MsCorePkg/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
++++ b/MsCorePkg/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
+@@ -28,6 +28,7 @@ CONSTRUCTOR                    = PlatformBootManagerEntry
+   BdsPlatform.h
+   MemoryTest.c
+   MsPlatform.c
++  XnuLoader.c
+ 
+ [Packages]
+   MdePkg/MdePkg.dec
+@@ -47,6 +48,7 @@ CONSTRUCTOR                    = PlatformBootManagerEntry
+   MemoryAllocationLib
+   PcdLib
+   PerformanceLib
++  PrintLib
+   UefiBootManagerLib
+   UefiBootServicesTableLib
+   UefiLib
+@@ -57,6 +59,9 @@ CONSTRUCTOR                    = PlatformBootManagerEntry
+   gEfiDxeSmmReadyToLockProtocolGuid   ## PRODUCES
+   gEfiGenericMemTestProtocolGuid      ## CONSUMES
+   gEfiAbsolutePointerProtocolGuid     ## CONSUMES
++  gEfiBlockIoProtocolGuid             ## CONSUMES
++  gEfiGraphicsOutputProtocolGuid      ## CONSUMES
++  gEfiPartitionInfoProtocolGuid       ## CONSUMES
+ 
+ [Guids]
+   gEfiCapsuleVendorGuid

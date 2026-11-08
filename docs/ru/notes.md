@@ -2316,13 +2316,13 @@ Mesa в репозитории нет: `tools/mk-mesa.sh` один раз ска
 
 ### UEFI для телефона
 
-См. `uefi/README.md` (порт Project Silicium на redwood). Для запуска пересобирать не нужно: `mkxnuimg.py` берёт
+См. `uefi/README.md` (порт mu_aloha_platforms на polaris). Для запуска пересобирать не нужно: `mkxnuimg.py` берёт
 готовое из `devices/redwood/prebuilt`.
 
 ## Как это устроено
 
 ```
-fastboot boot ──► UEFI (Mu-Silicium, redwood) ──► xnuloader (EFI-приложение)
+fastboot boot ──► UEFI (mu_aloha_platforms, polaris) ──► xnuloader (EFI-приложение)
                                                     │  остаётся резидентным: USB-канал (протокол fastboot),
                                                     │  сторожевой таймер, приём журнала от ядра
                                                     ▼
@@ -3254,5 +3254,5 @@ Darwin, которого она ждёт, — это уже другое: соз
   уведомления об авторских правах (они в заголовках файлов ath11k и в `COPYRIGHT` из архива FreeBSD);
 - `xnu-deps/build/lzbitmap/libzbitmap.*` — libzbitmap (Corellium, GPL-2.0+ OR MIT);
   `xnu-deps/hostinc/mach-o/{loader,nlist,fat}.h` — заголовки из XNU (APSL 2.0).
-- `devices/redwood/uefi/files/Binaries/redwood` и `devices/redwood/prebuilt/SILICIUM_UEFI.fd` содержат драйверы UEFI из прошивки Xiaomi
-  (так же, как их распространяет Project Silicium для других устройств); `devices/redwood/prebuilt/mkbootimg.py` — AOSP, Apache-2.0.
+- `devices/redwood/uefi/files/Binaries/redwood` и `devices/redwood/prebuilt/UEFI.fd` содержат драйверы UEFI из прошивки Xiaomi
+  (так же, как их распространяет Project Aloha для других устройств); `devices/redwood/prebuilt/mkbootimg.py` — AOSP, Apache-2.0.

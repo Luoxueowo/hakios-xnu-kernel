@@ -18,7 +18,7 @@
 | [`hakios-metal/`](hakios-metal) | 通过内核的 GPU 驱动，在 Adreno 上实现 Metal 的命令模型 |
 | [hakios-sm7325](https://github.com/oosexgang/hakios-sm7325) | POCO X5 Pro 5G：defconfig、状态、UEFI 平台、固件脚本及其 SoC 层（Qualcomm SC7280 系列） |
 | [hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) | Infinix Hot 20（MediaTek Helio G85）：实验性移植，有自己的引导加载器。不在本仓库的清单中 |
-| [hakios-uefi](https://github.com/oosexgang/hakios-uefi) | 启动引导加载器的固件：带有 HakiOS 启动路径、横幅和名称的 Mu-Silicium，以及 HakiOS 的 U-Boot |
+| [uefi/](uefi/README.md) | 启动引导加载器的固件：带有 HakiOS 启动路径、标志和名称的 mu_aloha_platforms，以及 HakiOS 的 U-Boot |
 | [hackios-web](https://github.com/oosexgang/hackios-web) | 网站 |
 | [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) | 旧仓库：只为保留链接而存在的指向。用户空间现在在这里的 `userland/` |
 
@@ -44,4 +44,4 @@ hakios 是一个实验性项目，致力于把 darwin 带到 android 硬件上�
 
 @oodze — 创始人，@netusd — 推广 / ceo-dev，@wannqn — 开发，@hxfuxyyXD — 开发，Rhaenja Hun（杭润嘉）— 开发 / 赞助
 
-感谢 silicium 团队提供的源代码！
+感谢 Project Mu、Project Aloha（mu_aloha_platforms）团队提供的源代码！

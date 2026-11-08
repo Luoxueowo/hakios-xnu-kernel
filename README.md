@@ -25,7 +25,7 @@ Start with [Getting started](docs/getting-started/index.md), [On the phone](docs
 | [`hakios-metal/`](hakios-metal) | Metal's command model on the Adreno, through the kernel's GPU driver |
 | [hakios-sm7325](https://github.com/oosexgang/hakios-sm7325) | POCO X5 Pro 5G: its defconfig, status, UEFI platform, firmware script, and its SoC's layer (Qualcomm SC7280 family) |
 | [hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) | Infinix Hot 20 (MediaTek Helio G85): an experimental port with its own loader. Not in this repository's manifest |
-| [hakios-uefi](https://github.com/oosexgang/hakios-uefi) | the firmware that starts the loader: Mu-Silicium with HakiOS's boot path, banner and name, and HakiOS's U-Boot |
+| [uefi/](uefi/README.md) | the firmware that starts the loader: mu_aloha_platforms with HakiOS's boot path, logo and name, and HakiOS's U-Boot |
 | [hackios-web](https://github.com/oosexgang/hackios-web) | the website |
 | [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) | old: a pointer kept for its links. User space is `userland/` here |
 

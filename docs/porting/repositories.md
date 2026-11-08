@@ -7,7 +7,7 @@ that names them):
 hakios/                          common: the kernel port, every common driver, the loader, user space, the tools, the docs
 ├── devices/<name>/              a device, one repository: device.conf, configs/, drivers/, its UEFI platform, scripts
 │   └── soc/                     ... and its SoC family's layer: soc.conf, configs/<soc>.config, the SoC's drivers
-├── uefi/                        HakiOS's UEFI (Mu-Silicium with HakiOS's changes), one for every device
+├── uefi/                        HakiOS's UEFI (mu_aloha_platforms with HakiOS's changes), one for every device
 └── devices/manifest.conf        every device and the UEFI: kept in this tree, or a repository of its own at a revision
 ```
 

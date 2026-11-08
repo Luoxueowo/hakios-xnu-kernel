@@ -1,6 +1,6 @@
 # U-Boot
 
-HakiOS's loader can be started by **Das U-Boot** instead of Project Silicium's UEFI. The phone's own bootloader (ABL) starts
+HakiOS's loader can be started by **Das U-Boot** instead of the UEFI of mu_aloha_platforms. The phone's own bootloader (ABL) starts
 U-Boot from RAM with `fastboot boot`, U-Boot finds the loader and its payload **in memory** and starts the loader as a UEFI
 application. Nothing is flashed: not `boot`, not any other partition, and a reboot gives the phone back to Android.
 
@@ -9,9 +9,9 @@ The sections below say exactly what was run.
 
 ## Why
 
-| | Silicium (`mkxnuimg.py`) | U-Boot (`tools/mkubootimg.py`) |
+| | the UEFI (`mkxnuimg.py`) | U-Boot (`tools/mkubootimg.py`) |
 |---|---|---|
-| What it is made of | Mu-Silicium and the **phone vendor's own UEFI drivers**, which are not in the repositories: you extract them from your own phone first | open source only: U-Boot's Qualcomm support and the phone's device tree |
+| What it is made of | mu_aloha_platforms and the **phone vendor's own UEFI drivers**, which are not in the repositories: you extract them from your own phone first | open source only: U-Boot's Qualcomm support and the phone's device tree |
 | Where the loader comes from | the payload the boot shim copies to `0xF0000000` | the boot image's ramdisk, or U-Boot's own fastboot: the hakios command copies the payload to `0xF0000000` |
 | A new loader or payload | a new boot image and `fastboot boot` through ABL again | the same, or sent to the running U-Boot over USB (below), without going back through ABL |
 | `xl` (run, ramdisk, log, screenshot) | yes | yes: U-Boot provides the same USB protocol the loader uses under Qualcomm's UEFI |
@@ -25,14 +25,14 @@ ABL ──fastboot boot──> U-Boot (RAM) ──hakios load──> payload at 
 ```
 
 - **The boot image** (`tools/mkubootimg.py`): the kernel is `gzip(u-boot.bin)` with the phone's Android device tree appended,
-  exactly what ABL expects for Silicium's image (header version 1); the ramdisk is an `HKUB` container with the loader and a payload,
+  exactly what ABL expects for the UEFI's image (header version 1); the ramdisk is an `HKUB` container with the loader and a payload,
   or nothing.
 - **U-Boot's device tree** (`devices/redwood/u-boot/files/dts/upstream/src/arm64/qcom/sm7325-xiaomi-redwood.dts`): the panel's
   framebuffer at `0xE1000000` as ABL left it (the loader knows the phone by that address), the keys, USB as a device, UFS, and every
-  carve-out of the Android device tree and of Silicium's memory map. The size of RAM is not in it: ABL writes it into the device
+  carve-out of the Android device tree and of the UEFI's memory map. The size of RAM is not in it: ABL writes it into the device
   tree it hands over and U-Boot reads it from there.
 - **`0xF0000000`, 64 MiB** is reserved in that device tree (`hakios-payload`): nothing in U-Boot takes it, the hakios command
-  writes the payload there, and the loader's memory window stays clear of it, as under Silicium.
+  writes the payload there, and the loader's memory window stays clear of it, as under the UEFI.
 - **The hakios command** (`uefi/u-boot/files/cmd/hakios.c`):
 
   | | |
@@ -67,7 +67,7 @@ developer.arm.com; `CROSS_COMPILE=` to name another). The result is `u-boot/buil
 **With `xl`**, as always:
 
 ```sh
-XL_FIRMWARE=u-boot ./xl enter        # without XL_FIRMWARE: Silicium when its image is built, else U-Boot
+XL_FIRMWARE=u-boot ./xl enter        # without XL_FIRMWARE: the UEFI when its image is built, else U-Boot
 ./xl ramdisk userland/system.apfs
 ./xl run
 ```
@@ -147,7 +147,7 @@ Run on a POCO X5 Pro 5G (`redwood`, bootloader unlocked, Android on slot b), fro
 
 - ABL starts the boot image with `fastboot boot`; U-Boot comes up on the panel, takes the size of RAM from ABL's device tree and
   brings UFS up (SK hynix, six LUNs).
-- `./xl enter` (`XL_FIRMWARE` unset, no Silicium image): `xl: loader is up` in about 7 s. The loader finds the phone by its
+- `./xl enter` (`XL_FIRMWARE` unset, no UEFI image): `xl: loader is up` in about 7 s. The loader finds the phone by its
   framebuffer (`platform redwood`), arms its watchdog, and its fastboot answers (`product: xnuloader`, `version: 0.5`).
 - `./xl memmap`: every carve-out of the device tree reserved, the payload area as U-Boot's, and 5.4 GiB free above `0xF4000000`
   for the kernel's window.

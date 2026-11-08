@@ -10,7 +10,7 @@
 open     prebuilt/hakios-kernel                   the kernel, built from Apple's open xnu-8796.121.2 plus xnu/hakios.patch and xnu/files: APSL-2.0, corresponding source here and at Apple
 open     prebuilt/loader.efi                      the boot loader, built from xnuloader/loader.c: MIT
 open     prebuilt/userland/*                      our programs and libraries, built from userland/src: MIT
-open     devices/redwood/prebuilt/BootShim.bin   built from the shim of Mu-Silicium with our change (uefi/hakios.patch): BSD-2-Clause-Patent
+open     devices/redwood/prebuilt/BootShim.bin   built from the shim of mu_aloha_platforms with our change (uefi/hakios.patch): BSD-2-Clause-Patent
 
 # --- a description of the hardware ------------------------------------------------------------------------
 pending  devices/redwood/prebuilt/device-tree.dtb          the phone's device tree, compiled from Linux sources that are GPL-2.0; confirm the headers, or have each user pull it from their own phone as tools/soc-args.py already does
@@ -21,7 +21,7 @@ pending  drivers/input/hakios.focaltech_fw.h   FocalTech's firmware as a C array
 
 # --- proprietary: Qualcomm's and Xiaomi's, taken out of the phone's own UEFI; not for a public tree ---------
 vendor   devices/redwood/uefi/files/Binaries/redwood/*       UEFI drivers extracted from the vendor's xbl firmware (QcomPkg, MiPkg, RawFiles and the EDK2 modules as the vendor built them)
-vendor   devices/redwood/prebuilt/SILICIUM_UEFI.fd           the built UEFI image: carries those drivers
+vendor   devices/*/prebuilt/UEFI.fd                       the built UEFI image: carries those drivers
 
 # --- everything that can write to the phone's storage: a short list, each limited in code --------------------
 # (the default run writes one thing: the loader's own log into the phone's logdump partition)

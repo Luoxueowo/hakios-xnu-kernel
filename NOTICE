@@ -7,10 +7,11 @@ In the repository:
   our patch and files are a derivative work under the Apple Public Source License 2.0 (LICENSE.APSL).
 - libdeflate (Eric Biggers), xnu/files/bsd/miscfs/apfs/libdeflate/: MIT, see its COPYING.
 - mkbootimg.py (Android Open Source Project), devices/redwood/prebuilt/mkbootimg.py: Apache License 2.0.
-- Mu-Silicium / Project Mu (Project Silicium, Microsoft and contributors): devices/redwood/uefi/ holds a
-  patch and files against it; their license applies to the derived parts (BSD-2-Clause-Patent).
+- mu_aloha_platforms / Project Mu (Project Aloha, Microsoft and contributors): uefi/ holds a patch and files
+  against it, and uefi/submodule.patch changes MsCorePkg's PlatformBootManagerLib; their license applies to the
+  derived parts (BSD-2-Clause-Patent).
 - UEFI driver binaries of the phone's own firmware, devices/redwood/uefi/files/Binaries/redwood/: the
-  vendor's (Qualcomm/Xiaomi), extracted from the phone's xbl.img the way Project Silicium redistributes
+  vendor's (Qualcomm/Xiaomi), extracted from the phone's xbl.img the way Project Aloha redistributes
   such drivers for other phones. They are needed only to rebuild the UEFI image; they can be removed and
   extracted by each user from their own phone's firmware with UEFIReader.
 

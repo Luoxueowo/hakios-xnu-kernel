@@ -25,7 +25,7 @@
 | [`hakios-metal/`](hakios-metal) | модель команд Metal на Adreno через драйвер GPU ядра |
 | [hakios-sm7325](https://github.com/oosexgang/hakios-sm7325) | POCO X5 Pro 5G: defconfig, стан, платформа UEFI, скрипт прошивок і шар його SoC (сімейство Qualcomm SC7280) |
 | [hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) | Infinix Hot 20 (MediaTek Helio G85): експериментальний порт із власним завантажувачем. Його немає в маніфесті цього репозиторію |
-| [hakios-uefi](https://github.com/oosexgang/hakios-uefi) | прошивка, що запускає завантажувач: Mu-Silicium зі шляхом завантаження, банером і назвою HakiOS, а також U-Boot від HakiOS |
+| [uefi/](uefi/README.md) | прошивка, що запускає завантажувач: mu_aloha_platforms зі шляхом завантаження, логотипом і назвою HakiOS, а також U-Boot від HakiOS |
 | [hackios-web](https://github.com/oosexgang/hackios-web) | вебсайт |
 | [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) | старий: вказівник, збережений заради посилань. Користувацький простір тепер у `userland/` тут |
 
@@ -58,4 +58,4 @@ hakios — експериментальний проєкт, мета якого 
 
 @oodze — засновник, @netusd — реклама / ceo-dev, @wannqn — розробник, @hxfuxyyXD — розробник, Rhaenja Hun（杭润嘉） — розробник / спонсор
 
-Дякуємо команді silicium за вихідний код!
+Дякуємо командам Project Mu і Project Aloha (mu_aloha_platforms) за вихідний код!

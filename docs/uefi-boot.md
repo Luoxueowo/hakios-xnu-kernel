@@ -13,7 +13,7 @@ only when there is none.
 
 | Way | How | Where | Checked |
 |---|---|---|---|
-| `fastboot boot` | `./xl enter`: a boot image holding Project Silicium's UEFI, a shim and the payload; the shim copies the payload to `0xF0000000` | the phone | yes: the loader started on the attached phone, its banner was read back from the screen and from the log |
+| `fastboot boot` | `./xl enter`: a boot image holding the UEFI of mu_aloha_platforms, a shim and the payload; the shim copies the payload to `0xF0000000` | the phone | yes, with the earlier Mu-Silicium port on redwood (the loader started on the attached phone, its banner was read back from the screen and from the log); **not tried with this port** |
 | a loader device | QEMU's `-device loader` puts the payload at `0xF0000000` (`make qemu-open`) | QEMU | yes |
 | **a file of the volume** | the loader opens the volume it was started from and reads `\EFI\hakios\payload.bin` itself | any UEFI that starts the loader from a volume | **in QEMU only** (AAVMF) |
 
@@ -55,11 +55,11 @@ A file that is not a payload gives `is not a payload (no XNUP at its start)`, an
 
 ## On a phone: what is known and what is not
 
-- Project Silicium's Boot Manager, in this port, is changed to start the XNU loader **from the container the shim
-  leaves in memory instead of a menu** (`uefi/README.md`). It does not look for a loader on a
-  volume. So the file-of-the-volume way has **not** been tried on the phone, and it needs a change to the Boot
-  Manager (or a UEFI that boots from a volume) before it can be.
-- Whether Silicium leaves `0xF0000000` free at the point where the loader runs is not known.
+- mu_aloha_platforms' boot manager, in this port, is changed to hand over to the XNU loader **from the container the
+  shim leaves in memory, instead of showing "No Operating System Found"** (`uefi/README.md`). It does not look for a
+  loader on a volume. So the file-of-the-volume way has **not** been tried on the phone, and it needs a change to that
+  boot manager (or a UEFI that boots from a volume) before it can be.
+- Whether the UEFI leaves `0xF0000000` free at the point where the loader runs is not known.
 - The way to a phone that does not need a host today is the boot image itself, in a boot slot: `docs/install.md`.
 - Another UEFI on the phone, all of it open source: HakiOS's U-Boot, started from RAM by ABL, which takes the loader and the
   payload from memory and starts the loader with `bootefi` ([U-Boot](u-boot.md)).

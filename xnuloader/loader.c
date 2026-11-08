@@ -4165,7 +4165,7 @@ ramfb_phone_screen(void)
  * UEFI-native boot: a payload from the volume the loader was started from.
  *
  * On the phone the payload (the kernel, the small root image, the command line) is put in memory at PAYLOAD_BASE
- * before the loader runs: by the boot shim behind Project Silicium's image (fastboot boot), or by QEMU's loader
+ * before the loader runs: by the boot shim behind the UEFI image (fastboot boot), or by QEMU's loader
  * device. This is the other way, the one every UEFI boot loader has: when there is no payload in memory, look for
  * \EFI\hakios\payload.bin on the volume this image was loaded from (the EFI system partition, where
  * \EFI\BOOT\BOOTAA64.EFI is the loader itself), read it to PAYLOAD_BASE and go on as if it had been there all along.
@@ -4286,7 +4286,7 @@ payload_kernel_version(void)
 
 /*
  * The greeting. Printed from efi_main, while the UEFI text console is still ours (on the phone that is
- * Project Silicium's UEFI): the USB command loop that follows sets screen_quiet and leaves the screen
+ * the UEFI): the USB command loop that follows sets screen_quiet and leaves the screen
  * alone, so what is on it now stays there. It also goes into the log, which "xl log" fetches.
  * The two lines under the letters are the ones the project's banner has: a greeting from the kernel,
  * and its version, kernel.ver=, as tools/kernel-version.py makes it.

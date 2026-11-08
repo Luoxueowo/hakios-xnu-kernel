@@ -112,7 +112,7 @@ def soc_homes():
 
 def home(kind, name):
     if kind == "uefi":
-        return os.path.join(ROOT, "uefi")         # one UEFI for every device: Mu-Silicium with HakiOS's changes (uefi/README.md)
+        return os.path.join(ROOT, "uefi")         # one UEFI for every device: mu_aloha_platforms with HakiOS's changes (uefi/README.md)
     if kind == "soc":
         return soc_homes().get(name, os.path.join(ROOT, "socs", name))
     return os.path.join(ROOT, "devices", name)
@@ -160,7 +160,7 @@ def cmd_list(_a):
         if kind == "uefi":
             where = one(named[(kind, name)], "repository") or one(named[(kind, name)], "path")
             there = os.path.isfile(os.path.join(home(kind, name), "apply.sh"))
-            print("%-6s %-10s %-44s %s" % (kind, name, "HakiOS UEFI (Mu-Silicium)" if there else
+            print("%-6s %-10s %-44s %s" % (kind, name, "HakiOS UEFI (mu_aloha_platforms)" if there else
                                             "NOT CHECKED OUT (tools/hakios-device.py sync %s)" % name, where))
             continue
         fields = describe(kind, name)

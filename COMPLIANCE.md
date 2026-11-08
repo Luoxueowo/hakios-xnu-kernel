@@ -52,7 +52,7 @@ These are flagged for review and are **not** asserted to be settled:
   is generated from a firmware blob on the device. Its redistribution terms are the touch
   vendor's and have not been confirmed; it is a candidate for moving to the pull-from-device
   model the rest of the firmware already uses.
-- **Mu-Silicium / Project Mu** derived files under `devices/redwood/uefi/` carry upstream
+- **mu_aloha_platforms / Project Mu** derived files under `uefi/` and `devices/*/uefi/` carry upstream
   BSD-2-Clause-Patent and GPL-2.0-or-MIT headers; the derived parts keep those licenses.
 
 - **Metal on Vulkan (`M2V=1`).** metal2vulkan is `GPL-2.0-or-later OR LGPL-3.0-or-later`, and `userland/build.sh` links it statically into the

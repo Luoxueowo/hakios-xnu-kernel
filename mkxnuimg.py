@@ -1,57 +1,97 @@
 #!/usr/bin/env python3
 """
-Pack the redwood UEFI (with the hook that starts the XNU loader) and an optional payload
-into an Android boot image for `fastboot boot`.
+Pack the phone's UEFI and an optional payload into an Android boot image for `fastboot boot`:
 
   kernel = gzip(BootShim + UEFI FD + ["XNUP" container]) + DTB
 
 The boot shim copies the FD to its base and the payload to PAYLOAD_BASE.
 
-The UEFI pieces are taken from a Mu-Silicium tree built here (Mu-Silicium/, see uefi/README.md)
-or, when there is none, from devices/redwood/prebuilt/.
+The UEFI pieces are taken from a mu_aloha_platforms tree built here (mu_aloha_platforms/, see uefi/README.md)
+or, when there is none, from devices/<device>/prebuilt/. The device is the phone's name in that tree
+(polaris: Platforms/NapaliPkg/Device/xiaomi-polaris); the package, the SoC that names the FD, the FD's base
+and size and the device tree are read from the tree by tools/mualoha.py, not written down here.
 
-usage: mkxnuimg.py [-p payload.bin] [-o out.img]
+usage: mkxnuimg.py [-d device] [-p payload.bin] [-o out.img] [--mode RELEASE]
 """
 import argparse, gzip, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MU = os.path.join(HERE, 'Mu-Silicium')
-PREBUILT = os.path.join(HERE, 'devices', 'redwood', 'prebuilt')
-FD_BASE, FD_SIZE = 0x9FD00000, 0x200000
+sys.path.insert(0, os.path.join(HERE, 'tools'))   # where mualoha.py is: it reads the UEFI tree for us
+import mualoha                                    # type: ignore  (found through the path above)
+
 PAYLOAD_BASE, PAYLOAD_MAX = 0xF0000000, 0x04000000
 
 ap = argparse.ArgumentParser()
+ap.add_argument('-d', '--device', default=os.environ.get('MUALOHA_DEVICE') or 'polaris',
+                help='the phone in the mu_aloha_platforms tree: polaris, qrd845, ... (default: polaris)')
 ap.add_argument('-p', '--payload')
-ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
-ap.add_argument('--mode', default='RELEASE')
+ap.add_argument('-o', '--output')
+ap.add_argument('--mode', default=os.environ.get('MUALOHA_MODE') or 'RELEASE')
 args = ap.parse_args()
 
-fd_path = os.path.join(MU, f'Build/redwoodPkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
-if os.path.isfile(fd_path):
-    shim_dir = os.path.join(MU, 'BootShim')
-    for f in ('BootShim.elf', 'BootShim.bin'):
-        try: os.unlink(os.path.join(shim_dir, f))
-        except FileNotFoundError: pass
-    subprocess.check_call(['make', 'REQUIRES_KERNEL_HEADER=1', f'FD_BASE={FD_BASE:#x}', f'FD_SIZE={FD_SIZE:#x}',
-                           f'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={PAYLOAD_BASE:#x}'],
-                          cwd=shim_dir, stdout=subprocess.DEVNULL)
-    parts = {'shim': os.path.join(shim_dir, 'BootShim.bin'), 'fd': fd_path,
-             'dtb': os.path.join(MU, 'Resources/DTBs/redwood.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
-             'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
+output = args.output or os.path.join(HERE, 'xnu-%s.img' % args.device)
+PREBUILT = os.path.join(HERE, 'devices', args.device, 'prebuilt')
+
+
+def prebuilt_conf(directory):
+    """base, size, package and soc from devices/<device>/prebuilt/uefi.conf (tools/update-prebuilt.sh writes it)."""
+    path = os.path.join(directory, 'uefi.conf')
+    if not os.path.isfile(path):
+        return {}
+    conf = {}
+    for line in open(path, encoding='utf-8', errors='replace'):
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] in ('device', 'package', 'soc', 'base', 'size'):
+            conf[fields[0]] = fields[1]
+    return conf
+
+
+tree = os.environ.get('MUALOHA') or os.path.join(HERE, 'mu_aloha_platforms')
+try:
+    target = mualoha.resolve(tree, args.device)
+except mualoha.Problem as e:
+    target, why = None, str(e)
 else:
-    parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),
+    why = 'the UEFI of %s is not built: ./build_uefi.py -d %s' % (args.device, os.path.basename(target.devdir))
+
+if target is not None and os.path.isfile(target.path('fd', args.mode)):
+    try:
+        parts = {'shim': mualoha.build_shim(target), 'fd': target.path('fd', args.mode),
+                 'dtb': target.path('dtb', args.mode), 'ramdisk': target.path('ramdisk', args.mode),
+                 'mkbootimg': target.path('mkbootimg', args.mode)}
+    except mualoha.Problem as e:
+        sys.exit('mkxnuimg.py: %s' % e)
+    fd_size = target.size
+    label = 'UEFI: %s (%s %s, base %#x, %d bytes)' % (mualoha.where(parts['fd']), target.package,
+                                                      target.soc, target.base, fd_size)
+else:
+    conf = prebuilt_conf(PREBUILT)
+    parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'UEFI.fd'),
              'dtb': os.path.join(PREBUILT, 'device-tree.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
              'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
-for name, path in parts.items():
+    fd_size = int(conf['size'], 0) if 'size' in conf else None
+    label = 'UEFI: %s (prebuilt)' % mualoha.where(parts['fd'])
+
+for name in ('fd', 'shim', 'dtb', 'ramdisk', 'mkbootimg'):
+    path = parts[name]
     if not os.path.isfile(path):
         hint = ''
         if name == 'fd':
-            hint = ("\n  The UEFI image is not in the repository: it carries the phone vendor's own drivers, which are not\n"
-                    "  redistributed here. Build it from your own phone's firmware: uefi/README.md")
-        sys.exit(f'mkxnuimg.py: {path} not found{hint}')
+            hint = ('\n  The UEFI image is not in the repository: it carries the phone vendor\'s own drivers, which\n'
+                    '  are not redistributed here. Build it from your own phone\'s firmware (uefi/README.md), or run\n'
+                    '  tools/update-prebuilt.sh where one is built.\n  %s' % why)
+        sys.exit('mkxnuimg.py: %s not found%s' % (path, hint))
+
+print(label)
+
 shim = open(parts['shim'], 'rb').read()
 fd = open(parts['fd'], 'rb').read()
-assert len(fd) == FD_SIZE, hex(len(fd))
+if fd_size is None:
+    sys.exit('mkxnuimg.py: %s needs a size: devices/%s/prebuilt/uefi.conf (tools/update-prebuilt.sh)'
+             % (mualoha.where(parts['fd']), args.device))
+if len(fd) != fd_size:
+    sys.exit('mkxnuimg.py: %s is %d bytes, the shim copies %d (%#x): rebuild the UEFI or refresh the prebuilt'
+             % (mualoha.where(parts['fd']), len(fd), fd_size, fd_size))
 
 blob = shim + fd
 if args.payload:
@@ -60,14 +100,17 @@ if args.payload:
     assert data[:4] == b'XNUP' and len(data) <= PAYLOAD_MAX - 0x1000, 'bad or oversized payload'
     blob += data
     blob += b'\0' * (-len(blob) % 16)
-    print(f'payload: {len(data)} bytes, bytesum={sum(data) & 0xffffffff:08x}')
+    print('payload: %d bytes, bytesum=%08x' % (len(data), sum(data) & 0xffffffff))
 
 dtb = open(parts['dtb'], 'rb').read()
-kernel = args.output + '.kernel~'
+output = os.path.abspath(output)
+kernel = output + '.kernel~'
 open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
 try:
-    subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
-                           '--header_version', '1', '-o', args.output])
+    # mkbootimg.py imports its neighbours (generate_gki_certificate): run it from its own directory
+    subprocess.check_call([sys.executable, os.path.basename(parts['mkbootimg']), '--kernel', kernel,
+                           '--ramdisk', os.path.abspath(parts['ramdisk']), '--header_version', '1', '-o', output],
+                          cwd=os.path.dirname(parts['mkbootimg']))
 finally:
     os.unlink(kernel)
-print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')
+print('%s: %d bytes (shim %d, uncompressed %d)' % (output, os.path.getsize(output), len(shim), len(blob)))

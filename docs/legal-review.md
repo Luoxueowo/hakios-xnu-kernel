@@ -63,16 +63,16 @@ gate anything that contains Apple's code behind it.**
 `README.md` and `LEGAL.md` say the phone's firmware is "never" in the repository. But the tree tracks:
 `devices/redwood/uefi/files/Binaries/redwood/**` (Qualcomm/Xiaomi UEFI drivers extracted from
 `xbl.img`, e.g. `DisplayDxe.efi`, `DALSYSDxe.efi`, `XBLCore.te`), the **built image
-`devices/redwood/prebuilt/SILICIUM_UEFI.fd` (2 MB, contains those drivers)**, and
+`devices/<name>/prebuilt/UEFI.fd` (3 MB, contains those drivers)**, and
 `drivers/input/hakios.focaltech_fw.h` (713 KB, a touch-controller firmware turned into a header).
-`COMPLIANCE.md` itself marks all of this "to verify, not cleared". The upstream [Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium)
+`COMPLIANCE.md` itself marks all of this "to verify, not cleared". The upstream [mu_aloha_platforms](https://github.com/Luoxueowo/mu_aloha_platforms)
 licenses its *code* BSD-2-Clause (GPL for some dirs) and states **no terms** for the vendor-binaries
-folder, so "Project Silicium does it too" is not a licence.
+folder, so "Project Aloha does it too" is not a licence.
 
-Note: deleting `Binaries/` is not enough, because `SILICIUM_UEFI.fd` carries the same drivers.
+Note: deleting `Binaries/` is not enough, because `UEFI.fd` carries the same drivers.
 
 **Fix:** move all three to the pull-from-device model the rest of the firmware already uses (the
-`pull-firmware-root.sh` and UEFIReader flow), build `SILICIUM_UEFI.fd` locally, and drop the tracked
+`pull-firmware-root.sh` and UEFIReader flow), build `UEFI.fd` locally, and drop the tracked
 copies. Then fix the sentences in README/LEGAL so they are true.
 
 ### P0-b. Darwin screenshots are still in the history

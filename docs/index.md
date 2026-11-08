@@ -131,7 +131,7 @@ the rest as the file headers say. None of this is legal advice.
 | [`hakios-metal/`](https://github.com/oosexgang/hakios-xnu-kernel/tree/main/hakios-metal) | Metal's command model on the Adreno, through the kernel's GPU driver |
 | [hakios-sm7325](https://github.com/oosexgang/hakios-sm7325) | POCO X5 Pro 5G: its defconfig, status, UEFI platform, firmware script, and its SoC's layer (`soc/`: the Qualcomm SC7280 family) |
 | [hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) | Infinix Hot 20 (MediaTek Helio G85): an experimental port with its own loader; not in `devices/manifest.conf` |
-| [hakios-uefi](https://github.com/oosexgang/hakios-uefi) | the firmware that starts the loader: Mu-Silicium with HakiOS's boot path, banner and name, and HakiOS's U-Boot (`u-boot/`) |
+| [uefi/](uefi/README.md) | the firmware that starts the loader: mu_aloha_platforms with HakiOS's boot path, logo and name, and HakiOS's U-Boot (`u-boot/`) |
 | [hackios-web](https://github.com/oosexgang/hackios-web) | the website, which carries a copy of these pages |
 | [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) | old: a pointer. User space is `userland/` in the common repository |
 
