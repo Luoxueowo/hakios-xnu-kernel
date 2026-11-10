@@ -163,7 +163,8 @@ mount_cryptex(const char *name, const char *container, const char *flashdev)
 		if (err != EINVAL) {
 			printf("  the %s cryptex from %s: %s\n", name, spec, strerror(err));
 		}
-		strcpy(spec, join(flashdev, container, ""));
+		const char *block = boot_arg(strcmp(name, "OS") == 0 ? "cryptex_os_block" : "cryptex_app_block");
+		strcpy(spec, join(flashdev, block ? ",b=" : container, block ? block : ""));
 		if (mount("apfs", at, MNT_RDONLY, (void *)spec) != 0) {
 			printf("  the %s cryptex from %s: %s\n", name, spec, strerror(errno));
 			strcpy(what, join("the ", name, " cryptex: in neither md0 nor the flash"));
@@ -858,7 +859,7 @@ mount_data_volume(void)
 	memset(&args, 0, sizeof(args));
 	args.fspec = dev;
 	if (mount("hfs", "/private/var", 0, &args) != 0) {
-		printf("  HFS Plus from %s: %s; a memory filesystem instead, empty at every boot\n", dev, strerror(errno));
+		printf("  HFS Plus from %s: %s; data volume not mounted\n", dev, strerror(errno));
 		return 0;
 	}
 	printf("  /private/var: HFS Plus from %s, kept between boots\n", dev);
@@ -918,6 +919,11 @@ mount_writable(void)
 
 	printf("\n-- writable filesystem --\n");
 	var_kept = mount_data_volume();
+	if (!var_kept && boot_arg("data_required") != NULL && strcmp(boot_arg("data_required"), "1") == 0) {
+		printf("FATAL: persistent data did not mount; refusing an empty RAM data volume\n");
+		reboot(RB_HALT);
+		for (;;) { }
+	}
 	if (var_kept) {
 		static const char *const own[] = { "/private/var/tmp", "/private/var/run", "/private/var/vm" };
 

@@ -1736,6 +1736,7 @@ ufs_survey(void)
  * the first phone's, and no write was ever served on another); they are printed instead.
  */
 #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
+static uint64_t block_write_first = BLOCK_WRITE_FIRST; /* per-run fixed Data boundary */
 #define BLOCK_DARWIN_MIN   5242875ULL                  /* blocks of 4096: the first phone's darwin, the layout's */
 #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
 
@@ -2105,7 +2106,7 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 	}
 	print("ufs: darwin (LBA %d..%d of unit 0, unique GUID %x...%x): its blocks from %d on may be written this run\n",
 	    info->start_lba, info->end_lba, (uint64_t)u[3] << 24 | (uint64_t)u[2] << 16 | (uint64_t)u[1] << 8 | u[0],
-	    (uint64_t)u[12] << 24 | (uint64_t)u[13] << 16 | (uint64_t)u[14] << 8 | u[15], BLOCK_WRITE_FIRST);
+	    (uint64_t)u[12] << 24 | (uint64_t)u[13] << 16 | (uint64_t)u[14] << 8 | u[15], block_write_first);
 	return 1;
 }
 
@@ -2147,7 +2148,7 @@ block_is_gpt_darwin(const efi_guid *type_guid, const efi_block_io *bio, const st
 		print("ufs: darwin: no write will be served: %s\n", why);
 		return 0;
 	}
-	print("ufs: darwin: GPT-verified raw-unit view; blocks from %d on may be written this run\n", BLOCK_WRITE_FIRST);
+	print("ufs: darwin: GPT-verified raw-unit view; blocks from %d on may be written this run\n", block_write_first);
 	return 1;
 }
 
@@ -2372,7 +2373,7 @@ block_start(void)
 	block_writes = block_writes_refused = block_write_bytes = 0;
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
-		block_shared.write_first = BLOCK_WRITE_FIRST;
+		block_shared.write_first = block_write_first;
 		block_shared.write_caps = BLOCK_CAN_FAST;
 	}
 	block_shared.magic = BLOCK_MAGIC;
@@ -2515,7 +2516,7 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE || op == BLOCK_OP_WRITE_FAST || op == BLOCK_OP_FLUSH) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
+			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < block_write_first) {
 				/* not darwin, or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
@@ -3372,6 +3373,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
 	 * loader asked for (the loader stays resident across runs) */
 	block_write_requested = 0;
+	block_write_first = BLOCK_WRITE_FIRST;
 	block_write_part = -1;
 	/*
 	 * the same for the other storage requests (they are only ever OR-ed in below): without this a run
@@ -3381,6 +3383,23 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_probe_requested = 0;
 	block_enabled = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
+		if (starts_with(c, "darwin_data=") && (c == pi.cmdline || c[-1] == ' ')) {
+			const char *digit = c + 12;
+			uint64_t first = 0;
+			int valid = *digit >= '0' && *digit <= '9';
+			for (; *digit && *digit != ' '; digit++) {
+				if (*digit < '0' || *digit > '9' || first > ((~0ULL) - (*digit - '0')) / 10) {
+					valid = 0;
+					break;
+				}
+				first = first * 10 + (*digit - '0');
+			}
+			if (!valid || first < BLOCK_WRITE_FIRST) {
+				print("invalid darwin_data boundary: kernel not started\n");
+				return 0;
+			}
+			block_write_first = first;
+		}
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
 		}

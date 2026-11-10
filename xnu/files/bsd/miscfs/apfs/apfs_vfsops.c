@@ -989,7 +989,7 @@ apfs_free_mount(struct apfs_mount *am)
  * that has a root directory.
  */
 static int
-apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t container, int volume)
+apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t container, int volume, uint64_t base_block)
 {
 	struct apfs_mount *am;
 	struct apfs_devctx *dc;
@@ -1030,6 +1030,14 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	}
 	dc->dc_devvp = devvp;
 	dc->dc_devblock = devblock;
+	/* Explicit offsets are counted in 4096-byte blocks, independent of device I/O size. */
+	if (base_block > (~0ULL / 4096) ||
+	    (devblocks != 0 && base_block >= devblocks * (uint64_t)devblock / 4096)) {
+		kfree_type(struct apfs_devctx, dc);
+		apfs_free_mount(am);
+		return EINVAL;
+	}
+	dc->dc_base = base_block * 4096;
 	{
 		uint8_t *sb = kalloc_data(APFS_META_CHUNK, Z_WAITOK);
 		uint64_t devsize = devblocks * (uint64_t)devblock;
@@ -1054,7 +1062,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 			}
 			nx_size = bc * bs;
 			if (bs < 4096 || bc == 0 || (nx_size % devblock) != 0 ||
-			    (devsize != 0 && dc->dc_base + nx_size > devsize)) {
+			    (devsize != 0 && (dc->dc_base > devsize || nx_size > devsize - dc->dc_base))) {
 				printf("apfs: container %u: %llu blocks of %u do not fit the device\n", i,
 				    (unsigned long long)bc, bs);
 				error = EINVAL;
@@ -1179,7 +1187,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	sp->f_ffree = 0;
 	/* (several volumes of one device are told apart by which container and volume) */
 	sp->f_fsid.val[0] = (int32_t)vnode_specrdev(devvp);
-	sp->f_fsid.val[1] = (int32_t)((vfs_typenum(mp) & 0xff) | (container << 8) | (am->am_vol.index << 20));
+	sp->f_fsid.val[1] = (int32_t)((vfs_typenum(mp) & 0xff) | ((uint32_t)(base_block ? base_block : container) << 8) | (am->am_vol.index << 20));
 	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
 
 	apfs_the_mount = am;
@@ -1208,7 +1216,7 @@ apfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 
 	(void)PE_parse_boot_argn("apfs_root_c", &c, sizeof(c));
 	(void)PE_parse_boot_argn("apfs_root_v", &v, sizeof(v));
-	return apfs_mount_common(mp, devvp, ctx, c, v);
+	return apfs_mount_common(mp, devvp, ctx, c, v, 0);
 }
 
 /*
@@ -1224,6 +1232,7 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	vnode_t vp = NULLVP;
 	size_t len = 0;
 	uint32_t container = 0;
+	uint64_t base_block = 0;
 	int volume = -1;
 	int error;
 
@@ -1249,7 +1258,7 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	} else {
 		error = copyinstr(data, path, MAXPATHLEN, &len);
 	}
-	/* "DEVICE[,c=N][,v=M]": the container (from 0) and the volume (by index) */
+	/* "DEVICE[,c=N][,v=M][,b=4096-byte-block]": the container (from 0) and the volume (by index) */
 	if (error == 0) {
 		char *opt = strchr(path, ',');
 
@@ -1259,6 +1268,20 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 			*opt = '\0';
 			if (strncmp(opt + 1, "c=", 2) == 0) {
 				container = (uint32_t)strtoul(opt + 3, NULL, 10);
+			} else if (strncmp(opt + 1, "b=", 2) == 0) {
+				const char *digit = opt + 3;
+				base_block = 0;
+				if (*digit == '\0' || *digit == ',') {
+					error = EINVAL;
+				}
+				for (; *digit && *digit != ','; digit++) {
+					if (*digit < '0' || *digit > '9' ||
+					    base_block > ((~0ULL / 4096) - (*digit - '0')) / 10) {
+						error = EINVAL;
+						break;
+					}
+					base_block = base_block * 10 + (*digit - '0');
+				}
 			} else if (strncmp(opt + 1, "v=", 2) == 0) {
 				volume = (int)strtoul(opt + 3, NULL, 10);
 			} else {
@@ -1266,6 +1289,9 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 			}
 			opt = next;
 		}
+	}
+	if (base_block != 0 && container != 0) {
+		error = EINVAL;
 	}
 	if (error == 0) {
 		error = vnode_lookup(path, 0, &vp, ctx);
@@ -1291,14 +1317,17 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 			 * The iocount from the lookup is kept for as long as the volume is
 			 * mounted; apfs_unmount() closes and drops it.
 			 */
-			error = apfs_mount_common(mp, vp, ctx, container, volume);
+			error = apfs_mount_common(mp, vp, ctx, container, volume, base_block);
 			if (error == 0) {
 				APFS_MP(mp)->am_owns_devvp = true;
 				APFS_MP(mp)->am_shares_devvp = shared;
 				/* what mount(8) and df show as where it came from */
-				if (vfs_statfs(mp)->f_mntfromname[0] == '\0' || container != 0 || volume >= 0) {
-					char opts[40] = "";
+				if (vfs_statfs(mp)->f_mntfromname[0] == '\0' || container != 0 || volume >= 0 || base_block != 0) {
+					char opts[80] = "";
 
+					if (base_block != 0) {
+						snprintf(opts, sizeof(opts), ",b=%llu", (unsigned long long)base_block);
+					}
 					if (container != 0) {
 						snprintf(opts, sizeof(opts), ",c=%u", container);
 					}

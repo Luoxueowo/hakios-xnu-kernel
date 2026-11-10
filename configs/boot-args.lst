@@ -84,7 +84,8 @@ cpufreq	k
 cpuload	k
 cpumask	l
 cpus	l
-darwin_data	k
+darwin_data	kl
+data_required	u
 ddr	k
 ddr_rest	k
 ddr_vote	k

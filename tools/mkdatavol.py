@@ -17,6 +17,9 @@ included: which those are is read from the volume's own allocation bitmap.
 
 Case-sensitive (HFSX), as Darwin's own data volume is, and journaled.
 """
+import argparse
+import importlib.util
+from pathlib import Path
 import os
 import struct
 import subprocess
@@ -56,18 +59,43 @@ def used_blocks(img):
 
 
 def main():
-    if len(sys.argv) not in (2, 3):
-        sys.exit(__doc__)
-    out = sys.argv[1]
-    mkfs = sys.argv[2] if len(sys.argv) > 2 else 'mkfs.hfsplus'
+    global DARWIN_BLOCKS, DATA_FIRST
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--layout', type=Path, help='fixed layout JSON, required for Polaris')
+    parser.add_argument('output')
+    parser.add_argument('mkfs', nargs='?', default='mkfs.hfsplus')
+    args = parser.parse_args()
+    out, mkfs = args.output, args.mkfs
+    if args.layout:
+        spec = importlib.util.spec_from_file_location('polaris_storage', Path(__file__).with_name('polaris-storage.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        config = module.layout(args.layout)
+        DARWIN_BLOCKS = config['partition_bytes'] // BS
+        DATA_FIRST = config['data_offset'] // BS
     blocks = DARWIN_BLOCKS - DATA_FIRST
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, 'data.hfs')
         with open(path, 'wb') as f:
             f.truncate(blocks * BS)
         # its root is /private/var: root's, 0755, as on an iPhone
-        subprocess.run([mkfs, '-s', '-J', '-b', str(BS), '-U', '0', '-G', '0', '-M', '755', '-v', 'Data', path],
-                       check=True)
+        options = ['-s', '-J', '-b', str(BS), '-v', 'Data']
+        options += ['-U', '0', '-G', '0', '-M', '755']
+        attached = None
+        try:
+            if os.path.basename(mkfs) == 'newfs_hfs':
+                # Apple's formatter takes a device, not a regular sparse file.
+                import re
+                result = subprocess.check_output(['hdiutil', 'attach', '-nomount', '-nobrowse',
+                    '-imagekey', 'diskimage-class=CRawDiskImage', path], text=True)
+                devices = re.findall(r'^(/dev/disk[0-9]+)\s', result, re.M)
+                if len(devices) != 1:
+                    raise RuntimeError('unexpected disk-image attachment: ' + result)
+                attached = devices[0]
+            subprocess.run([mkfs] + options + [attached or path], check=True)
+        finally:
+            if attached:
+                subprocess.run(['hdiutil', 'detach', attached], check=True)
         with open(path, 'rb') as img:
             total, used = used_blocks(img)
             if total != blocks:

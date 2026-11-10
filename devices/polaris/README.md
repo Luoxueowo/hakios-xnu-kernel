@@ -142,3 +142,6 @@ The userland APFS volume is `polaris` and is mounted on `/polaris`. Rebuild
 userland and the system image after changing this layout: the installed Darwin
 image must contain the matching launchd and library symlinks. Legacy userland
 prebuilts using `/redwood` are not compatible with this layout.
+
+See [STORAGE.md](STORAGE.md) for the fixed 10/4/1 GiB system slots, persistent
+Data volume, first installation and updates that preserve user files.

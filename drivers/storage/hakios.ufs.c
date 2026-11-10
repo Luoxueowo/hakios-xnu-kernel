@@ -1883,8 +1883,13 @@ hakios_ufs_init(void)
 				ufs_write_first = scanned;
 				from = "the end of the containers written into darwin";
 			}
-			/* the boot argument wins over all of it, the way it does everywhere else */
+			/* an explicit Data start must not go below the system or loader boundary */
 			if (PE_parse_boot_argn("darwin_data", &asked, sizeof(asked)) && asked > 0 && asked < blocks) {
+				if (asked < ufs_write_first) {
+					printf("ufs: darwin_data is below the system/loader boundary; Data disabled\n");
+					ufs_write_part = -1;
+					return;
+				}
 				ufs_write_first = asked;
 				from = "the darwin_data boot argument";
 			}

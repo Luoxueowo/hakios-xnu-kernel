@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "device": "polaris",
+  "partition": "darwin",
+  "partition_bytes": 137438932992,
+  "block_size": 4096,
+  "regions": [
+    {"name": "system", "gib": 10},
+    {"name": "os", "gib": 4},
+    {"name": "app", "gib": 1}
+  ]
+}

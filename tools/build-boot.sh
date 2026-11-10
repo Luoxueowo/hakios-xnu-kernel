@@ -75,6 +75,20 @@ RAMDISK_PATH=$(repo_path "$RAMDISK_IMAGE")
 OUTPUT_PATH=$(repo_path "$OUTPUT_IMAGE")
 PAYLOAD_PATH="${OUTPUT_PATH%.img}.payload"
 
+# Every fixed storage offset comes from the same layout used by the installer.
+if [[ -n "${STORAGE_LAYOUT:-}" ]]; then
+	LAYOUT_PATH=$(repo_path "$STORAGE_LAYOUT")
+	LAYOUT_ARGS=$(python3 tools/polaris-storage.py --layout "$LAYOUT_PATH" bootargs)
+	for key in cryptex_os_block cryptex_app_block darwin_data var_hfs data_required; do
+		if [[ " $BOOT_ARGS " == *" $key="* ]]; then
+			echo "build-boot: set $key through STORAGE_LAYOUT, not BOOT_ARGS" >&2
+			exit 1
+		fi
+	done
+	[[ " $BOOT_ARGS " == *" ufs_write=1 "* ]] || { echo "build-boot: persistent storage requires ufs_write=1" >&2; exit 1; }
+	BOOT_ARGS="$BOOT_ARGS $LAYOUT_ARGS"
+fi
+
 if [[ "$BUILD_KERNEL" == 1 ]]; then
 	echo "build-boot: configure $DEVICE ($KERNEL_DEFCONFIG)"
 	make DEVICE="$DEVICE" "$KERNEL_DEFCONFIG"
