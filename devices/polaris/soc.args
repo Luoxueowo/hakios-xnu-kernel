@@ -1,0 +1,17 @@
+soc_ipa_base=0x1e40000
+soc_gsi_base=0x1e04000
+soc_aoss=0xc300000
+soc_apps_smmu=0x15000000
+soc_imem=0x14600000
+soc_ipa_stream=0x720
+soc_ipa_stream_uc=0x722
+soc_pas_ipa=0xf
+soc_ipa_fw=ipa_fws
+# The five below are not read out of this phone's tree by tools/soc-args.py: the nodes are named the
+# mainline way, and the recovery device tree the file above came from keeps only part of them. These
+# are the values the phone's own Android tree carries (the ones the previous port booted with).
+soc_smem=0x86000000        # /soc/qcom,smem@86000000
+soc_cmd_db=0x861e0000      # /soc/qcom,cmd-db@861e0000
+soc_ipcc=0x179e0000        # /soc/mailbox@179e0000 (the IPCC the modem's glink uses)
+soc_mpss_mem=0x8e400000    # /reserved-memory/modem_region@0x8e400000, 0x07800000 bytes
+soc_pas_mpss=4             # /soc/qcom,mss@4080000: the modem's PAS id

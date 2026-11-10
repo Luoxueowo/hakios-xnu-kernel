@@ -1,0 +1,4 @@
+# HakiOS defconfig for the Xiaomi MIX 2S (polaris): the common kernel, the sdm845 family's facts, and this device's own.
+#include common_defconfig
+#include sdm845.config
+#include polaris.config
