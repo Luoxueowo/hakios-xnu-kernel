@@ -6,6 +6,7 @@
 #   make images          userland/root.apfs and userland/system.apfs (userland/build.sh)
 #   make kernel          the kernel from source (xnu/apply.sh, xnu-deps/setup.sh, xnu-build.sh)
 #   make loader          the boot loader, with identity.h made from your IPSW (xnuloader/build.sh)
+#   make boot            compile and package a device boot image (tools/build-boot.sh)
 #   make firmware        the phone's firmware off the phone over adb (devices/$(DEVICE)/pull-firmware.sh)
 #   make qemu            a 20-minute session in QEMU (needs the Darwin images)
 #   make qemu-open       boot the open kernel in QEMU with NO Apple software
@@ -52,10 +53,11 @@ endif
 IMAGE_OPTS ?= REST=1
 ESP_DIR ?= build/esp
 PAYLOAD ?= qemu/payload.bin
+BOOT_CONFIG ?= configs/polaris-boot.conf
 # make u-boot-img: the payload put in the image's ramdisk with the loader (none: U-Boot waits for them over fastboot)
 UBOOT_PAYLOAD ?=
 
-.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp
+.PHONY: devices help unpack images kernel loader loader-open hello qemu qemu-open qemu-u-boot u-boot u-boot-img phone prebuilt clean all doctor defconfig config savedefconfig esp boot
 
 help:
 	@awk '{ if (!/^#/) exit; sub(/^# ?/, ""); print }' Makefile
@@ -78,6 +80,9 @@ kernel:
 
 loader:
 	xnuloader/build.sh
+
+boot:
+	tools/build-boot.sh "$(BOOT_CONFIG)"
 
 firmware:
 	devices/$(DEVICE)/pull-firmware.sh

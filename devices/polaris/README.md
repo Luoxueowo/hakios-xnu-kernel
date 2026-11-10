@@ -95,6 +95,20 @@ and the addresses, pins and rails in each are the reference phone's. Leave out i
 ported to this phone yet (`# CONFIG_HAKIOS_GOODIX is not set`, ...; `configs/qemu_defconfig` leaves out all of them), and put
 each one back when it has been made to work here. `tools/hakios-config.py show` lists what is built in.
 
+## Build a boot image
+
+Edit [`configs/polaris-boot.conf`](../../configs/polaris-boot.conf) to change the Polaris kernel config, boot arguments, input
+images, or build switches, then run:
+
+```sh
+make boot
+```
+
+This builds the kernel, userland boot ramdisks, and loader, then packages `out/boot/polaris.img`. The `resident` entry is the
+flashboot image containing `/sbin/launchd` and becomes md0; `ramdisk` contains `/sbin/init` and becomes md1. The script checks
+both APFS paths and the final image size, and it does not flash the phone. Use `make boot BOOT_CONFIG=path/to/other.conf` to select
+another configuration.
+
 ## Firmware
 
 Pulled from your own phone, never committed: `devices/redwood/pull-firmware.sh`, or
