@@ -27,6 +27,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
 
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
@@ -573,6 +574,16 @@ hakios_cpufreq_init(void)
 	}
 	enabled = 0;
 	if (!PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled)) || !enabled) {
+		return;
+	}
+	/*
+	 * The EPSS block below belongs to the other SoC this tree is built for (SM7325, redwood). The MIX 2S's SDM845
+	 * has nothing of the kind at that address -- its cores' clock is the OSM's, which this file does not drive --
+	 * and 0x18591000 is some other block there. Refuse instead of writing rows into it.
+	 */
+	if (pe_arm_get_soc_base_phys() == 0x00100000UL) {
+		tell("cpufreq: the SDM845 has no EPSS at 0x18591000; its cores are left at the boot loader's clock "
+		    "(the OSM is not driven by this file)\n");
 		return;
 	}
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
