@@ -107,6 +107,11 @@ static int
 synthetic_dir(const char *path)
 {
 	int ok = sysctlbyname("kern.apfs_synthetic", NULL, NULL, (void *)path, strlen(path)) == 0;
+	if (!ok && errno == 17) { /* EEXIST: prepared system images already carry mount points. */
+		struct stat st;
+
+		ok = stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
+	}
 
 	if (!ok) {
 		printf("  synthetic directory %s: %s\n", path, strerror(errno));
@@ -245,7 +250,7 @@ flash_root(const char *dev)
 		close(fd);
 	}
 	printf("  %d applications waiting to be installed, %d of them in /Applications\n", apps, bound);
-	check(apps > 0 && bound == apps, "the first boot's applications in /Applications");
+	check(bound == apps, "any staged first-boot applications are bound into /Applications");
 
 	ok = sysctlbyname("kern.hakios_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
 	if (!ok) {
@@ -1327,8 +1332,12 @@ run_command(char *line)
 				close(null);
 			}
 		}
-		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.darwin") == 0) {
-			argv[1] = "/sbin/launchd";      /* the root is Darwin's own volume: its launchd is that */
+		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.darwin") == 0 &&
+		    stat("/sbin/launchd.darwin", &st) != 0) {
+			/* An unmodified Darwin root has /sbin/launchd. Our generated
+			 * system image keeps stage0 there and the real daemon at .darwin;
+			 * replacing that path would execute stage0 again as process 1. */
+			argv[1] = "/sbin/launchd";
 		}
 		execve(argv[1], argv + 1, envp);
 		printf("%s: %s\n", argv[1], strerror(errno));
