@@ -113,8 +113,8 @@ def model_values(path, values):
     board = values['board']
     if not re.fullmatch(r'iPhone\d+,\d+', model):
         sys.exit(f'mkidentityconf.py: {path}: model is not of the form iPhone13,1: {model!r}')
-    if not re.fullmatch(r'D[A-Z0-9]{1,3}AP', board):
-        sys.exit(f'mkidentityconf.py: {path}: board is not of the form D83AP: {board!r}')
+    if not re.fullmatch(r'D[A-Za-z0-9]{1,4}AP', board):
+        sys.exit(f'mkidentityconf.py: {path}: board is not of the form D52gAP: {board!r}')
     product = string_value(path, 'product-name', values['product-name'], 31)
     target = board[:-2]                     # D83AP -> D83
     # "<board>\0<model>\0AppleARM\0", the bytes the phone's own tree carries as compatible
