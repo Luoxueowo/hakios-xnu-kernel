@@ -88,3 +88,7 @@ claim purgeable space, change total capacity, override nonzero answers, or repla
 a zero when the volume really is full. Read-only and other filesystem types keep
 their existing answers. This is a user-space capacity adapter, not a filesystem
 format or partition change.
+
+`/polaris/bin/storage_info` reports the kernel, Foundation, NSURL and MobileGestalt
+answers together. For a diagnostic boot, build userland with
+`RC_JOBS=rc.jobs.storage`; normal builds use the normal command list.

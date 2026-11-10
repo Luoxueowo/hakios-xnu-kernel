@@ -1,0 +1,11 @@
+# Capacity diagnostics; keep the normal launchd commands.
+/polaris/bin/storage_info
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+/polaris/bin/hello_dyn started by launchd
+/polaris/bin/svc_test
+/polaris/bin/surf_test
+/bin/ps -A
+/polaris/bin/mg_test
+# the processors: how many, and -- once the system has settled -- whether they work at the same time
+/polaris/bin/cpu_test
+/polaris/bin/cpu_test 240 &

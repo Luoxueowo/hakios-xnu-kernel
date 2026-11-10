@@ -220,6 +220,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -o obj/vol_ls src/vol_ls.c
 		$DYN -dynamiclib -framework CoreFoundation -lobjc -install_name /polaris/lib/libhakios.storage.dylib \
 			-o obj/libhakios.storage.dylib src/storage_capacity.c
+		$DYN -framework Foundation -o obj/storage_info src/storage_info.m obj/libhakios.storage.dylib
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
@@ -350,6 +351,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/shm_test ] && cp obj/shm_test root/bin/
 	[ -f obj/apfs_mmap_test ] && cp obj/apfs_mmap_test root/bin/
 	[ -f obj/vol_ls ] && cp obj/vol_ls root/bin/
+	[ -f obj/storage_info ] && cp obj/storage_info root/bin/
 	[ -f obj/snap_test ] && cp obj/snap_test root/bin/
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
