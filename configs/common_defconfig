@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 371 symbols in 18 groups; 34 are set, 25 of them drivers built in.
+# 382 symbols in 18 groups; 34 are set, 25 of them drivers built in.
 #
 
 #
@@ -19,7 +19,7 @@
 CONFIG_FIRMWARE="device"
 
 #
-# Drivers built in (25)
+# Drivers built in (27)
 #
 
 # the audio DSP started and linked (adsp=1, adsp_step=N); the battery's state comes through it too. Needs the DSP's ... [hakios.adsp.c]
@@ -73,7 +73,7 @@ CONFIG_HAKIOS_MODEM=y
 # QEMU's virtio network device as the link behind en0 (virtio_net=1). QEMU only [hakios.virtio_net.c]
 CONFIG_HAKIOS_VIRTIO_NET=y
 
-# the battery: kern.hakios.battery_*, and HakiosBattery, the IOPMPowerSource Darwin reads the charge from (the state ... [hakios.battery.c, hakios.battery.cpp]
+# the battery: kern.hakios.battery_*, and HakiosBattery, the IOPMPowerSource Darwin reads the charge from (from the ... [hakios.battery.c, hakios.battery.cpp]
 CONFIG_HAKIOS_BATTERY=y
 
 # the clock of the cores the kernel runs on (cpufreq=1), and the memory bus's votes (ddr=) [hakios.cpufreq.c]
@@ -96,6 +96,12 @@ CONFIG_HAKIOS_VIRTIO_BLK=y
 
 # Wi-Fi of the WCN6750 (wifi=1, wifi_step=N): the DSP that runs the radio's firmware, Linux's ath11k (its object, made ... [hakios.wifi.c, hakios.wlfw.c, hakios.lx.c, hakios.sta.c, hakios.apple80211.c, hakios.wlan.cpp; requires CONFIG_HAKIOS_QMI]
 CONFIG_HAKIOS_WIFI=y
+
+# the Xiaomi MIX 2S Synaptics S3330 RMI4 touch screen on its bit-banged I2C bus (touchscreen=1) [hakios.synaptics.c]
+# CONFIG_HAKIOS_SYNAPTICS is not set
+
+# the Xiaomi MIX 2S PM8998 power and volume keys through SPMI (buttons=1; touchscreen=1 also enables them) [hakios.buttons.polaris.c]
+# CONFIG_HAKIOS_BUTTONS_POLARIS is not set
 
 #
 # CPU, memory and boot (21)
@@ -165,7 +171,7 @@ CONFIG_HAKIOS_WIFI=y
 # CONFIG_XPCPROXY_IDVERSION is not set
 
 #
-# Storage and APFS (44)
+# Storage and APFS (45)
 #
 
 # the phone's storage: 1 a survey, read only; 2 the loader's block service, through which the kernel reads it (the ...
@@ -264,6 +270,9 @@ CONFIG_UFS=2
 # the file in it, by path from the volume's root
 # CONFIG_APFS_WRITE_PATH is not set
 
+# read by hakios.ufs.c (kernel)
+# CONFIG_DARWIN_DATA is not set
+
 # what one request through the loader costs, by size
 # CONFIG_UFS_BENCH is not set
 
@@ -301,23 +310,44 @@ CONFIG_UFS=2
 # CONFIG_VIRTIO_BLK is not set
 
 #
-# Touch and buttons (10)
+# Touch and buttons (17)
 #
 
 # the touch screen, and the power and volume buttons
 CONFIG_TOUCHSCREEN=y
 
-# read by hakios.buttons.c (kernel)
+# read by hakios.buttons.c, hakios.buttons.polaris.c (kernel)
 # CONFIG_BUTTONS is not set
 
 # read by hakios.buttons.c (kernel)
 # CONFIG_BUTTONS_STEPS is not set
+
+# read by hakios.buttons.polaris.c (kernel)
+# CONFIG_POLARISBUTTONS is not set
 
 # a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the ...
 # CONFIG_PRESS_POWER is not set
 
 # read by hakios.buttons.c (kernel)
 # CONFIG_PRESS_POWER_MS is not set
+
+# ignore Control 23 and use N slots
+# CONFIG_SYNAPTICS_FINGERS is not set
+
+# the panel's X coordinate range (default 1080)
+# CONFIG_SYNAPTICS_MAX_X is not set
+
+# the panel's Y coordinate range (default 2160)
+# CONFIG_SYNAPTICS_MAX_Y is not set
+
+# polling interval in microseconds (500..1000000; default 20000)
+# CONFIG_SYNAPTICS_POLL_US is not set
+
+# leave RESET99 alone (by default, release it if the loader left it asserted)
+# CONFIG_SYNAPTICS_RESET is not set
+
+# a line for every frame (bring-up)
+# CONFIG_SYNAPTICS_TRACE is not set
 
 # read by hakios.goodix.c (kernel)
 # CONFIG_TOUCH_FLIP is not set
@@ -335,7 +365,7 @@ CONFIG_TOUCHSCREEN=y
 # CONFIG_VIRTIO_INPUT is not set
 
 #
-# GPU and display (76)
+# GPU and display (77)
 #
 
 # rendering on Adreno (an image built with GL=1; the GPU's firmware from your phone) [needs fw-gpu/ from the phone]
@@ -398,6 +428,9 @@ CONFIG_GPU=y
 # read by MiniIOMobileFramebuffer.cpp (kernel)
 # CONFIG_FB_HZ is not set
 
+# the registers of the display interface the panel is on, for a port
+# CONFIG_FB_INTF is not set
+
 # how often the panel is really refreshed
 # CONFIG_FB_MEASURE is not set
 
@@ -422,7 +455,7 @@ CONFIG_GPU=y
 # log the first N calls of every selector (default 3)
 # CONFIG_FBTRACE is not set
 
-# read by MiniIOMobileFramebuffer.cpp (kernel)
+# read by MiniIOMobileFramebuffer.cpp, inject_sb.c (kernel and user space)
 # CONFIG_FBWIDTH is not set
 
 # the surface's memory, as before

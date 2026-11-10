@@ -561,6 +561,8 @@ struct platform {
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+	int charger_supported;            /* UEFI exposes the Qualcomm ChargerEx/QcomCharger status protocols */
+	int qcom_charger_reinitialize;    /* call QcomCharger.initialize(1) before reading status */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -586,6 +588,7 @@ static const struct platform platform_redwood = {
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
 	.small_cores = 0x0f,
+	.charger_supported = 1, .qcom_charger_reinitialize = 1,
 };
 
 /* Xiaomi MIX 2S (Polaris), from its Android DTB and the UEFI memory map. */
@@ -597,6 +600,8 @@ static const struct platform platform_polaris = {
 	.cores = 8, .core_shift = 8,
 	/* SDM845 CPUs 0-3 are the slower Silver cluster; CPUs 4-7 are Gold. */
 	.small_cores = 0x0f,
+	/* Carried from the old Polaris loader profile: read the resident UEFI status without reinitializing it. */
+	.charger_supported = 1, .qcom_charger_reinitialize = 0,
 };
 
 #define POLARIS_FRAMEBUFFER_BASE 0x9D400000ULL /* Display Reserved in Polaris PlatformMemoryMapLib */
@@ -2247,19 +2252,22 @@ charger_start(void)
 	static const efi_guid charger_ex_guid = QCOM_CHARGER_EX_GUID;
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
+	int reinitialized = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	if (charger_enabled || !PLAT->charger_supported) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
 	qcom_status = BS->locate_protocol(&qcom_charger_guid, NULL, (void **)&QCOM_CHARGER);
-	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL) {
+	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL && PLAT->qcom_charger_reinitialize) {
 		/* Re-open the driver's status path after QcomChargerApp handed off to the OS. */
 		init_status = QCOM_CHARGER->initialize(1);
+		reinitialized = 1;
 	}
 	charger_enabled = (!EFI_ERROR(ex_status) && CHARGER_EX != NULL) ||
 	    (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL);
-	print("battery: ChargerEx=%x QcomCharger=%x init=%x shared=%x\n", ex_status, qcom_status, init_status,
+	print("battery: ChargerEx=%x QcomCharger=%x reinitialized=%d init=%x shared=%x\n", ex_status, qcom_status,
+	    (uint64_t)reinitialized, init_status,
 	    (uint64_t)(uintptr_t)&charger_shared);
 	charger_poll();
 	print("battery: flags=%x SOC=%d%% V=%d mV I=%d mA T=%d C action=%d\n", (uint64_t)charger_shared.flags,

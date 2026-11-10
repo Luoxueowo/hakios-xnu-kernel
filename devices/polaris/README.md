@@ -23,6 +23,12 @@ and [UEFI memory map](../../mu_aloha_platforms/Platforms/NapaliPkg/Device/xiaomi
 
 This loader profile is integrated; an XNU boot on the phone has not yet been verified.
 
+With `battery=1`, the loader reads the resident Qualcomm ChargerEx/QcomCharger protocols and shares a read-only status cache with
+XNU. The Polaris profile does not reinitialize QcomCharger, matching the old Polaris loader setting. XNU publishes the readings as
+`HakiosBattery` (`IOPMPowerSource`) so Darwin can show the level and charging state; this path is integrated but not yet validated
+on the phone. Include `battery=1` in the payload command line to enable it; the defconfig allows the argument but does not add it
+automatically.
+
 ## The SoC addresses
 
 No reference tree to compare with (devices/redwood/prebuilt/device-tree.dtb is missing).
@@ -64,7 +70,8 @@ says where its numbers came from; that is the map of what to rewrite.
 - [ ] **CPU clocks**: hakios.cpufreq.c
 - [ ] **GPU**: hakios.adreno.c (Adreno 642L here: another generation needs its own firmware and registers)
 - [ ] **Wi-Fi**: hakios.wifi.c, hakios.lx.c and wifi/lx/ (the WCN6750 radio of the reference phone)
-- [ ] **Audio and battery**: hakios.adsp.c, hakios.audio.c, hakios.sound.c, hakios.speaker.c, hakios.mic.c, hakios.battery.c
+- [ ] **Audio**: hakios.adsp.c, hakios.audio.c, hakios.sound.c, hakios.speaker.c, hakios.mic.c
+- [ ] **Battery**: `battery=1` enables the Qualcomm UEFI status cache and `HakiosBattery`; not yet validated on this phone.
 - [ ] **Cellular**: hakios.mpss.c, hakios.qmi.c, hakios.nas.c, hakios.ipa.c, hakios.cell.c; soc.args carries the addresses, the IPA layout is for IPA 4.11 (docs/cellular.md)
 - [ ] **Haptics and cameras**: hakios.haptic.c, hakios.camera.c
 

@@ -9,10 +9,10 @@
  * and everything else follows from that: the status bar's battery, the lock screen's "Charging",
  * the Batteries widget, Settings > Battery.
  *
- * What the values are comes from the audio DSP's battery manager (drivers/audio/hakios.adsp.c,
- * with adsp=1, unless battmgr=0), by way of drivers/power/hakios.battery.c, which calls
- * HakiosBatteryReport() with every reading; the first one makes the service. Nothing here asks
- * the charger anything or tells it anything.
+ * With battery=1, the values come from the loader's read-only Qualcomm UEFI cache; otherwise they
+ * can come from the audio DSP's battery manager (drivers/audio/hakios.adsp.c, with adsp=1 unless
+ * battmgr=0). drivers/power/hakios.battery.c calls HakiosBatteryReport() with every reading; the
+ * first one makes the service. Nothing here asks the charger anything or tells it anything.
  *
  * As on Apple's newer batteries, CurrentCapacity is the percentage that the fuel gauge shows (and
  * MaxCapacity 100); the charges in mAh are AppleRawCurrentCapacity, AppleRawMaxCapacity (what the

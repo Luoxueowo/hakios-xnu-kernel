@@ -5,10 +5,10 @@
 
 Every device with a repository, and how far each part of it works. A device of yours: [Port a device](../porting/index.md).
 
-| Device | SoC | display | touch | buttons | gpu | storage | audio | network |
-|---|---|---|---|---|---|---|---|---|
-| [Xiaomi MIX 2S](polaris.md) | `sdm845` | partly | partly | partly |  |  |  |  |
-| [QEMU virt (aarch64)](qemu.md) | `none` | yes | yes | yes | no | yes | yes | yes |
+| Device | SoC | display | touch | buttons | gpu | storage | audio | battery | network |
+|---|---|---|---|---|---|---|---|---|---|
+| [Xiaomi MIX 2S](polaris.md) | `sdm845` | partly | partly | partly |  |  |  | partly |  |
+| [QEMU virt (aarch64)](qemu.md) | `none` | yes | yes | yes | no | yes | yes |  | yes |
 
 An empty cell is a part nobody has looked at on that device yet.
 

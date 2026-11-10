@@ -1,12 +1,16 @@
 /*
- * Battery monitor for Xiaomi redwood (POCO X5 Pro).
+ * Battery telemetry and the Darwin power-source report.
  *
- * The phone selects PM7325B and qcom,battery-charger over PMIC GLINK/ADSP, not
- * the local PM7250B/QG layout.  The resident UEFI contains the matching
- * Qualcomm charger drivers.  xnuloader owns that firmware context on core 0,
- * polls it, and publishes a read-only cache; XNU only consumes that cache.
- * Charger limits and JEITA protection therefore remain firmware-owned.
+ * With battery=1, xnuloader polls Qualcomm's ChargerEx/QcomCharger UEFI
+ * protocols on core 0 and publishes a read-only cache; XNU consumes it and
+ * reports it as HakiosBattery, an IOPMPowerSource. The Polaris profile keeps
+ * QcomCharger's reinitialize call disabled, as in the old Polaris loader
+ * configuration. Charger limits and JEITA protection remain firmware-owned.
+ *
+ * When battery=1 is absent, the audio DSP battery manager can report through
+ * hakios_battery_report() instead (adsp=1, unless battmgr=0).
  */
+#include <stdint.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -87,10 +91,22 @@ battery_snapshot(struct loader_battery *out)
 	return false;
 }
 
+static int32_t
+battery_scaled(int32_t value, int32_t scale)
+{
+	int64_t result = (int64_t)value * scale;
+
+	if (result > INT32_MAX) return INT32_MAX;
+	if (result < INT32_MIN) return INT32_MIN;
+	return (int32_t)result;
+}
+
 static void
 battery_poll(void)
 {
 	struct loader_battery sample;
+	struct hakios_battery_state report = { .size = sizeof(report) };
+	bool voltage_valid;
 
 	if (!battery_snapshot(&sample) || sample.magic != LOADER_BATTERY_MAGIC ||
 	    sample.version != LOADER_BATTERY_VERSION || sample.size < sizeof(sample) ||
@@ -98,8 +114,10 @@ battery_poll(void)
 		battery_failures++;
 		return;
 	}
+	voltage_valid = (sample.flags & LOADER_BATTERY_VOLTAGE_VALID) != 0 && sample.voltage_mv >= 2500 &&
+	    sample.voltage_mv <= 5000;
 	battery_soc_percent = sample.soc_percent;
-	battery_voltage_mv = (sample.flags & LOADER_BATTERY_VOLTAGE_VALID) ? sample.voltage_mv : -1;
+	battery_voltage_mv = voltage_valid ? sample.voltage_mv : -1;
 	battery_current_ma = sample.current_ma;
 	battery_temperature_c = sample.temperature_c;
 	battery_present = (sample.flags & LOADER_BATTERY_PRESENT) != 0;
@@ -107,12 +125,20 @@ battery_poll(void)
 	battery_charging = (sample.flags & LOADER_BATTERY_CHARGING) != 0;
 	battery_soc_estimated = (sample.flags & LOADER_BATTERY_SOC_ESTIMATED) != 0;
 	battery_charger_action = (int)sample.charger_action;
-	battery_updates++;
+	report.percent_hundredths = sample.soc_percent * 100;
+	report.voltage_uv = voltage_valid ? sample.voltage_mv * 1000 : 0;
+	report.current_ua = battery_scaled(sample.current_ma, 1000);
+	report.temperature_hundredths = battery_scaled(sample.temperature_c, 100);
+	report.present = battery_present;
+	report.external = battery_charger_present;
+	report.status = battery_charging ? 1 : battery_charger_present ?
+	    (sample.soc_percent == 100 ? 4 : 3) : 2;
+	hakios_battery_report(&report);
 }
 
 /*
- * What the audio DSP's battery manager says (drivers/audio/hakios.adsp.c, with adsp=1 unless battmgr=0):
- * the values that Android shows, from where Android takes them. They are kept here for the sysctls
+ * What the audio DSP's battery manager says (drivers/audio/hakios.adsp.c, with adsp=1 unless battmgr=0),
+ * when the loader's UEFI cache is not selected with battery=1. These values are kept here for sysctls
  * and passed on to the power source that Darwin reads (drivers/power/hakios.battery.cpp).
  */
 static int battery_full_uah, battery_design_uah, battery_cycles, battery_source_dsp;

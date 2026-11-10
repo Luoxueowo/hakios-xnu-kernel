@@ -6,7 +6,7 @@ driver BATTERY
 	file    bsd/dev/hakios.battery.c
 	file    iokit/Kernel/hakios.battery.cpp iokitcpp
 	help    the battery: kern.hakios.battery_*, and HakiosBattery, the IOPMPowerSource Darwin reads the charge from
-	help    (the state comes from the audio DSP's battery manager, with adsp=1)
+	help    (from the loader's Qualcomm UEFI cache with battery=1, or the audio DSP with adsp=1)
 
 driver CPUFREQ
 	file    bsd/dev/hakios.cpufreq.c
