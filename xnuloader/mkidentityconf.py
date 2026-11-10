@@ -125,7 +125,9 @@ def model_values(path, values):
         ('compatible', compatible),
         ('model', model),
     ]
-    return root, [('product-name', product)]
+    # product-name and product-description are both what the phone is called: Darwin's own tree
+    # carries the marketing name in both, and the interface reads one or the other
+    return root, [('product-name', product), ('product-description', product)]
 
 
 def main():
