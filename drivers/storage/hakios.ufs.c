@@ -45,6 +45,7 @@
 #include <kern/thread.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
+#include <libkern/OSByteOrder.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <miscfs/devfs/devfs.h>
@@ -82,13 +83,25 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 /*
  * Where a write may go, and nowhere else: darwin, the port's own 20 GiB at the end of logical
  * unit 0, and in it only past what the build puts there from the computer -- the Darwin volume
- * (blocks 0..1374207) and the two cryptexes behind it (..2042367). The loader keeps the same
- * bounds and checks the partition's type besides (xnuloader/loader.c, BLOCK_WRITE_FIRST). Where darwin
- * begins and its exact size are the phone's (tools/userdata-carve.py puts it after userdata, whatever
- * that is): at least the layout's 20 GiB.
+ * and the two cryptexes behind it. Past where those end is the data volume's; the boundary is
+ * worked out at start from the APFS containers actually there (ufs_data_scan), the loader's own
+ * floor and the darwin_data boot argument, and only falls back to the constant below. The loader
+ * keeps its own bounds and checks the partition's type besides (xnuloader/loader.c,
+ * BLOCK_WRITE_FIRST). Where darwin begins and its exact size are the phone's
+ * (tools/userdata-carve.py puts it after userdata, whatever that is): at least the layout's 20 GiB.
  */
-#define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
+#define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096: where the build's images end */
 #define UFS_DARWIN_MIN     5242875ULL                  /* the first phone's darwin, in blocks of 4096 */
+
+/*
+ * Where the data volume begins, in darwin's blocks of 4096: decided at start by what is written into
+ * darwin rather than by the constant above, so that a Darwin volume of another size -- or cryptexes
+ * that changed size -- move the data volume along by themselves, and everything past them is the
+ * data volume's (ufs_data_scan). The boot argument darwin_data=<blocks> overrides, and a loader that
+ * asks for its own floor is taken when that floor is the higher one; the constant is what is left
+ * when none of them says anything.
+ */
+static uint64_t ufs_write_first = UFS_WRITE_FIRST;
 
 struct loader_block_part {
 	char name[36];
@@ -612,7 +625,7 @@ ufs_write(uint32_t op, uint32_t part, uint64_t offset, const uint8_t *src, uint6
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
 		return EINVAL;          /* whole blocks only: nothing is read before a write */
 	}
-	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
+	if (offset / nbs < ufs_write_first || offset > ufs_part_bytes(part) ||
 	    len > ufs_part_bytes(part) - offset) {
 		/* the Darwin volume, the cryptexes, and anything past the partition's end: never */
 		ufs_write_refused++;
@@ -677,7 +690,58 @@ ufs_write_restore(void)
 	lck_mtx_unlock(&ufs_write_mtx);
 }
 
-/* ---- the data volume: darwin from UFS_WRITE_FIRST on ---- */
+/* ---- the data volume: darwin from ufs_write_first on ---- */
+
+/*
+ * Where the build's images end: the APFS containers written into darwin lie back to back from its
+ * first block -- the Darwin volume, then the two cryptexes -- and each says in its own header how
+ * many blocks it has (nx_block_count of an APFS container superblock, and the magic above it). Walked
+ * here, on the partition itself, so the data volume starts after whatever is really there. The block
+ * after the last container, rounded up to a megabyte and counted in darwin's 4096-byte blocks; 0 if
+ * darwin does not start with a container this reads.
+ */
+static uint64_t
+ufs_data_scan(uint32_t part)
+{
+	uint8_t *buf;
+	uint64_t blocks = ufs_page->part[part].blocks, b = 0, end = 0;
+
+	if (ufs_page->part[part].block_size != 4096) {
+		return 0;
+	}
+	buf = kalloc_data(4096, Z_WAITOK);
+	if (buf == NULL) {
+		return 0;
+	}
+	while (b < blocks) {
+		uint32_t bsize;
+		uint64_t count;
+
+		if (ufs_read(part, b * 4096, buf, 4096) != 0) {
+			break;
+		}
+		if (memcmp(buf + 32, "NXSB", 4) != 0) {
+			break;          /* not an APFS container: the images end before here */
+		}
+		memcpy(&bsize, buf + 36, sizeof(bsize));
+		memcpy(&count, buf + 40, sizeof(count));
+		bsize = OSSwapLittleToHostInt32(bsize);
+		count = OSSwapLittleToHostInt64(count);
+		if (bsize != 4096 || count == 0 || count > blocks - b) {
+			break;
+		}
+		b += count;
+		end = b;
+	}
+	kfree_data(buf, 4096);
+	if (end != 0) {
+		end = (end + 255) & ~255ULL;
+		if (end >= blocks) {
+			end = 0;        /* nothing left for a data volume */
+		}
+	}
+	return end;
+}
 
 static bool
 ufs_is_data(dev_t dev)
@@ -688,7 +752,7 @@ ufs_is_data(dev_t dev)
 static uint64_t
 ufs_data_bytes(void)
 {
-	return ufs_part_bytes((uint32_t)ufs_write_part) - UFS_WRITE_FIRST * 4096;
+	return ufs_part_bytes((uint32_t)ufs_write_part) - ufs_write_first * 4096;
 }
 
 /*
@@ -713,7 +777,7 @@ ufs_data_flush(void)
 	lck_mtx_lock(&ufs_write_mtx);
 	lck_mtx_lock(&ufs_lock);
 	/* one block in bounds, for the loader's checks; nothing of it is touched */
-	error = ufshc_list_in() ? EIO : ufs_request(BLOCK_OP_FLUSH, (uint32_t)ufs_write_part, UFS_WRITE_FIRST, 1, NULL, NULL);
+	error = ufshc_list_in() ? EIO : ufs_request(BLOCK_OP_FLUSH, (uint32_t)ufs_write_part, ufs_write_first, 1, NULL, NULL);
 	lck_mtx_unlock(&ufs_lock);
 	lck_mtx_unlock(&ufs_write_mtx);
 	return error;
@@ -727,7 +791,7 @@ ufs_data_flush(void)
 static int
 ufs_data_io(bool write, uint64_t offset, uint8_t *p, uint64_t len)
 {
-	uint64_t base = UFS_WRITE_FIRST * 4096, size = ufs_data_bytes();
+	uint64_t base = ufs_write_first * 4096, size = ufs_data_bytes();
 	uint8_t *bounce;
 	int error = 0;
 
@@ -1768,7 +1832,7 @@ hakios_ufs_init(void)
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
 		uint32_t offered = ufs_page->write_part_plus_one;
 
-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
+		if (offered == 0 || offered > ufs_parts) {
 			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
 			    "line too, and a loader that knows about writes)\n");
 		}
@@ -1799,9 +1863,36 @@ hakios_ufs_init(void)
 			ufs_write_part = (int)i;
 		}
 		if (ufs_write_part >= 0) {
+			/*
+			 * Where the data volume begins: the boot argument, else the end of the APFS containers
+			 * that are really written into darwin, else the loader's floor, else the constant. The
+			 * first two are the ones that move by themselves when the images written there change.
+			 */
+			uint64_t blocks = ufs_page->part[ufs_write_part].blocks;
+			uint64_t scanned = ufs_data_scan((uint32_t)ufs_write_part);
+			uint64_t asked = 0;
+			const char *from = "the build's own layout";
+
+			ufs_write_first = UFS_WRITE_FIRST;
+			if (ufs_page->write_first > ufs_write_first) {
+				ufs_write_first = ufs_page->write_first;
+				from = "the loader's floor";
+			}
+			if (scanned > ufs_write_first) {
+				ufs_write_first = scanned;
+				from = "the end of the containers written into darwin";
+			}
+			/* the boot argument wins over all of it, the way it does everywhere else */
+			if (PE_parse_boot_argn("darwin_data", &asked, sizeof(asked)) && asked > 0 && asked < blocks) {
+				ufs_write_first = asked;
+				from = "the darwin_data boot argument";
+			}
+			printf("ufs: the data volume starts at block %llu of darwin (%llu MB), from %s; "
+			    "%llu MB of it, whole blocks from there on\n", ufs_write_first,
+			    ufs_write_first * 4096 >> 20, from, (blocks - ufs_write_first) * 4096 >> 20);
 			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (ufs_page->part[ufs_write_part].blocks - UFS_WRITE_FIRST) * 4096 >> 20);
+			    "everything else of the storage is read only\n", ufs_write_first,
+			    (blocks - ufs_write_first) * 4096 >> 20);
 			if (devfs_make_node(makedev(ufs_bmajor, UFS_DATA_MINOR), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
 			    "ufs_darwin_data") != NULL) {
 				printf("ufs: /dev/ufs_darwin_data: the same %llu MB as a block device, for the data volume; "

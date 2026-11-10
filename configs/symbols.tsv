@@ -76,6 +76,7 @@ CAM_VBLANK	arg	cam_vblank	Cameras	k	hakios.camera.c
 CC_FADE	arg	cc_fade	User space	u	inject_sb.c	
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
+DARWIN_DATA	arg	darwin_data	Storage and APFS	k	hakios.ufs.c	
 DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock managers ("BCM") in the command database the boot loader left, with what is needed to vote for bandwidth on them -- only read
 DDR_REST	arg	ddr_rest	CPU, memory and boot	k	hakios.cpufreq.c	
 DDR_VOTE	arg	ddr_vote	CPU, memory and boot	k	hakios.cpufreq.c	
