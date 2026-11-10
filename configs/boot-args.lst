@@ -240,6 +240,7 @@ return_cpu	k
 return_panic	k
 root_apfs	u
 sb_delay	u
+screen_log	l
 serial	l
 small_cores	k
 small_cores_after	k

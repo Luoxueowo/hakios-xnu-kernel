@@ -63,3 +63,15 @@ A file that is not a payload gives `is not a payload (no XNUP at its start)`, an
 - The way to a phone that does not need a host today is the boot image itself, in a boot slot: `docs/install.md`.
 - Another UEFI on the phone, all of it open source: HakiOS's U-Boot, started from RAM by ABL, which takes the loader and the
   payload from memory and starts the loader with `bootefi` ([U-Boot](u-boot.md)).
+
+## Screen logging
+
+Use `screen_log=0` in the payload command line to hide loader text after payload
+parsing and disable the kernel's verbose screen console. Use `screen_log=1` to
+enable screen logging. The explicit setting overrides `-v`; omitting it preserves
+existing behaviour. Loader background text remains suppressed while the kernel
+owns the display.
+
+Screen logging is independent of log capture and `logdump` partition writes:
+turning it off does not disable either. Firmware and loader messages emitted
+before the payload command line is read are outside this setting.

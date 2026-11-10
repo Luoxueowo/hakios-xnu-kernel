@@ -168,6 +168,8 @@ str_eq(const char *a, const char *b)
  * the screen is left to the kernel (and to "oem screenshot").
  */
 static int screen_quiet;
+/* Independent of log capture and partition writes. */
+static int screen_log = -1; /* unspecified: preserve the existing -v behaviour */
 /*
  * And while the kernel runs, whatever started the loader: under HakiOS's U-Boot (the menu of an installed HakiOS) there
  * is no USB command loop, the text console is U-Boot's, drawn into the framebuffer the kernel shows Darwin in, and every
@@ -184,7 +186,7 @@ put_char(char c)
 	if (log_len < sizeof(log_buf) - 1) {
 		log_buf[log_len++] = c;
 	}
-	if (ST->con_out != NULL && !screen_quiet) {
+	if (ST->con_out != NULL && !screen_quiet && screen_log != 0) {
 		if (c == '\n') {
 			w[0] = '\r', w[1] = '\n';
 		} else {
@@ -3193,6 +3195,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("no kernel in payload\n");
 		return 0;
 	}
+	screen_log = -1;
+	for (const char *c = pi.cmdline; *c; c++) {
+		if ((c == pi.cmdline || c[-1] == ' ') && starts_with(c, "screen_log=") &&
+		    (c[11] == '0' || c[11] == '1') && (c[12] == 0 || c[12] == ' ')) {
+			screen_log = c[11] - '0';
+		}
+	}
 	if (!have_checkpoint) {
 		checkpoint = pi.checkpoint;
 	}
@@ -3457,6 +3466,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		for (const char *c = pi.cmdline; *c; c++) {
 			verbose |= starts_with(c, "-v") && (c[2] == ' ' || c[2] == 0) && (c == pi.cmdline || c[-1] == ' ');
 		}
+		if (screen_log >= 0) {
+			verbose = screen_log;
+		}
 		ba->video.v_baseAddr = SCREEN.base;
 		ba->video.v_display = verbose ? 0 : 1;
 		ba->video.v_rowBytes = SCREEN.stride;
@@ -3554,8 +3566,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * copy used to stop at the end without a word: a long line lost its tail (the last argument arrived
 	 * shortened and the kernel took it as that). Now it is said, with how much was lost.
 	 */
+	/* Keep the kernel's -v flag consistent with the explicit screen policy. */
+	if (screen_log == 1 && n + 3 < BOOT_LINE_LENGTH) {
+		ba->commandLine[n++] = '-';
+		ba->commandLine[n++] = 'v';
+		ba->commandLine[n++] = ' ';
+	}
 	const char *rest = pi.cmdline;
 	for (; *rest && n < BOOT_LINE_LENGTH - 1; rest++) {
+		if (screen_log == 0 && (rest == pi.cmdline || rest[-1] == ' ') &&
+		    starts_with(rest, "-v") && (rest[2] == 0 || rest[2] == ' ')) {
+			rest++;
+			continue;
+		}
 		ba->commandLine[n++] = *rest;
 	}
 	if (*rest != 0) {
