@@ -9,15 +9,17 @@
 | SoC | `sdm845` |
 | Configuration | `make polaris_defconfig` |
 | Maintainer | Luoxue |
-| Repository | [`devices/polaris/`](https://github.com/oosexgang/hakios-xnu-kernel/tree/main/devices/polaris) |
+| Repository | [`devices/polaris/`](https://github.com/Luoxueowo/hakios-xnu-kernel/tree/main/devices/polaris) |
 
 ## What works
 
 | Part | State | |
 |---|---|---|
-| display | partly | UEFI's framebuffer, through the loader (to be checked) |
-| touch | partly | Synaptics S3330 driver ported from the old Polaris project; not yet validated from this repository |
-| buttons | partly | PM8998 key driver ported from the old Polaris project; not yet validated from this repository |
-| battery | partly | Qualcomm UEFI charger cache reported through HakiosBattery; ported from the old Polaris setup, not yet validated here |
+| display | partly | UEFI boots successfully; display through the UEFI framebuffer is partially working |
+| touch | works | Synaptics S3330 RMI4 touch input works on the MIX 2S (`touchscreen=1`) |
+| buttons | works | MIX 2S PM8998 power and volume keys work (`touchscreen=1`) |
+| cpu | works | XNU runs on four CPUs (`bootcpu=7 cpus=4`) |
+| storage | works | persistent HFSX Data volume; Settings reports about 120–121 GB available |
+| battery | works | battery level and charging status are reported through HakiosBattery (`battery=1`) |
 
 The state is what has been seen on this device, written down in `devices/polaris/device.conf`; a part the table does not name has not been looked at.

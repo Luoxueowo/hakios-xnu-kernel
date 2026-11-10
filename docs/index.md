@@ -6,6 +6,8 @@ phone's.
 
 **Where it stands.** The POCO X5 Pro 5G runs the Darwin 16.5 user space you lay out yourself, and its window server draws through Metal
 on the Adreno 642L, at 100 to 104 frames a second in page swipes on a 120 Hz panel. 120 has not been reached: [the measurements](reference/metal-measurements.md).
+The Xiaomi MIX 2S also boots to the system; touch, buttons, four-core operation, persistent storage and battery-status reporting work,
+while display support is partial: [Polaris](devices/polaris.md).
 
 
 ## Guide: run it
@@ -14,9 +16,9 @@ on the Adreno 642L, at 100 to 104 frames a second in page swipes on a 120 Hz pan
 |---|---|
 | [Getting started](getting-started/index.md) | three ways in, and what your machine needs |
 | [QEMU](getting-started/qemu.md) | the open kernel in a few commands, or the Darwin user space you lay out yourself |
-| [On the phone](getting-started/phone.md) | the POCO X5 Pro 5G, in RAM with `fastboot boot`, back to Android with a reboot |
+| [On the phone](getting-started/phone.md) | POCO X5 Pro RAM sessions; [MIX 2S build and storage updates](../devices/polaris/STORAGE.md) |
 | [Windows](windows.md) | the same from a Windows PC: what runs in WSL 2, what in Git Bash; a measured Metal run |
-| [Installing beside Android](dual-boot.md) | HakiOS as a second system, a menu at every start, your data kept ([in Russian](ru/dual-boot.md)) |
+| [Installing beside Android](dual-boot.md) | the POCO X5 Pro U-Boot/A-B setup and menu ([in Russian](ru/dual-boot.md)) |
 | [Building from source](getting-started/building.md) | when you change something |
 
 ## Porting: bring a device
@@ -80,21 +82,20 @@ measurements are the source. The rows about the lock screen and the apps describ
 | | POCO X5 Pro 5G (`redwood`) | Xiaomi MIX 2S (`polaris`) | QEMU `virt` |
 |---|---|---|---|
 | Lock screen, home screen, Control Center, the stock apps | yes | — | yes (slow: the CPU is emulated) |
-| Touch, multitouch, buttons | yes | — | yes (the mouse and the keyboard) |
-| All 8 CPU cores, the big one at 2.4 GHz | yes | — | no |
+| Touch and buttons | yes | yes (touch, power and volume buttons) | yes (the mouse and the keyboard) |
+| Multiple CPU cores | yes | yes (four CPUs active) | no |
 | GPU (OpenGL ES through Mesa) | yes | — | no |
 | Metal | partly: the window server draws through it, on two paths ([Metal](reference/metal.md)), off by default; swipes 100 to 104 frames a second, not 120; other programs not shown | — | partly: a device Metal loads; no GPU, nothing drawn |
 | Wi-Fi | yes | — | yes (virtio-net) |
 | Sound, microphone | yes | — | sound only (virtio) |
-| The battery's level | yes | — | no |
+| Battery level and charging-status reporting | yes | yes | no |
 | Cameras, vibration | yes | — | no |
-| `/private/var` kept across reboots, Sileo, SSH | yes | — | no |
+| Persistent user storage (`/private/var`) | yes | yes (about 120–121 GB available) | no |
 | Flashlight, temperature guard | partly: written, some of it seen ([redwood](devices/redwood.md)) | — | no |
 | Cellular | partly: the modem is up, the SIM bound, the network seen; no registration yet ([cellular](cellular.md)) | — | no |
-| Bluetooth, charging under this kernel, Apple's services | no | — | no |
+| Bluetooth, Apple's services | no | — | no |
 
-`polaris` is a port on its way: it is at step 2 of [Port a device](porting/index.md), so nothing in this table has been seen on the
-phone yet. What has been written down, part by part, is [its own page](devices/polaris.md).
+The MIX 2S status reflects features confirmed on the phone. Its detailed component status is on [its own page](devices/polaris.md).
 
 ## The three layers
 
@@ -104,9 +105,10 @@ phone yet. What has been written down, part by part, is [its own page](devices/p
    it. Whether you may do that, and whether you want to, is your decision.
 3. **Apple's services** (activation, Apple ID, iCloud, the App Store): not supported and not a goal.
 
-By default the loader goes into RAM through `fastboot boot`, the system lives in RAM for a session, and a reboot brings the phone back to
-its own Android. The one thing written by default is the loader's own log (a few KB) to the `logdump` partition; with `ufs_write=1` the
-kernel writes only to a partition `darwin` that you create yourself. What is and is not written to a phone:
+The development-session default starts the loader with `fastboot boot`, keeps the system in RAM for a session, and returns the phone to
+Android on reboot. The MIX 2S also has an installed path: its boot image is flashed to `boot`, and System/OS/App and persistent Data
+live in the existing `darwin` partition. Runtime sessions write the loader log by default; Polaris persistent writes require
+`ufs_write=1` and stay in the Data range. What is and is not written to a phone:
 [Architecture](concepts/architecture.md#what-is-written-to-the-phone).
 
 ## What is in the repository, and what never is
