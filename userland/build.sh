@@ -218,6 +218,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -o obj/shm_test src/shm_test.c
 		$DYN -o obj/apfs_mmap_test src/apfs_mmap_test.c
 		$DYN -o obj/vol_ls src/vol_ls.c
+		$DYN -dynamiclib -framework CoreFoundation -lobjc -install_name /polaris/lib/libhakios.storage.dylib \
+			-o obj/libhakios.storage.dylib src/storage_capacity.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
@@ -241,7 +243,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
 		# program either as the one library the kernel inserts or opened by a library of ours
 		$DYN -dynamiclib -install_name /polaris/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
-			-o obj/libhakios.tweaks.dylib src/inject_tweaks.c
+			-o obj/libhakios.tweaks.dylib src/inject_tweaks.c obj/libhakios.storage.dylib
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /polaris/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
@@ -370,6 +372,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	[ -f obj/libhakios.storage.dylib ] && cp obj/libhakios.storage.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
 		cp obj/HakiosAudio root/lib/HakiosAudio.driver/

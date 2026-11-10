@@ -259,6 +259,8 @@ load_the_tweaks(void)
 	}
 }
 
+extern void hakios_storage_capacity_init(void);
+
 __attribute__((constructor))
 static void
 hakios_tweaks_init(void)
@@ -269,5 +271,6 @@ hakios_tweaks_init(void)
 		return;
 	}
 	done = true;
+	hakios_storage_capacity_init();
 	load_the_tweaks();
 }

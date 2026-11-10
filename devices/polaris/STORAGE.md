@@ -72,3 +72,19 @@ updated. Pack and apply the new manifest, then flash the matching boot. Omit
 never writes Data. An image exceeding its reserved slot is rejected before any
 system write. Keep independent user-data backups; fixed offsets protect against
 system-update overlap, not drive failure or an incompatible OS upgrade.
+
+## Capacity shown by Settings
+
+The almost-113-GiB Data volume is about 121.33 GB in decimal units. HFSX provides
+its live free/available counters through `statfs` and `getattrlist`. On firmware
+20F66, NSURL's important/opportunistic capacity queries return zero on this HFS
+volume even while those counters and ordinary Foundation free-size queries are
+positive. About uses the important-usage capacity query.
+
+`libhakios.storage.dylib`, linked by the Preferences injection library, adapts the
+CFURL and NSURL entry points: only an original zero policy-capacity answer on a
+writable HFS volume may fall back to its actual `f_bavail * f_bsize`. It does not
+claim purgeable space, change total capacity, override nonzero answers, or replace
+a zero when the volume really is full. Read-only and other filesystem types keep
+their existing answers. This is a user-space capacity adapter, not a filesystem
+format or partition change.
