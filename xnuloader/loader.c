@@ -3429,6 +3429,26 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "#address-cells", 2);
 	dt_prop_u32(&w, "#size-cells", 2);
 	/*
+	 * The MIX 2S's read-only key driver needs the PM8998 arbiter regions and key peripherals.
+	 * These board values are carried from the old Polaris loader's platform.h; keep the node
+	 * limited to the Polaris platform profile.
+	 */
+	if (plat == &platform_polaris) {
+		dt_begin(&w, "polaris-buttons");
+		dt_prop_str(&w, "compatible", "xiaomi,polaris-pm8998-buttons");
+		dt_prop_u32(&w, "arbiter-core", 0x0c440000);
+		dt_prop_u32(&w, "arbiter-config", 0x0c40a000);
+		dt_prop_u32(&w, "arbiter-observer", 0x0e600000);
+		dt_prop_u32(&w, "pon-sid", 0);
+		dt_prop_u32(&w, "pon-peripheral", 0x08);
+		dt_prop_u32(&w, "gpio-sid", 0);
+		dt_prop_u32(&w, "gpio-peripheral", 0xc5);
+		dt_prop_u32(&w, "gpio-number", 6);
+		dt_prop_u32(&w, "gpio-active-low", 1);
+		dt_prop_u32(&w, "debounce-ms", 15);
+		dt_end(&w);
+	}
+	/*
 	 * With cam=5, where MobileGestalt looks for the cameras (IODeviceTree:/arm-io/isp, its still-camera and
 	 * rear-facing-camera, by which SpringBoard shows Camera.app): the iPhone's ISP node, of its
 	 * properties only the camera at the back. Neither a compatible nor a device_type: no driver matches it.

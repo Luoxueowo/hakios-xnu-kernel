@@ -222,6 +222,7 @@ net_names	k
 net_trace	k
 pmic	k
 pmic_list	k
+polarisbuttons	k
 press_power	k
 press_power_ms	k
 privs	k

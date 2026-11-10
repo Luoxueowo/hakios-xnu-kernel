@@ -57,7 +57,8 @@ come from its tree and its Android. What is written for one phone is the list be
 says where its numbers came from; that is the map of what to rewrite.
 
 - [ ] **UEFI**: the firmware that starts the loader: devices/redwood/uefi/ is a port of mu_aloha_platforms; the vendor's drivers are extracted from your own phone (uefi/README.md)
-- [ ] **Display and buttons**: framebuffer and button paths still need device-specific validation.
+- [ ] **Display**: framebuffer path still needs device-specific validation.
+- [ ] **Buttons**: `drivers/input/hakios.buttons.polaris.c` reads the MIX 2S PM8998 power and volume keys; ported from the old project, pending validation from this repository.
 - [ ] **Touch**: `drivers/input/hakios.synaptics.c` is the MIX 2S Synaptics S3330 RMI4 driver, ported from the old Polaris project; verify it from this repository on the phone.
 - [ ] **Storage**: hakios.ufs.c and hakios.ufshc.c (UFS); a phone with eMMC needs another driver
 - [ ] **CPU clocks**: hakios.cpufreq.c

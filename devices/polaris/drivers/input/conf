@@ -3,3 +3,8 @@ driver SYNAPTICS
     file    bsd/dev/hakios.synaptics.c
     default n
     help    the Xiaomi MIX 2S Synaptics S3330 RMI4 touch screen on its bit-banged I2C bus (touchscreen=1)
+
+driver BUTTONS_POLARIS
+    file    bsd/dev/hakios.buttons.polaris.c
+    default n
+    help    the Xiaomi MIX 2S PM8998 power and volume keys through SPMI (buttons=1; touchscreen=1 also enables them)

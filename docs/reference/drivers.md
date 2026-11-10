@@ -110,5 +110,6 @@ Every driver the kernel can be built with. `CONFIG_HAKIOS_<NAME>=y` in a defconf
 | Driver | Files | Requires | Boot arguments | polaris | qemu | |
 |---|---|---|---|---|---|
 | **`HAKIOS_SYNAPTICS`**<br>the Xiaomi MIX 2S Synaptics S3330 RMI4 touch screen on its bit-banged I2C bus (touchscreen=1) | `hakios.synaptics.c` |  | `synaptics_fingers=`, `synaptics_max_x=`, `synaptics_max_y=`, `synaptics_poll_us=`, `synaptics_reset=`, `synaptics_trace=`, `touchscreen=` | built |  | |
+| **`HAKIOS_BUTTONS_POLARIS`**<br>the Xiaomi MIX 2S PM8998 power and volume keys through SPMI (buttons=1; touchscreen=1 also enables them) | `hakios.buttons.polaris.c` |  | `buttons=`, `polarisbuttons=`, `touchscreen=` | built |  | |
 
 The columns on the right are the devices' defconfigs: "built" means that defconfig builds the driver in.
