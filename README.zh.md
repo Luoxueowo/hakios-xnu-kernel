@@ -17,7 +17,7 @@
 | [hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) | **公共部分**：内核移植、所有公共驱动、引导加载器、用户空间、工具、本文档以及 `devices/qemu` |
 | [`hakios-metal/`](hakios-metal) | 通过内核的 GPU 驱动，在 Adreno 上实现 Metal 的命令模型 |
 | [hakios-sm7325](https://github.com/oosexgang/hakios-sm7325) | POCO X5 Pro 5G：defconfig、状态、UEFI 平台、固件脚本及其 SoC 层（Qualcomm SC7280 系列） |
-| [devices/polaris/](devices/polaris/README.md) | 小米 MIX 2S（Polaris，SDM845）：UEFI 可正常引导；触摸、按键、四核运行、持久化存储及电量/充电状态显示可用；显示部分可用。[构建、刷入和分区更新说明](devices/polaris/STORAGE.md) |
+| [devices/polaris/](devices/polaris/README.md) | 小米 MIX 2S（Polaris，SDM845）：UEFI 可正常引导；触摸、按键、八核运行、持久化存储及电量/充电状态显示可用；CPU 时钟仍由引导程序设置，显示部分可用。[构建、刷入和分区更新说明](devices/polaris/STORAGE.md) |
 | [hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) | Infinix Hot 20（MediaTek Helio G85）：实验性移植，有自己的引导加载器。不在本仓库的清单中 |
 | [uefi/](uefi/README.md) | 启动引导加载器的固件：带有 HakiOS 启动路径、标志和名称的 mu_aloha_platforms，以及 HakiOS 的 U-Boot |
 | [hackios-web](https://github.com/oosexgang/hackios-web) | 网站 |

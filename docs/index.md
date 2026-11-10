@@ -6,8 +6,8 @@ phone's.
 
 **Where it stands.** The POCO X5 Pro 5G runs the Darwin 16.5 user space you lay out yourself, and its window server draws through Metal
 on the Adreno 642L, at 100 to 104 frames a second in page swipes on a 120 Hz panel. 120 has not been reached: [the measurements](reference/metal-measurements.md).
-The Xiaomi MIX 2S also boots to the system; touch, buttons, four-core operation, persistent storage and battery-status reporting work,
-while display support is partial: [Polaris](devices/polaris.md).
+The Xiaomi MIX 2S also boots to the system; touch, buttons, eight-core operation, persistent storage and battery-status reporting work.
+Its SDM845 CPU clocks remain at the boot-loader setting, and display support is partial: [Polaris](devices/polaris.md).
 
 
 ## Guide: run it
@@ -83,7 +83,7 @@ measurements are the source. The rows about the lock screen and the apps describ
 |---|---|---|---|
 | Lock screen, home screen, Control Center, the stock apps | yes | — | yes (slow: the CPU is emulated) |
 | Touch and buttons | yes | yes (touch, power and volume buttons) | yes (the mouse and the keyboard) |
-| Multiple CPU cores | yes | yes (four CPUs active) | no |
+| Multiple CPU cores | yes | yes (eight CPUs active; CPU clocks remain at the boot-loader setting) | no |
 | GPU (OpenGL ES through Mesa) | yes | — | no |
 | Metal | partly: the window server draws through it, on two paths ([Metal](reference/metal.md)), off by default; swipes 100 to 104 frames a second, not 120; other programs not shown | — | partly: a device Metal loads; no GPU, nothing drawn |
 | Wi-Fi | yes | — | yes (virtio-net) |

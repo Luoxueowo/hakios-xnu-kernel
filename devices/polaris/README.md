@@ -26,8 +26,9 @@ This loader profile is integrated, and XNU has now booted to the system on the M
 as specified by the old Polaris loader profile and the device's timer description.
 
 UEFI boots successfully on the MIX 2S. Display output through the UEFI framebuffer is partially working. XNU has confirmed working
-touch input, power and volume buttons, four active CPUs, persistent storage, and battery-level and charging-status reporting. The
-boot configuration uses `touchscreen=1`, `bootcpu=7 cpus=4`, and `battery=1`.
+touch input, power and volume buttons, eight active CPUs, persistent storage, and battery-level and charging-status reporting. The
+boot configuration uses `touchscreen=1`, `bootcpu=7 cpus=8 cpufreq=1`, and `battery=1`. CPU clocks remain at the boot loader's
+setting: the SDM845 uses OSM, which the current CPU-frequency driver does not control.
 
 With `battery=1`, the loader reads the resident Qualcomm ChargerEx/QcomCharger protocols and shares a read-only status cache with
 XNU. The Polaris profile does not reinitialize QcomCharger, matching the old Polaris loader setting. XNU publishes the readings as
@@ -71,10 +72,10 @@ says where its numbers came from; that is the map of what to rewrite.
 - [ ] **Display (partial)**: UEFI framebuffer output works partially; display support still needs further device-specific work.
 - [x] **Buttons**: `drivers/input/hakios.buttons.polaris.c` handles the MIX 2S PM8998 power and volume keys; both are confirmed working.
 - [x] **Touch**: `drivers/input/hakios.synaptics.c` handles the MIX 2S Synaptics S3330 RMI4 touchscreen; touch input is confirmed working.
-- [x] **Multi-core CPU**: XNU runs with four active CPUs (`bootcpu=7 cpus=4`). CPU frequency scaling is a separate feature.
+- [x] **Multi-core CPU**: XNU runs with eight active CPUs (`bootcpu=7 cpus=8`). CPU clock control is still pending; the SDM845 OSM is not driven by the current CPU-frequency driver.
 - [x] **Storage**: UFS-backed persistent HFSX Data is mounted for user data; Settings reports about 120–121 GB available.
-- [ ] **CPU clocks**: `hakios.cpufreq.c`
-- [ ] **GPU**: hakios.adreno.c (Adreno 642L here: another generation needs its own firmware and registers)
+- [ ] **CPU clocks**: the SDM845 OSM path is not implemented; the existing EPSS path in `hakios.cpufreq.c` is for the SM7325.
+- [ ] **GPU**: the MIX 2S has an Adreno 630; the current `hakios.adreno.c` driver targets the POCO X5 Pro's Adreno 642L and is disabled for Polaris.
 - [ ] **Wi-Fi**: hakios.wifi.c, hakios.lx.c and wifi/lx/ (the WCN6750 radio of the reference phone)
 - [ ] **Audio**: hakios.adsp.c, hakios.audio.c, hakios.sound.c, hakios.speaker.c, hakios.mic.c
 - [x] **Battery status**: `battery=1` enables the Qualcomm UEFI status cache and `HakiosBattery`; battery level and charging status are confirmed visible.

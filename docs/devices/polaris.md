@@ -9,7 +9,7 @@
 | SoC | `sdm845` |
 | Configuration | `make polaris_defconfig` |
 | Maintainer | Luoxue |
-| Repository | [`devices/polaris/`](https://github.com/Luoxueowo/hakios-xnu-kernel/tree/main/devices/polaris) |
+| Repository | [`devices/polaris/`](https://github.com/oosexgang/hakios-xnu-kernel/tree/main/devices/polaris) |
 
 ## What works
 
@@ -18,7 +18,7 @@
 | display | partly | UEFI boots successfully; display through the UEFI framebuffer is partially working |
 | touch | works | Synaptics S3330 RMI4 touch input works on the MIX 2S (`touchscreen=1`) |
 | buttons | works | MIX 2S PM8998 power and volume keys work (`touchscreen=1`) |
-| cpu | works | XNU runs on four CPUs (`bootcpu=7 cpus=4`) |
+| cpu | works | all eight cores (`bootcpu=7 cpus=8 cpufreq=1`); the clock is the boot loader's, SDM845's OSM is not driven |
 | storage | works | persistent HFSX Data volume; Settings reports about 120–121 GB available |
 | battery | works | battery level and charging status are reported through HakiosBattery (`battery=1`) |
 
