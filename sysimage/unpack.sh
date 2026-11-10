@@ -75,11 +75,8 @@ if [ ! -f .done-rootfs ] || [ select-system.py -nt .done-rootfs ]; then
 	echo "unpack.sh: extracting $(wc -l < system.files) files"
 	rm -rf rootfs
 	7z x -y -orootfs rootfs.dmg @system.files > extract-system.log
-	# the two fonts too big for the image as they are, made smaller in place (see select-system.py)
-	python3 ../tools/font_trim.py emoji rootfs/System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc \
-		rootfs/System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc 40,64,96
-	python3 ../tools/font_trim.py faces rootfs/System/Library/Fonts/LanguageSupport/PingFang.ttc \
-		rootfs/System/Library/Fonts/LanguageSupport/PingFang.ttc '^\.?PingFang(SC|TC|HK)-(Regular|Semibold)$'
+	# (the fonts are taken whole now -- the colour emoji and PingFang as they are in the image; see
+	# select-system.py. ../tools/font_trim.py is still what a smaller image would use.)
 	touch .done-rootfs
 	[ -n "$KEEP" ] || rm -f rootfs.dmg
 fi
