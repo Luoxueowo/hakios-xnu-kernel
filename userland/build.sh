@@ -428,6 +428,30 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# the prefix with the root on the flash, downloads every package and index there, and without it each
 	# download ended in "No such file or directory"
 	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
+	# The language: Simplified Chinese, first in CoreFoundation's search list, English after it. The
+	# resources are in the system image (sysimage/select-system.py keeps zh-Hans/zh_CN and drops the rest);
+	# what is missing without this file is the choice -- CoreFoundation reads it from
+	# /private/var/mobile/Library/Preferences/.GlobalPreferences.plist, and a data volume that has none
+	# comes up in English, the development region. init writes it on the first boot that finds it missing
+	# (the `f` line below), so a volume made before this change gets it too -- and one where it has been
+	# set another way since is left alone.
+	cat > root/etc/GlobalPreferences.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AppleLanguages</key>
+	<array>
+		<string>zh-Hans</string>
+		<string>zh_CN</string>
+		<string>en</string>
+	</array>
+	<key>AppleLocale</key>
+	<string>zh_CN</string>
+</dict>
+</plist>
+PLIST
+	printf 'f\t600\t501\t501\t/private/var/mobile/Library/Preferences/.GlobalPreferences.plist\t/etc/GlobalPreferences.plist\n' >> root/etc/var.skel
 	# Metal's compiled shader stages (HakiosMetalCA.m: HM_CACHE_DIR): in /var/db so that var_store keeps them (it
 	# leaves tmp out), open to every user like tmp, since the window server may not be root
 	printf 'd\t1777\t0\t0\t/private/var/db/hakios-metal-cache\n' >> root/etc/var.skel
