@@ -77,21 +77,24 @@ on the Adreno 642L, at 100 to 104 frames a second in page swipes on a 120 Hz pan
 As each device's own `device.conf` records it: [all devices](devices/index.md). Where the Metal row is ahead of a device's file, the
 measurements are the source. The rows about the lock screen and the apps describe what happens when you add layer 2 below yourself.
 
-| | POCO X5 Pro 5G (`redwood`) | QEMU `virt` |
-|---|---|---|
-| Lock screen, home screen, Control Center, the stock apps | yes | yes (slow: the CPU is emulated) |
-| Touch, multitouch, buttons | yes | yes (the mouse and the keyboard) |
-| All 8 CPU cores, the big one at 2.4 GHz | yes | no |
-| GPU (OpenGL ES through Mesa) | yes | no |
-| Metal | partly: the window server draws through it, on two paths ([Metal](reference/metal.md)), off by default; swipes 100 to 104 frames a second, not 120; other programs not shown | partly: a device Metal loads; no GPU, nothing drawn |
-| Wi-Fi | yes | yes (virtio-net) |
-| Sound, microphone | yes | sound only (virtio) |
-| The battery's level | yes | no |
-| Cameras, vibration | yes | no |
-| `/private/var` kept across reboots, Sileo, SSH | yes | no |
-| Flashlight, temperature guard | partly: written, some of it seen ([redwood](devices/redwood.md)) | no |
-| Cellular | partly: the modem is up, the SIM bound, the network seen; no registration yet ([cellular](cellular.md)) | no |
-| Bluetooth, charging under this kernel, Apple's services | no | no |
+| | POCO X5 Pro 5G (`redwood`) | Xiaomi MIX 2S (`polaris`) | QEMU `virt` |
+|---|---|---|---|
+| Lock screen, home screen, Control Center, the stock apps | yes | — | yes (slow: the CPU is emulated) |
+| Touch, multitouch, buttons | yes | — | yes (the mouse and the keyboard) |
+| All 8 CPU cores, the big one at 2.4 GHz | yes | — | no |
+| GPU (OpenGL ES through Mesa) | yes | — | no |
+| Metal | partly: the window server draws through it, on two paths ([Metal](reference/metal.md)), off by default; swipes 100 to 104 frames a second, not 120; other programs not shown | — | partly: a device Metal loads; no GPU, nothing drawn |
+| Wi-Fi | yes | — | yes (virtio-net) |
+| Sound, microphone | yes | — | sound only (virtio) |
+| The battery's level | yes | — | no |
+| Cameras, vibration | yes | — | no |
+| `/private/var` kept across reboots, Sileo, SSH | yes | — | no |
+| Flashlight, temperature guard | partly: written, some of it seen ([redwood](devices/redwood.md)) | — | no |
+| Cellular | partly: the modem is up, the SIM bound, the network seen; no registration yet ([cellular](cellular.md)) | — | no |
+| Bluetooth, charging under this kernel, Apple's services | no | — | no |
+
+`polaris` is a port on its way: it is at step 2 of [Port a device](porting/index.md), so nothing in this table has been seen on the
+phone yet. What has been written down, part by part, is [its own page](devices/polaris.md).
 
 ## The three layers
 
