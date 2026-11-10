@@ -11,6 +11,7 @@
  */
 #include "efi.h"
 #include "identity.h"         /* who Darwin shall think we are: from the iPhone's own device tree (mkidentity.py) */
+#include "identity_conf.h"    /* the serial number and the UDID's inputs: devices/<device>/identity.conf (mkidentityconf.py) */
 
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
@@ -652,15 +653,49 @@ dt_prop_padded(struct dt_writer *w, const char *name, const char *value, uint32_
  */
 static int gamut_p3;    /* boot-arg gamut=p3 (a test): the iPhone's own "P3" left in place */
 
-static void
-dt_identity(struct dt_writer *w, const struct identity_prop *props, uint32_t count, const unsigned char *data)
+static int
+identity_has(const struct identity_prop *props, uint32_t count, const char *name)
 {
 	for (uint32_t i = 0; i < count; i++) {
+		if (str_eq(props[i].name, name)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * The properties of one node, copied out of identity.h -- but where the boot is to present another
+ * model (devices/<device>/identity.conf: model, board, product-name), that property's place is taken
+ * by the one in hk_root_override / hk_product_override.
+ */
+static void
+dt_identity(struct dt_writer *w, const struct identity_prop *props, uint32_t count, const unsigned char *data,
+    const struct identity_override *ov, uint32_t nov)
+{
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t k;
+
+		for (k = 0; k < nov; k++) {
+			if (str_eq(ov[k].name, props[i].name)) {
+				dt_prop(w, props[i].name, ov[k].value, ov[k].length);
+				break;
+			}
+		}
+		if (k < nov) {
+			continue;
+		}
 		if (str_eq(props[i].name, "artwork-display-gamut") && !gamut_p3) {
 			dt_prop(w, props[i].name, "sRGB", 5);
 			continue;
 		}
 		dt_prop(w, props[i].name, data + props[i].offset, props[i].length);
+	}
+	/* ... and one the phone's own tree does not have at all */
+	for (uint32_t k = 0; k < nov; k++) {
+		if (!identity_has(props, count, ov[k].name)) {
+			dt_prop(w, ov[k].name, ov[k].value, ov[k].length);
+		}
 	}
 }
 
@@ -3624,14 +3659,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * its device up by these, and its files -- the dyld shared cache to begin with -- are
 	 * those of that phone. XNU itself does not care; the hardware is described further down.
 	 */
-	dt_identity(&w, identity_root, sizeof(identity_root) / sizeof(identity_root[0]), identity_root_data);
+	dt_identity(&w, identity_root, sizeof(identity_root) / sizeof(identity_root[0]), identity_root_data,
+	    hk_root_override, HK_ROOT_OVERRIDE_COUNT);
 	dt_prop_str(&w, "platform-name", "t8015");
-	/* what iBoot takes from the factory configuration of a real phone; fixed size fields */
-	dt_prop_padded(&w, "serial-number", "RDW00POCOX5P", 32);
-	dt_prop_padded(&w, "mlb-serial-number", "RDW00POCOX5PMLB00", 32);
-	dt_prop_padded(&w, "model-number", "MQAC2", 32);
-	dt_prop_padded(&w, "region-info", "LL/A", 32);
-	dt_prop_padded(&w, "regulatory-model-number", "A1865", 32);
+	/*
+	 * What iBoot takes from the factory configuration of a real phone; fixed size fields. The values are
+	 * the device's, not the code's: devices/<device>/identity.conf, compiled in as identity_conf.h
+	 * (mkidentityconf.py, build.sh) -- see that file for what each one is.
+	 */
+	dt_prop_padded(&w, "serial-number", HK_SERIAL, 32);
+	dt_prop_padded(&w, "mlb-serial-number", HK_MLB, 32);
+	dt_prop_padded(&w, "model-number", HK_MODEL_NUMBER, 32);
+	dt_prop_padded(&w, "region-info", HK_REGION, 32);
+	dt_prop_padded(&w, "regulatory-model-number", HK_REGULATORY, 32);
 	dt_prop_u32(&w, "#address-cells", 2);
 	dt_prop_u32(&w, "#size-cells", 2);
 
@@ -3655,13 +3695,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * (UDID) from the serial number, the chip ID and the two addresses; when one is missing it
 	 * asks its helper for the factory data, is refused and waits forever (and lsd with it).
 	 */
-	static const uint8_t wifi_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x01 };
-	static const uint8_t bluetooth_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x02 };
+	static const uint8_t wifi_address[6] = HK_MAC_WIFI;
+	static const uint8_t bluetooth_address[6] = HK_MAC_BLUETOOTH;
 	static const uint8_t manifest_hash[48] = { 0x72, 0x65, 0x64, 0x77, 0x6f, 0x6f, 0x64 };
 	static const uint8_t no_behavior[16];
-	dt_prop_u64(&w, "unique-chip-id", 0x000052445730001ULL);
-	dt_prop_u32(&w, "chip-id", 0x8015);
-	dt_prop_u32(&w, "board-id", 0x06);
+	dt_prop_u64(&w, "unique-chip-id", HK_UNIQUE_CHIP_ID);
+	dt_prop_u32(&w, "chip-id", HK_CHIP_ID);
+	dt_prop_u32(&w, "board-id", HK_BOARD_ID);
 	dt_prop(&w, "mac-address-wifi0", wifi_address, sizeof(wifi_address));
 	dt_prop(&w, "mac-address-bluetooth0", bluetooth_address, sizeof(bluetooth_address));
 	dt_prop(&w, "boot-manifest-hash", manifest_hash, sizeof(manifest_hash));
@@ -3717,7 +3757,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* the product: screen class, artwork scale, name ... as on the real phone */
 	dt_begin(&w, "product");
-	dt_identity(&w, identity_product, sizeof(identity_product) / sizeof(identity_product[0]), identity_product_data);
+	dt_identity(&w, identity_product, sizeof(identity_product) / sizeof(identity_product[0]), identity_product_data,
+	    hk_product_override, HK_PRODUCT_OVERRIDE_COUNT);
 	/*
 	 * and its haptics: "closed-loop" (MobileGestalt's DeviceSupportsClosedLoopHaptics) makes Darwin play
 	 * its vibrations and feedbacks as waveforms on the "Actuator" audio device (the audio plug-in
@@ -3725,7 +3766,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * that the iPhone X does not have, and nothing vibrates.
 	 */
 	dt_begin(&w, "haptics");
-	dt_identity(&w, identity_haptics, sizeof(identity_haptics) / sizeof(identity_haptics[0]), identity_haptics_data);
+	dt_identity(&w, identity_haptics, sizeof(identity_haptics) / sizeof(identity_haptics[0]), identity_haptics_data,
+	    NULL, 0);
 	dt_end(&w);
 	/*
 	 * and of its camera what is here: with torch=N the flash (MobileGestalt's camera-flash; without

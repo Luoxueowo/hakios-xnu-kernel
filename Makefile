@@ -79,7 +79,7 @@ kernel:
 	tools/make-kernel.sh -j$(JOBS)
 
 loader:
-	xnuloader/build.sh
+	DEVICE="$(DEVICE)" IDENTITY_CONF="$(CURDIR)/devices/$(DEVICE)/identity.conf" xnuloader/build.sh
 
 boot:
 	tools/build-boot.sh "$(BOOT_CONFIG)"

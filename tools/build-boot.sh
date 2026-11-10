@@ -107,7 +107,8 @@ fi
 
 if [[ "$BUILD_LOADER" == 1 ]]; then
 	echo "build-boot: compile UEFI loader"
-	make DEVICE="$DEVICE" loader
+	# the serial number and the UDID's inputs, from this device's own file
+	IDENTITY_CONF="$ROOT/devices/$DEVICE/identity.conf" make DEVICE="$DEVICE" loader
 fi
 
 for required in "$KERNEL_PATH" "$LOADER_PATH" "$RESIDENT_PATH" "$RAMDISK_PATH"; do

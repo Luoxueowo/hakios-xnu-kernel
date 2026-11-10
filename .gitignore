@@ -52,6 +52,7 @@ __pycache__/
 !/xnuloader/efi.h
 !/xnuloader/loader.c
 !/xnuloader/mkidentity.py
+!/xnuloader/mkidentityconf.py
 !/xnuloader/mkpayload.py
 
 /qemu/*
@@ -106,8 +107,11 @@ __pycache__/
 /tools/android/f2fs-resize
 /tools/macos-bin/platform-tools/
 
-# made at build time from the device tree of the builder's own IPSW (xnuloader/mkidentity.sh)
+# made at build time: from the device tree of the builder's own IPSW (xnuloader/mkidentity.sh), and from
+# the serial number and the UDID's inputs of the device (xnuloader/mkidentityconf.py,
+# devices/<device>/identity.conf -- that file is tracked, the header is not)
 /xnuloader/identity.h
+/xnuloader/identity_conf.h
 !/xnuloader/im4p.py
 !/xnuloader/mkidentity.sh
 
