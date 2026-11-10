@@ -37,7 +37,7 @@ base and size (`0x9FC00000`, `0x300000`) and the SoC that names the FD, and the 
 | `BootShim/BootShim.S` | copies the `XNUP` container behind the UEFI image to `0xF0000000`, where the loader finds the kernel |
 | `Common/MU/.../PlatformBootManagerLib/MsPlatform.c` | when BDS finds nothing to boot, hands over to the XNU loader (`XnuLoader.c`) instead of "No Operating System Found" |
 | `Platforms/AndromedaPkg/Andromeda.dsc.inc` | `PcdFirmwareVendor` is `HakiOS` (what the firmware and its SMBIOS tables say they are) |
-| `Platforms/AndromedaPkg/Include/Resources/BootLogo.bmp` | the site's mark, white on black, in place of Project Aloha's |
+| `Platforms/AndromedaPkg/Include/Resources/BootLogo.bmp` | the Apple logo, white on black, in place of Project Aloha's |
 
 `XnuLoader.c` runs when BDS has nothing to boot. It looks in the payload for `loader.efi` and starts it straight from
 memory, so the loader is iterated on without rebuilding the firmware. When there is none, it writes what the loader
@@ -81,9 +81,9 @@ it; `llvm-objcopy` is used when the machine has one (`MUALOHA_OBJCOPY=<path>` sa
 python3 uefi/branding/banner.py /tmp/logo        # BootLogo.bmp, 236x236
 ```
 
-It is the website's mark (hakios-web: a lowercase h and a red dot) white on black, drawn from its shapes and smoothed,
-the size the FDF embeds. Nothing to install; change the size or the colours in the file and run `uefi/apply.sh`
-again.
+It is a white Apple silhouette on black, drawn from smooth curves and smoothed to the size the FDF embeds. Nothing to
+install; change the size in the file and run the generator again, or run `uefi/apply.sh` to regenerate it as part of
+the UEFI tree.
 
 ## Limits
 
