@@ -1,14 +1,16 @@
 # On the phone
 
-The phone with a port today is the **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G): [its page](../devices/redwood.md). Another
-phone needs a port first: [Port a device](../porting/index.md).
+This page's `make phone` commands are the temporary RAM-session workflow for the **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G):
+[its page](../devices/redwood.md). The Xiaomi MIX 2S (`polaris`) also boots HakiOS, but uses a direct-flashed boot image and a
+persistent fixed `darwin` layout; use the [MIX 2S build and storage guide](../../devices/polaris/STORAGE.md) for that workflow.
+Other phones need a port first: [Port a device](../porting/index.md).
 
-## What happens to the phone
+## What happens in a Redwood RAM session
 
-Nothing is installed. The loader goes into RAM with `fastboot boot`, the system image is sent into RAM, a session runs for as long
-as you say, and a reboot brings the phone back to its own Android. The one thing written by default is the loader's own log, a
-few KB, to the phone's `logdump` partition. With `ufs_write=1` (off unless you ask) the kernel writes to a partition named `darwin`
-that you create yourself, and nowhere else. [What is written, exactly](../concepts/architecture.md#what-is-written-to-the-phone).
+Nothing is installed by this session workflow. The loader goes into RAM with `fastboot boot`, the system image is sent into RAM, a
+session runs for as long as you say, and a reboot brings the phone back to its own Android. The one thing written by default is the
+loader's own log, a few KB, to the phone's `logdump` partition. This description applies to these Redwood commands; it is not the
+MIX 2S install or update procedure. [What is written, exactly](../concepts/architecture.md#what-is-written-to-the-phone).
 
 ## What you need
 

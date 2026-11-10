@@ -1,94 +1,173 @@
-# Fixed storage layout (v1)
+# MIX 2S system image, boot image, and storage updates
 
-`configs/polaris-storage.json` describes the layout inside the existing `darwin`
-partition on this MIX 2S. GPT and Android's userdata partition are not resized.
-One GiB means 1,073,741,824 bytes. Offsets passed to the kernel use 4096-byte blocks.
+This is the current Polaris workflow. It replaces the old instructions based on
+carving Android `userdata`, writing a combined `darwin.img` with fastboot, or
+installing into an inactive A/B slot. The MIX 2S already has a dedicated
+`darwin` GPT partition; these steps do not resize Android `userdata` or change
+the GPT.
 
-| Region | Start | Reserved size | Role |
+## The fixed layout
+
+[`configs/polaris-storage.json`](../../configs/polaris-storage.json) is the
+source of truth. The existing `darwin` partition is 137,438,932,992 bytes
+(128 GiB). Offsets use 4096-byte blocks.
+
+| Region | Start | Reserved size | Purpose |
 | --- | ---: | ---: | --- |
 | System | 0 | 10 GiB | Read-only Darwin root |
-| OS Cryptex | 10 GiB (2621440 blocks) | 4 GiB | Shared cache and OS libraries |
-| App Cryptex | 14 GiB (3670016 blocks) | 1 GiB | Apple's App resources |
-| Data | 15 GiB (3932160 blocks) | 121332805632 bytes, almost 113 GiB | Journaled, case-sensitive HFS Plus on `/private/var` |
+| OS Cryptex | 10 GiB (block 2621440) | 4 GiB | Shared cache and OS libraries |
+| App Cryptex | 14 GiB (block 3670016) | 1 GiB | App resources |
+| Data | 15 GiB (block 3932160) | 121,332,805,632 bytes, about 113 GiB | Persistent, journaled HFSX mounted at `/private/var` |
 
-The first three regions reserve space for future images; each APFS container keeps
-its actual size. They are mounted at explicit offsets (`b=`), so gaps between them
-are allowed. System updates can replace each container within its own limit, and
-must never change Data's start. Version 1 rejects a changed 10/4/1 boundary: such a
-change needs an explicit new layout version and a user-file migration.
+The first three sizes are reserved slots; each APFS image remains its actual
+size. Data starts at a fixed 15 GiB boundary. Version 1 refuses changed
+boundaries: a different layout requires a new version and a deliberate user
+data migration.
 
-The boot builder derives `cryptex_os_block`, `cryptex_app_block`, `darwin_data`,
-`var_hfs` and `data_required` from this JSON. The loader and kernel both enforce
-Data's write floor. A failed Data mount stops boot instead of silently creating an
-empty memory-backed user volume. **Do not flash this boot before installing the
-matching storage layout and Data volume.**
+## Build the images
 
-## First installation from the previous contiguous layout
-
-Use recovery ADB. `snapshot` saves the currently installed System/OS/App containers
-and their checksums on the computer. It does not back up user files. If the legacy
-layout contains a persistent HFS user volume, the installer refuses migration;
-back up its files and restore them onto the new Data volume separately.
+If the local Darwin 16.5 inputs have not been extracted yet, unpack a compatible
+20F66 IPSW you obtained yourself:
 
 ```sh
-python3 tools/polaris-storage.py plan
-python3 tools/polaris-storage.py snapshot out/storage/before-v1
+make unpack IPSW=/path/to/your-compatible-20F66.ipsw
+```
+
+Build the matching kernel, loader, userland, and Android boot image:
+
+```sh
+make boot
+```
+
+[`configs/polaris-boot.conf`](../../configs/polaris-boot.conf) selects the
+Polaris defconfig, `FLASHBOOT=1`, `CRYPTEXES=flash`, the fixed storage layout,
+boot arguments, and output paths. The build produces:
+
+| Artifact | Use |
+| --- | --- |
+| `userland/system.apfs` | System container written to the System slot |
+| `userland/flashboot.apfs` | Small resident image supplied as `md0` |
+| `userland/root.apfs` | Init ramdisk supplied as `md1` and mounted at `/polaris` |
+| `out/boot/polaris.img` | Packaged image for the phone's `boot` partition |
+
+`make boot` builds and checks the boot image; it does not write to the phone or
+update `darwin`. Set `BUILD_KERNEL=0`, `BUILD_LOADER=0`, or
+`BUILD_USERLAND=0` in the boot config only when reusing matching existing
+outputs. The builder derives the Cryptex and Data offsets from the layout JSON
+and checks that the APFS paths and boot image fit their limits.
+
+## Convert an older contiguous `darwin` layout once
+
+Do this only when migrating from the old layout. The current MIX 2S already has
+the fixed layout and initialized Data volume; skip this section for normal
+updates.
+
+1. Build the new images with `make boot`.
+2. Boot the phone into recovery, connect USB, and confirm it appears in
+   `adb devices`. Keep the `darwin` partition unmounted in recovery.
+3. Save the existing APFS containers on the computer. Pick a new snapshot
+   directory; the tool will not overwrite one.
+
+   ```sh
+   python3 tools/polaris-storage.py plan
+   python3 tools/polaris-storage.py snapshot out/storage/before-fixed-layout
+   ```
+
+   This backs up System/OS/App, not files from a legacy persistent HFS volume.
+   If the installer detects legacy HFS data, it stops. This tool has no
+   in-place importer or override for that old volume, so conversion with
+   persistent legacy data is not currently supported. Do not bypass the check
+   or erase its header manually; keep the old layout until a dedicated
+   migration procedure is available.
+4. Package the new System with the saved OS and App containers:
+
+   ```sh
+   python3 tools/polaris-storage.py pack \
+     --system userland/system.apfs \
+     --os out/storage/before-fixed-layout/os.apfs \
+     --app out/storage/before-fixed-layout/app.apfs \
+     -o out/storage/system-update.json
+   ```
+
+5. Create the empty Data image. On macOS, use Apple's formatter; on Linux,
+   omit the last argument to use `mkfs.hfsplus` from `PATH`.
+
+   ```sh
+   python3 tools/mkdatavol.py --layout configs/polaris-storage.json \
+     out/storage/data-initial.simg /sbin/newfs_hfs
+   ```
+
+6. Still in recovery, write the three APFS images and initialize Data. Do not
+   reboot between these commands.
+
+   ```sh
+   python3 tools/polaris-storage.py apply-system \
+     out/storage/system-update.json --first-install
+   python3 tools/polaris-storage.py apply-data \
+     out/storage/data-initial.simg --initialize-data
+   ```
+
+7. Flash the matching boot image directly to `boot` and restart:
+
+   ```sh
+   adb reboot bootloader
+   fastboot devices
+   fastboot flash boot out/boot/polaris.img
+   fastboot reboot
+   ```
+
+Do not use `fastboot boot`, `fastboot flash darwin`, `fastboot -w`, or
+`tools/userdata-carve.py` for this Polaris layout.
+
+## Update System and boot
+
+For a regular update, keep the installed layout and Data volume. Rebuild the
+boot image, snapshot the current containers in recovery, package the new System
+with the unchanged OS/App containers, and apply that manifest:
+
+```sh
+make boot
+adb reboot recovery
+# Confirm `adb devices` shows recovery, and use a fresh directory each time.
+python3 tools/polaris-storage.py snapshot out/storage/before-update-01
 python3 tools/polaris-storage.py pack \
   --system userland/system.apfs \
-  --os out/storage/before-v1/os.apfs \
-  --app out/storage/before-v1/app.apfs
-
-# macOS (Linux: replace /sbin/newfs_hfs with mkfs.hfsplus)
-python3 tools/mkdatavol.py --layout configs/polaris-storage.json \
-  out/storage/data-initial.simg /sbin/newfs_hfs
-
-# These two commands write the phone. Do not reboot between them.
-python3 tools/polaris-storage.py apply-system out/storage/system-update.json --first-install
-python3 tools/polaris-storage.py apply-data out/storage/data-initial.simg --initialize-data
-
-# Build/install the matching kernel, loader, and userland.
-make boot
+  --os out/storage/before-update-01/os.apfs \
+  --app out/storage/before-update-01/app.apfs \
+  -o out/storage/system-update.json
+python3 tools/polaris-storage.py apply-system out/storage/system-update.json
 adb reboot bootloader
 fastboot flash boot out/boot/polaris.img
 fastboot reboot
 ```
 
-The recovery installer checks the phone, partition mapping and capacity, image
-headers, slot limits and SHA-256. It stages each payload on Android's `/data`,
-writes only its selected range, then reads that range back and verifies it.
-Keep recovery connected and do not interrupt the initial migration. A failed
-system write is retried from recovery before booting.
+If OS or App Cryptexes are being changed, supply the matching raw APFS
+containers to `pack` instead of the saved copies. `pack` validates APFS
+headers, image lengths, hashes, and the 10/4/1 GiB slot limits. It does not
+accept a DMG in place of an APFS container.
 
-`apply-data` refuses an existing HFS+/HFSX volume. It decodes sparse chunks itself,
-checks every write falls inside Data and explicitly skips DONT_CARE chunks;
-it does not erase/discard the rest of the partition. Primary HFS metadata is
-published after the other metadata so an interrupted initialization can be retried.
+`apply-system` checks the connected device, `darwin` mapping and capacity, and
+that the partition is not mounted. It validates the full manifest before
+writing, stages and hashes each image, writes only the corresponding System,
+OS, and App extents, then reads them back and verifies their SHA-256 hashes.
+Already identical images are skipped. A write or readback error means: stay in
+recovery and do not boot until the matching update has been applied and
+verified.
 
-## Subsequent updates
+**Never run `apply-data` for an update.** It is a first-initialization command;
+it refuses an existing HFS+/HFSX volume. The Data region is outside all three
+system slots and `apply-system` never writes it. Keep separate backups of user
+files; an APFS snapshot does not back up Data.
 
-Build a new System image, and use the matching OS/App containers if those were
-updated. Pack and apply the new manifest, then flash the matching boot. Omit
-`apply-data`: formatting is strictly a first-install operation. `apply-system`
-never writes Data. An image exceeding its reserved slot is rejected before any
-system write. Keep independent user-data backups; fixed offsets protect against
-system-update overlap, not drive failure or an incompatible OS upgrade.
+## Capacity shown in Settings
 
-## Capacity shown by Settings
-
-The almost-113-GiB Data volume is about 121.33 GB in decimal units. HFSX provides
-its live free/available counters through `statfs` and `getattrlist`. On firmware
-20F66, NSURL's important/opportunistic capacity queries return zero on this HFS
-volume even while those counters and ordinary Foundation free-size queries are
-positive. About uses the important-usage capacity query.
-
-`libhakios.storage.dylib`, linked by the Preferences injection library, adapts the
-CFURL and NSURL entry points: only an original zero policy-capacity answer on a
-writable HFS volume may fall back to its actual `f_bavail * f_bsize`. It does not
-claim purgeable space, change total capacity, override nonzero answers, or replace
-a zero when the volume really is full. Read-only and other filesystem types keep
-their existing answers. This is a user-space capacity adapter, not a filesystem
-format or partition change.
-
-`/polaris/bin/storage_info` reports the kernel, Foundation, NSURL and MobileGestalt
-answers together. For a diagnostic boot, build userland with
-`RC_JOBS=rc.jobs.storage`; normal builds use the normal command list.
+Data is about 113 GiB, or 121.33 decimal GB. On the MIX 2S, Settings now reports
+about 120–121 GB available. iOS 16.5's About screen asks NSURL for important
+usage capacity; that query returned zero on this writable HFSX volume even
+though HFS free-space queries were positive. `libhakios.storage.dylib` adapts
+the CFURL and NSURL entry points: only an original zero answer on writable HFS
+can fall back to the filesystem's actual available block count. It does not
+claim purgeable space, change total capacity, override a nonzero answer, or
+replace zero when the volume is actually full. Read-only volumes and other
+filesystem types keep their original results. This is a user-space reporting
+fix; it does not resize or reformat storage.

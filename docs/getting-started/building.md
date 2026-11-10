@@ -54,6 +54,28 @@ GL=1 REST=1 userland/build.sh # ... with Mesa, for gpu=1
 
 `MODEM=1 SYSTEM=1` put the modem's firmware into the system image.
 
+## MIX 2S boot and system images
+
+For the Xiaomi MIX 2S (`polaris`), use the device's one-command builder:
+
+```sh
+make boot
+```
+
+It selects `polaris_defconfig`, builds the kernel, flash-root userland images,
+and UEFI loader, then packages `out/boot/polaris.img`. The matching System
+container is `userland/system.apfs`; the resident image and init ramdisk are
+`userland/flashboot.apfs` (`md0`) and `userland/root.apfs` (`md1`). Edit
+[`configs/polaris-boot.conf`](../../configs/polaris-boot.conf) for boot
+arguments and build switches. The builder validates the payload and image
+size but does not flash the phone.
+
+The System container is updated separately on the existing `darwin` partition
+through recovery ADB. The boot image is then written directly to `boot` with
+fastboot. See the [Polaris image and storage update guide](../../devices/polaris/STORAGE.md)
+for the exact first-install and update sequences; do not use the old `userdata`
+carve or whole-partition fastboot recipe for this device.
+
 ## The checks
 
 What CI runs, and what to run before a pull request:

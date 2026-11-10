@@ -1,64 +1,96 @@
-# From RAM to the phone's own storage, without a brick: the order, the gates, and what has been done
+# Safe system and boot updates on the MIX 2S
 
-[install.md](install.md) is the design and its rules. This is the order of work that follows from them, with a gate between
-every two steps, and an honest account of how far it has got. **Nothing here has written a byte to a phone.** The first two
-stages are tools that only read; the rest is a plan for a person at the desk.
+These instructions describe the implemented Polaris layout. They replace the
+older plan that proposed shrinking `userdata`, installing into an inactive
+slot, or using `fastboot boot` as the installed boot path. For the complete
+first-install and update commands, see
+[the MIX 2S storage guide](../devices/polaris/STORAGE.md).
 
-## Why this order
+## What an update writes
 
-A phone is bricked by writing the wrong thing to the chain it starts from, or by leaving it with no slot that starts. So:
+| Action | Destination | Effect |
+|---|---|---|
+| `polaris-storage.py apply-system` | `darwin` System/OS/App slots | Writes bounded APFS images and verifies each written range by SHA-256 |
+| `fastboot flash boot out/boot/polaris.img` | `boot` | Installs the matching kernel, loader, and flash-root ramdisks |
+| `polaris-storage.py apply-data --initialize-data` | `darwin` Data region | First initialization only; never part of a system update |
 
-1. nothing is written until what cannot be made again has been copied off and proven;
-2. the system moves to the phone's own storage **before** the boot chain does: the loader is still started from RAM
-   (`fastboot boot`), so a wrong system image costs a reboot into Android, not a phone;
-3. the boot chain moves last, into the slot Android does **not** run from, with the other slot left exactly as it was;
-4. the bootloader chain itself (`xbl`, `abl`, `tz`, `hyp` ...), the modem's and the radio's calibration, and the active slot are
-   never written by this project. On Xiaomi phones a damaged bootloader chain can need an authorised service tool to revive;
-   that is the one failure no step here may risk.
+The current v1 layout keeps System, OS Cryptex, and App Cryptex in fixed
+10/4/1 GiB slots. Data begins at byte 16,106,127,360 (15 GiB) and occupies the
+rest of the existing 128 GiB `darwin` partition. The updater does not change
+the GPT or Android `userdata`.
 
-## The stages
+## Before you start
 
-| # | Stage | What happens to the phone | State |
-|---|---|---|---|
-| 0 | **Preflight.** Two slots? Which one is Android on? Is the bootloader really unlocked? Battery over 60% and the cable good? `darwin` already there? | nothing; reads | `make doctor` does most of it. The battery gate is NOT checked by anything yet (see "The phone that went quiet") |
-| 1 | **Backup.** The boot-related partitions of both slots, `vbmeta*`, `persist`, `modemst1/2`, `fsg`, the partition tables, and with `--with-bootchain` the chain. Each copy is proven by three SHA-256s (the phone's before, the host's, the phone's after) | nothing; reads, as root | **written and tested** against a stand-in adb: `tools/backup-partitions.py` (`tools/backup-partitions-test.py`). Not run on a phone: the phone was not on USB when it was finished |
-| 2 | **Carve `darwin`** off the end of Android's userdata | **Android's data is shrunk and moved**: the f2fs is resized and the GPT rewritten. Back up the phone's data first (the user's own, with Android's tools); the tool does not | plan only: `tools/userdata-carve.py` prints the commands and writes nothing |
-| 3 | **Write the system image to `darwin`** with the guarded writer | writes `darwin` only; the writer refuses any other partition and reads every write back | exists: `tools/darwin-write.py`; its self-test refuses the wrong partition. Never run on a phone |
-| 4 | **Boot from the phone's storage, still from RAM.** `fastboot boot` the loader, and the kernel mounts its root from `darwin` (`root_apfs=`) instead of from an image uploaded to RAM | `fastboot boot` writes nothing; `ufs_write` stays 0 | **not verified**: the arguments the flash recipe needs are not confirmed. Repeat until it is boring; this is the gate before stage 5 |
-| 5 | **The boot image into the inactive slot**, `fastboot set_active` to it, once | writes the inactive slot's `boot` (and what its recipe needs); the active slot is not touched | **not done, not tried**; whether mu_aloha_platforms' boot manager behaves from a boot slot, and what `vbmeta` says to a modified boot image, are unknown |
-| 6 | **A way back**, tested before it is needed: `fastboot set_active a` (or b) from the bootloader, and Android's own slot switch | writes the slot flag | the standard fastboot command; not tried here |
+- Unlock the bootloader and have `adb` and `fastboot` available.
+- Back up user files separately. `snapshot` saves System/OS/App containers,
+  not HFSX Data or `/private/var` contents.
+- Apply APFS updates from recovery ADB with `darwin` unmounted. The tool checks
+  the Polaris device, `/dev/block/sda22`, partition size, and mount state.
+- Build the boot image and System container from the same source/configuration
+  before writing either one.
 
-Stage 4 is the one that changes the project: it makes "the system lives in RAM for the length of a session" false, and it does so
-without any step that can brick. A phone that boots from `darwin` by `fastboot boot` is already "not RAM"; stage 5 only removes the cable.
+## Routine update
 
-## The gates
+1. Build the matching boot and userland images:
 
-A stage is started only when the one before it has a recorded result and a person has read it:
+   ```sh
+   make boot
+   ```
 
-- before stage 2: `manifest.json` of stage 1 exists and every partition in it is proven; a copy of the phone's data exists;
-- before stage 3: the new GPT was read back from the phone and equals what the carve tool made; Android boots and its data is there;
-- before stage 5: stage 4 has booted the system from `darwin` at least three times in a row, and the log says so;
-- before every write: `tools/provenance.allow` lists the writer (CI fails if a writer appears that is not listed).
+2. Enter recovery and connect USB. Confirm `adb devices` lists the recovery
+   device. Leave `darwin` unmounted; the storage tool checks the device name,
+   partition mapping, capacity, and mount state itself.
+3. Snapshot current APFS containers to a new directory on the computer, then
+   package the new System image together with the unchanged OS/App containers:
 
-## The phone that went quiet
+   ```sh
+   python3 tools/polaris-storage.py snapshot out/storage/before-update-01
+   python3 tools/polaris-storage.py pack \
+     --system userland/system.apfs \
+     --os out/storage/before-update-01/os.apfs \
+     --app out/storage/before-update-01/app.apfs \
+     -o out/storage/system-update.json
+   ```
 
-Writing this, the phone vanished from USB: not adb, not fastboot, not Qualcomm's emergency mode. The last run before that ended
-normally and left the phone in the loader. The likeliest cause is the **battery**: nothing charges the phone while it sits in the
-loader (the kernel's charging path is not written; the UEFI shell does not charge), the screen was on for hours, and a long session
-is a flat battery. If so, plugging it into a charger for a few minutes brings it back to Android by itself. That has not been
-confirmed. It is why stage 0 has a battery gate, and why an unattended run is not a safe thing to leave overnight until the kernel
-reads the battery and stops the run (`thermal_stop` is the same idea for heat; a battery guard is the same again, and needs the
-battery reading of the audio DSP's driver, which only runs with `adsp=1`).
+   Choose a fresh snapshot directory for each run. Snapshot files are APFS
+   image backups; they do not contain user files from Data.
+4. Apply and verify the System/OS/App images from recovery:
 
-## What the user decides
+   ```sh
+   python3 tools/polaris-storage.py apply-system out/storage/system-update.json
+   ```
 
-1. Whether to give up some of the phone's storage (stage 2): the size of `darwin`. The system image alone is 2.5 GB; room to live in
-   is more.
-2. Whether Android's data may be disturbed at all. If not, stages 2 to 5 wait for a second phone or a spare partition.
-3. Who is at the desk for stage 5.
+5. Flash the matching boot image directly to `boot`:
 
-## What was not done tonight, on purpose
+   ```sh
+   adb reboot bootloader
+   fastboot devices
+   fastboot flash boot out/boot/polaris.img
+   fastboot reboot
+   ```
 
-No partition was written, no slot was switched, `darwin` was not made, and the installer was not written: an installer that
-has never run on a phone, written while its owner sleeps, would be a guess with a progress bar. The tools above are the part
-that could be built and tested without a phone, and they are.
+The updater validates the full manifest before its first write, checks the
+device is the MIX 2S and `darwin` is `/dev/block/sda22`, stages and hashes each
+image, then reads back and hashes each written range. It rejects images larger
+than their reserved slot and skips a range that already has the expected hash.
+If a write or readback check fails, stay in recovery and do not boot that
+partially updated system.
+
+## First initialization and layout changes
+
+Use `--first-install` only when converting the old contiguous APFS layout with
+no legacy persistent HFS data. If the tool detects an old HFS volume, conversion
+is not currently supported: the installer has no in-place importer or override.
+Do not bypass that check or erase the volume header manually. Create the new
+Data image with `tools/mkdatavol.py` and run `apply-data ... --initialize-data`
+once, after `apply-system`; it refuses to format an existing HFS+/HFSX volume.
+Never run it for an update or to repair a system image.
+
+Do not use `fastboot flash darwin`, `fastboot -w`, or
+`tools/userdata-carve.py` for Polaris. Do not change the 10/4/1 GiB boundaries
+under layout v1. A boundary change needs a new layout version, a data migration
+plan, and matching loader/kernel changes. The current implementation does not
+provide an in-place resize operation.
+
+For a different device, follow its own guide. The POCO X5 Pro installation
+pages describe a separate layout and boot flow.

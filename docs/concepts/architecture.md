@@ -6,6 +6,12 @@ yours (the user space you lay out).
 
 ## A boot, from the button to the home screen
 
+Development sessions can start the loader with `fastboot boot` and keep the
+system image in RAM. The MIX 2S's installed workflow is different: its Android
+bootloader starts the image in the `boot` partition, and XNU mounts the System
+container from the existing `darwin` partition. The exact Polaris layout and
+update steps are in [its storage guide](../../devices/polaris/STORAGE.md).
+
 ```
  Android's fastboot        HakiOS UEFI              xnuloader              XNU + HakiOS             launchd       user space
  (the phone's own)   -->   (mu_aloha with      -->  (loader.efi,     -->   (xnu/, drivers/)   -->            -->   (yours: Darwin userland 16.5,
@@ -55,8 +61,15 @@ device's. A device's defconfig is three lines: the common kernel, its SoC's frag
 | What | When | Where |
 |---|---|---|
 | the loader's log, a few KB | at the end of every run | the `logdump` partition |
-| `/private/var` | only with `ufs_write=1 var_store=1` | the partition `darwin`, which you create yourself (`tools/userdata-carve.py` prints the commands; it changes nothing) |
-| anything else | never | the loader refuses every other write; `tools/provenance.allow` lists each piece of code that can write, and why |
+| Polaris `/private/var` data | during an installed Polaris session, with `ufs_write=1` and the generated `var_hfs=ufs_darwin_data` argument | HFSX Data in `darwin`, starting at 15 GiB; the existing GPT partition is not carved or resized |
+| Polaris System/OS/App containers | only when explicitly applying a system update from recovery | the three bounded APFS slots in `darwin`, through `tools/polaris-storage.py apply-system` |
+| Polaris Data filesystem | once during first initialization | only the Data range in `darwin`, through `tools/polaris-storage.py apply-data --initialize-data` |
+| Polaris boot image | only when explicitly installing an update | `boot`, with `fastboot flash boot out/boot/polaris.img` |
+| Android `userdata`, GPT, bootloader and calibration partitions | never in the Polaris build/update workflow | left as they are |
+| other runtime writes | never | the loader and kernel refuse writes outside their runtime allowlist; `tools/provenance.allow` lists declared writers |
+
+`make boot` only builds and packages files on the computer. It does not flash
+`boot` or write the `darwin` System slots.
 
 [LEGAL.md](https://github.com/oosexgang/hakios-xnu-kernel/blob/main/LEGAL.md) has the same, with what is and is not distributed.
 

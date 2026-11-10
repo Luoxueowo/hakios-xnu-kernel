@@ -1,5 +1,10 @@
 # Installing beside Android
 
+> This procedure is for the POCO X5 Pro (`redwood`) and its U-Boot/A-B-slot
+> setup. Do not use its `userdata` carve, `fastboot -w`, or whole-partition
+> `fastboot flash darwin` steps on the MIX 2S. Use the [Polaris fixed-layout
+> guide](../devices/polaris/STORAGE.md) for the Xiaomi MIX 2S.
+
 HakiOS on the POCO X5 Pro (redwood) as a second system: Android stays where it is, and at every start a menu asks which
 one to run. This page is for the person installing it. How it works underneath, and every step as it was first done and
 checked, is in [U-Boot](u-boot.md).

@@ -25,11 +25,14 @@ and [UEFI memory map](../../mu_aloha_platforms/Platforms/NapaliPkg/Device/xiaomi
 This loader profile is integrated, and XNU has now booted to the system on the MIX 2S. The GICv3 virtual timer uses INTID 19,
 as specified by the old Polaris loader profile and the device's timer description.
 
+UEFI boots successfully on the MIX 2S. Display output through the UEFI framebuffer is partially working. XNU has confirmed working
+touch input, power and volume buttons, four active CPUs, persistent storage, and battery-level and charging-status reporting. The
+boot configuration uses `touchscreen=1`, `bootcpu=7 cpus=4`, and `battery=1`.
+
 With `battery=1`, the loader reads the resident Qualcomm ChargerEx/QcomCharger protocols and shares a read-only status cache with
 XNU. The Polaris profile does not reinitialize QcomCharger, matching the old Polaris loader setting. XNU publishes the readings as
-`HakiosBattery` (`IOPMPowerSource`) so Darwin can show the level and charging state; this path is integrated but not yet validated
-on the phone. Include `battery=1` in the payload command line to enable it; the defconfig allows the argument but does not add it
-automatically.
+`HakiosBattery` (`IOPMPowerSource`) for Darwin's battery level and charging-status display. This reports charging state; it does not
+control the phone's charging hardware.
 
 ## The SoC addresses
 
@@ -64,16 +67,17 @@ The kernel, loader and user space know nothing about a phone: addresses, interru
 come from its tree and its Android. What is written for one phone is the list below. The head of each file
 says where its numbers came from; that is the map of what to rewrite.
 
-- [ ] **UEFI**: the firmware that starts the loader: devices/redwood/uefi/ is a port of mu_aloha_platforms; the vendor's drivers are extracted from your own phone (uefi/README.md)
-- [ ] **Display**: framebuffer path still needs device-specific validation.
-- [ ] **Buttons**: `drivers/input/hakios.buttons.polaris.c` reads the MIX 2S PM8998 power and volume keys; ported from the old project, pending validation from this repository.
-- [ ] **Touch**: `drivers/input/hakios.synaptics.c` is the MIX 2S Synaptics S3330 RMI4 driver, ported from the old Polaris project; verify it from this repository on the phone.
-- [ ] **Storage**: hakios.ufs.c and hakios.ufshc.c (UFS); a phone with eMMC needs another driver
-- [ ] **CPU clocks**: hakios.cpufreq.c
+- [x] **UEFI boot**: UEFI starts the loader and boots HakiOS on the MIX 2S.
+- [ ] **Display (partial)**: UEFI framebuffer output works partially; display support still needs further device-specific work.
+- [x] **Buttons**: `drivers/input/hakios.buttons.polaris.c` handles the MIX 2S PM8998 power and volume keys; both are confirmed working.
+- [x] **Touch**: `drivers/input/hakios.synaptics.c` handles the MIX 2S Synaptics S3330 RMI4 touchscreen; touch input is confirmed working.
+- [x] **Multi-core CPU**: XNU runs with four active CPUs (`bootcpu=7 cpus=4`). CPU frequency scaling is a separate feature.
+- [x] **Storage**: UFS-backed persistent HFSX Data is mounted for user data; Settings reports about 120–121 GB available.
+- [ ] **CPU clocks**: `hakios.cpufreq.c`
 - [ ] **GPU**: hakios.adreno.c (Adreno 642L here: another generation needs its own firmware and registers)
 - [ ] **Wi-Fi**: hakios.wifi.c, hakios.lx.c and wifi/lx/ (the WCN6750 radio of the reference phone)
 - [ ] **Audio**: hakios.adsp.c, hakios.audio.c, hakios.sound.c, hakios.speaker.c, hakios.mic.c
-- [ ] **Battery**: `battery=1` enables the Qualcomm UEFI status cache and `HakiosBattery`; not yet validated on this phone.
+- [x] **Battery status**: `battery=1` enables the Qualcomm UEFI status cache and `HakiosBattery`; battery level and charging status are confirmed visible.
 - [ ] **Cellular**: hakios.mpss.c, hakios.qmi.c, hakios.nas.c, hakios.ipa.c, hakios.cell.c; soc.args carries the addresses, the IPA layout is for IPA 4.11 (docs/cellular.md)
 - [ ] **Haptics and cameras**: hakios.haptic.c, hakios.camera.c
 
@@ -84,7 +88,7 @@ The kernel's settings are layered the way an Android kernel's are: the common ke
 
     configs/polaris.config          CONFIG_DEVICE="polaris"   and whatever is true of this phone only
     configs/polaris_defconfig       #include common_defconfig
-                                   #include <the SoC's fragment: sc7280.config for the SC7280 family>
+                                   #include sdm845.config
                                    #include polaris.config
 
 Then `make polaris_defconfig`. Turn on only what this phone has been shown to do; `tools/hakios-config.py check` says what the
@@ -104,10 +108,13 @@ images, or build switches, then run:
 make boot
 ```
 
-This builds the kernel, userland boot ramdisks, and loader, then packages `out/boot/polaris.img`. The `resident` entry is the
-flashboot image containing `/sbin/launchd` and becomes md0; `ramdisk` contains `/sbin/init` and becomes md1. The script checks
-both APFS paths and the final image size, and it does not flash the phone. Use `make boot BOOT_CONFIG=path/to/other.conf` to select
-another configuration.
+This builds the kernel, flash-root userland images, and loader, then packages `out/boot/polaris.img`. The `resident` entry is
+`userland/flashboot.apfs` with `/sbin/launchd` and becomes md0; `ramdisk` is `userland/root.apfs` with `/sbin/init` and becomes
+md1. `userland/system.apfs` is the System container for the fixed `darwin` layout. The script checks the APFS paths and boot
+image size, and it does not write to the phone. Use `make boot BOOT_CONFIG=path/to/other.conf` to select another configuration.
+
+Building the Android boot image does not update the installed System container. For the recovery ADB update procedure, the
+first-time Data initialization, and the direct `fastboot flash boot` step, see [STORAGE.md](STORAGE.md).
 
 ## Firmware
 

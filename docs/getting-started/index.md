@@ -7,7 +7,7 @@ should see, and what to check when you do not see it.
 |---|---|---|---|
 | [**The open kernel in QEMU**](qemu.md#the-open-kernel) | the kernel, the loader and a tiny user space, booting | a Linux or macOS machine, QEMU | minutes |
 | [**Darwin in QEMU**](qemu.md#darwin-in-qemu) | the lock screen and the home screen in a window | Linux, 12 GB of disk, your own IPSW (nothing downloads it) | an hour, mostly downloads |
-| [**On the phone**](phone.md) | the system on a POCO X5 Pro 5G, in RAM | the phone, its boot loader unlocked, `adb` and `fastboot` | an hour the first time |
+| [**On the phone**](phone.md) | POCO X5 Pro RAM sessions; [MIX 2S build, boot flash, and storage updates](../install.md) | the phone, its boot loader unlocked, `adb` and `fastboot` | an hour the first time |
 
 Building from source is optional for all three: `prebuilt/` has a kernel, a loader and libraries made from these repositories.
 [Building from source](building.md) when you change something.

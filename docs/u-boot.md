@@ -185,6 +185,10 @@ If U-Boot hangs, the menu (volume down) and `fastboot oem console` are the ways 
 
 ## Installed beside Android: a menu at every start
 
+> This installed U-Boot menu and slot-switch procedure is for the POCO X5 Pro
+> (`redwood`). The MIX 2S uses its own fixed `darwin` layout and directly
+> flashed `boot` image; see the [Polaris storage guide](../devices/polaris/STORAGE.md).
+
 What was done on the POCO X5 Pro, 29 October 2026, in this order, each step checked before the next:
 
 1. **Backup** (`tools/backup-partitions.py --yes`, read only, as root): the boot partitions of both slots, `vbmeta*`, `misc`,
