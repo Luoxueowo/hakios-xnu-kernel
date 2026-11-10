@@ -555,7 +555,7 @@ static void hm_fps_drew(double seconds, unsigned cpu);   /* metal_fps: our time 
 static void hm_fps_core(double seconds);   /* metal_fps: the core's time in a draw call */
 static BOOL hm_fps_on(void);                          /* metal_fps: command buffers timed pass by pass */
 #define HM_CACHE_DIR  "/private/var/db/hakios-metal-cache"     /* compiled stages, kept across boots by var_store */
-#define HM_CACHE_SEED "/redwood/share/hakios-metal-cache"     /* the same, baked into the image (read-only) */
+#define HM_CACHE_SEED "/polaris/share/hakios-metal-cache"     /* the same, baked into the image (read-only) */
 static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled rendering where a pass allows it */
 - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
 - (void)hakiosRefreshShadow;
@@ -1622,7 +1622,7 @@ hm_bitcode_for(id function, NSString *pipeline, BOOL vertex)
 
 			if (device == nil) device = MTLCreateSystemDefaultDevice();   /* (the function's own answered nil) */
 			NSError *e = nil;
-			id lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/redwood/share/ca-share/QuartzCore-default.metallib"]
+			id lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/polaris/share/ca-share/QuartzCore-default.metallib"]
 						     error:&e];
 			hm_print("inplace_copy for edr_scale: device %s, library %s%s\n", device ? "yes" : "nil", lib ? "opened" : "not opened: ",
 				 lib ? "" : [[e description] UTF8String]);
@@ -2199,7 +2199,7 @@ hm_boot_arg_set(const char *what)
 			native_bridge_metal_variant_hook = hm_m2v_variant;
 		}
 		mkdir("/private/var/db/m2v", 0700);
-		id device = native_bridge_metal_open("/redwood/lib/libvulkan_freedreno.dylib",
+		id device = native_bridge_metal_open("/polaris/lib/libvulkan_freedreno.dylib",
 		    access("/private/var/db/m2v", W_OK) == 0 ? "/private/var/db/m2v" : "/private/var/tmp/m2v", 0, hm_m2v_missing);
 		if (device != nil) {
 			hm_print("device: %s (metal2vulkan over Turnip, class %s)\n", [[device name] UTF8String],
@@ -2486,7 +2486,7 @@ hm_print_callers(const char *what)
 	/* QuartzCore's of this image (the iPhone X's) has no default.metallib beside it; the one made of its own functions
 	 * file (hakios: merge_metallib.py, the four uber shaders, one variant each -- hm_bitcode_for() picks the variant a
 	 * pipeline needs) stands in for it, from where the image puts it */
-	NSString *ours = @"/redwood/share/ca-share/QuartzCore-default.metallib";
+	NSString *ours = @"/polaris/share/ca-share/QuartzCore-default.metallib";
 	NSString *beside = [frame stringByAppendingPathComponent:@"default.metallib"];
 	if ([path rangeOfString:@"QuartzCore.framework"].location != NSNotFound && ![fm fileExistsAtPath:beside] &&
 	    [fm fileExistsAtPath:ours]) {

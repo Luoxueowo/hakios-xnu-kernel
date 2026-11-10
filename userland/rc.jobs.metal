@@ -10,6 +10,6 @@
 # Mind the length of the run: on the phone SpringBoard is up in about 20 s, but in QEMU it took 208
 # ("sound_test: the ringer is on after 208 s"), so a QEMU session wants 480 s or more -- a shorter
 # one ends before metal_test is reached at all.
-/redwood/bin/sound_test springboard
-/redwood/bin/rwtouch wait 25
-/redwood/bin/metal_test
+/polaris/bin/sound_test springboard
+/polaris/bin/rwtouch wait 25
+/polaris/bin/metal_test

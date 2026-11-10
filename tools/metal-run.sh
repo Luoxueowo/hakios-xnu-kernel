@@ -61,7 +61,7 @@ SECS=${SECS:-180}
 PERSIST=${PERSIST:-1}
 UPLOAD=${UPLOAD:-1}
 SHOTS=${SHOTS:-0}
-CA_METALLIB=${CA_METALLIB:-/redwood/share/ca-share/QuartzCore-default.metallib}
+CA_METALLIB=${CA_METALLIB:-/polaris/share/ca-share/QuartzCore-default.metallib}
 # what is the phone's own: its big core and cores, its panel's rate, how many threads copy frames, how often the touch screen is read.
 # DEVICE_ARGS= names them, or devices/<CONFIG_DEVICE>/metal.args (tools/hakios-device.py new makes one). Without either, on a phone that
 # is not redwood, what assumes nothing: a wrong bootcpu= does not boot and a wrong fb_hz= shows every frame's beat wrong.

@@ -5,7 +5,7 @@
 # GPU driver through tools/mesa/hakios-drm, the stand-in for libdrm, whose syncobjs (Turnip's fences and semaphores)
 # are kept in the process over the kernel's fences.
 #
-# What comes out: xnu-deps/build/mesa/out/libvulkan_freedreno.dylib (install name /redwood/lib/libvulkan_freedreno.dylib),
+# What comes out: xnu-deps/build/mesa/out/libvulkan_freedreno.dylib (install name /polaris/lib/libvulkan_freedreno.dylib),
 # loaded by its vk_icdGetInstanceProcAddr like any Vulkan driver.
 #
 # Needs on this machine what mk-mesa.sh needs, and glslangValidator (apt: glslang-tools) for Turnip's own shaders.
@@ -21,7 +21,7 @@ grep -q with_freedreno_vk mesa-$VERSION/meson.build ||
 command -v glslangValidator >/dev/null || { echo "mk-turnip.sh: no glslangValidator (apt: glslang-tools)" >&2; exit 1; }
 export PATH=$B/venv/bin:$PATH
 [ -f $BUILD/build.ninja ] || meson setup $BUILD mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
-	--prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
+	--prefix=/polaris --libdir=lib --buildtype=release -Db_ndebug=true \
 	-Dplatforms= -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm -Dopengl=false -Dgles1=disabled \
 	-Dgles2=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dllvm=disabled -Dzstd=disabled -Dxmlconfig=disabled \
 	-Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= \
@@ -29,6 +29,6 @@ export PATH=$B/venv/bin:$PATH
 ninja -C $BUILD src/freedreno/vulkan/libvulkan_freedreno.dylib > turnip-ninja.log
 mkdir -p out
 cp $BUILD/src/freedreno/vulkan/libvulkan_freedreno.dylib out/
-install_name_tool -id /redwood/lib/libvulkan_freedreno.dylib out/libvulkan_freedreno.dylib 2>/dev/null ||
-	"$ROOT/xnu-deps/host/bin/install_name_tool" -id /redwood/lib/libvulkan_freedreno.dylib out/libvulkan_freedreno.dylib
+install_name_tool -id /polaris/lib/libvulkan_freedreno.dylib out/libvulkan_freedreno.dylib 2>/dev/null ||
+	"$ROOT/xnu-deps/host/bin/install_name_tool" -id /polaris/lib/libvulkan_freedreno.dylib out/libvulkan_freedreno.dylib
 echo "mk-turnip.sh: Turnip $VERSION: $B/out/libvulkan_freedreno.dylib ($(stat -c %s out/libvulkan_freedreno.dylib) bytes)"

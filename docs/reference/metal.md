@@ -95,7 +95,7 @@ METAL_PLUGIN=ca TURNIP=1 M2V=1 RC_JOBS=rc.jobs.bench EXTRA_SHARE=~/ca-share REST
 Build these before the image: `userland/build.sh` links metal2vulkan into the plug-in only if `xnu-deps/build/m2v/out` is already there.
 `tools/mk-m2v.sh` pins [UniXNU/AdrenoMetal](https://github.com/UniXNU/AdrenoMetal) at `243d63c` and
 [steelbrain/metal2vulkan](https://github.com/steelbrain/metal2vulkan) at `624bab3` with AdrenoMetal's 30 patches, and adds
-`tools/m2v/`. Programs and libraries over 4 MB go into the system image, with a link in the small one (`/usr/local/redwood`).
+`tools/m2v/`. Programs and libraries over 4 MB go into the system image, with a link in the small one (`/usr/local/polaris`).
 
 Two programs check the path before the window server is involved:
 

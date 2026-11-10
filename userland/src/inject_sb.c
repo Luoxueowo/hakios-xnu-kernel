@@ -733,7 +733,7 @@ battery_post_notifications(void)
 
 /* ---- the lock screen's clock without a GPU ------------------------------------------------------- */
 
-#define HAKIOS_GL "/redwood/lib/libhakios.gl.dylib"
+#define HAKIOS_GL "/polaris/lib/libhakios.gl.dylib"
 
 /* Does the window server draw with OpenGL ES? The same question, asked the same way, as opengl_es() in inject.c. */
 static bool
@@ -745,7 +745,7 @@ gpu_draws(void)
 	io_service_t gpu;
 
 	/* ... or through Metal (boot-arg metal=1 with the GPU kept: HakiosMetal.bundle, an image built with METAL_PLUGIN) */
-	if (access("/redwood/lib/HakiosMetal.bundle/HakiosMetal", R_OK) == 0 &&
+	if (access("/polaris/lib/HakiosMetal.bundle/HakiosMetal", R_OK) == 0 &&
 	    sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 		for (argument = arguments; (argument = strstr(argument, "metal=")) != NULL; argument += 6) {
 			if ((argument == arguments || argument[-1] == ' ') && argument[6] != '0') {
@@ -2059,7 +2059,7 @@ accessibility_settings(void)
  * Open the tweak loader of the package manager's prefix, when there is one. Nothing here depends on
  * it: without a prefix (or without ElleKit in it) the file is not there and this does nothing.
  */
-#define HAKIOS_TWEAK_LOADER    "/redwood/lib/libhakios.tweaks.dylib"
+#define HAKIOS_TWEAK_LOADER    "/polaris/lib/libhakios.tweaks.dylib"
 
 static void
 load_tweaks(void)

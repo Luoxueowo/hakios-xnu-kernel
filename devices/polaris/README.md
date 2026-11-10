@@ -137,3 +137,8 @@ Every phone driver of the common repository is left out to begin with: their add
 for. Put one back in `configs/polaris.config` when it has been made to work here, and say so in `device.conf`.
 
 Check with `tools/hakios-device.py check polaris`.
+
+The userland APFS volume is `polaris` and is mounted on `/polaris`. Rebuild
+userland and the system image after changing this layout: the installed Darwin
+image must contain the matching launchd and library symlinks. Legacy userland
+prebuilts using `/redwood` are not compatible with this layout.

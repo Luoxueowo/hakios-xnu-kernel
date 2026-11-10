@@ -122,7 +122,7 @@ static void
 in_a_new_process(const char *what, const char *argument, int secs)
 {
 	extern char **environ;
-	char *const argv[] = { (char *)"/redwood/bin/metal_test", (char *)argument, NULL };
+	char *const argv[] = { (char *)"/polaris/bin/metal_test", (char *)argument, NULL };
 	pid_t pid;
 	int status = 0, waited = 0;
 
@@ -411,7 +411,7 @@ static int coreimage_over_eagl;
  * an EAGLContext (which on an image built with GL=1, on a phone with gpu=1, is our Mesa behind
  * src/eagl.c) and hand it over.
  */
-#define HAKIOS_GL      "/redwood/lib/libhakios.gl.dylib"
+#define HAKIOS_GL      "/polaris/lib/libhakios.gl.dylib"
 
 static EAGLContext *
 make_eagl(void)

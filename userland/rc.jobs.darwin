@@ -7,10 +7,10 @@
 # usr/sbin/mediaserverd 895037cd97f96801 (tools/apfs/apfs-tool census, apfs.py).
 /sbin/mount
 /bin/df
-/redwood/bin/vol_ls fs /System/Volumes/Darwin
-/redwood/bin/vol_ls ls /System/Volumes/Darwin
-/redwood/bin/vol_ls ls /System/Volumes/Darwin/System/Library/CoreServices
-/redwood/bin/vol_ls cat /System/Volumes/Darwin/System/Library/CoreServices/SystemVersion.plist
-/redwood/bin/vol_ls hash /System/Volumes/Darwin/System/Library/CoreServices/SystemVersion.plist /System/Volumes/Darwin/usr/lib/dyld /System/Volumes/Darwin/usr/sbin/mediaserverd
-/redwood/bin/apfs_mmap_test mmap /System/Volumes/Darwin/usr/sbin
-/redwood/bin/apfs_mmap_test read /System/Volumes/Darwin/usr/sbin 65536
+/polaris/bin/vol_ls fs /System/Volumes/Darwin
+/polaris/bin/vol_ls ls /System/Volumes/Darwin
+/polaris/bin/vol_ls ls /System/Volumes/Darwin/System/Library/CoreServices
+/polaris/bin/vol_ls cat /System/Volumes/Darwin/System/Library/CoreServices/SystemVersion.plist
+/polaris/bin/vol_ls hash /System/Volumes/Darwin/System/Library/CoreServices/SystemVersion.plist /System/Volumes/Darwin/usr/lib/dyld /System/Volumes/Darwin/usr/sbin/mediaserverd
+/polaris/bin/apfs_mmap_test mmap /System/Volumes/Darwin/usr/sbin
+/polaris/bin/apfs_mmap_test read /System/Volumes/Darwin/usr/sbin 65536

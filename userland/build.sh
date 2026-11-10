@@ -5,7 +5,7 @@
 #   root.apfs        the small image: our init and test programs, etc/rc, and the launchd jobs
 #                    (LaunchDaemons/), an APFS container (../tools/apfs/mkapfs.py). It travels in
 #                    the payload next to the kernel (the second RAM disk, /dev/md1) and is mounted
-#                    on /redwood. Rebuilt every time.
+#                    on /polaris. Rebuilt every time.
 #                      RC=<file>    etc/rc: rc.launchd (default) hands process 1 to the Darwin launchd
 #                                   after init's checks; rc.darwin runs a few Darwin programs and halts
 #                      JOBS="..."   labels of the stock Darwin launchd jobs to load (default: DARWIN_JOBS)
@@ -17,9 +17,9 @@
 #                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard,
 #                                   src/inject_media.c in mediaserverd);
 #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
-#                      EXTRA="..."  more programs for /redwood/bin (files on this machine): one-off
+#                      EXTRA="..."  more programs for /polaris/bin (files on this machine): one-off
 #                                   diagnostics, which a file given as RC_JOBS can then run
-#                      EXTRA_SHARE="..." directories on this machine to copy whole into /redwood/share,
+#                      EXTRA_SHARE="..." directories on this machine to copy whole into /polaris/share,
 #                                   each under its own name: the data a one-off diagnostic reads, when it
 #                                   needs more than a program (tools/air/intrincheck.py --emit writes such
 #                                   a directory). This goes into the boot volume, which every recipe
@@ -74,9 +74,8 @@
 #                    That root.apfs is for a flash boot; a RAM boot wants one built without FLASHBOOT=1,
 #                    or launchd will fail to start those few when something asks for them.
 #
-#   PREBUILT=1       do not compile anything: take our programs from ../prebuilt/userland (this is also
-#                    what happens when the cross toolchain is not set up, see ../xnu-deps/setup.sh);
-#                    the images are then made of them and of the Darwin files alone (python3)
+#   A source toolchain is required for the /polaris layout. The shipped prebuilts
+#   still use the old mount path and are rejected (see ../xnu-deps/setup.sh).
 #   CHECK=1          check every image (every container) as it is made: apfsck has to find it clean and
 #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
 #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
@@ -133,21 +132,18 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # (libhakios.tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
 # SpringBoard the library above opens it, here it is named for the programs that have no library of
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
-INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
-/redwood/lib/libhakios.sb.dylib SpringBoard
-/redwood/lib/libhakios.media.dylib mediaserverd
-/redwood/lib/libhakios.app.dylib Sileo
-/redwood/lib/libhakios.tweaks.dylib Preferences"}
+INJECT=${INJECT-"/polaris/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
+/polaris/lib/libhakios.sb.dylib SpringBoard
+/polaris/lib/libhakios.media.dylib mediaserverd
+/polaris/lib/libhakios.app.dylib Sileo
+/polaris/lib/libhakios.tweaks.dylib Preferences"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
 if [ -n "$PREBUILT" ]; then
-	echo "build.sh: not compiling, using the programs in prebuilt/userland"
-	for f in ../prebuilt/userland/*; do
-		# keep a file that did not change (and its time stamp): system.apfs depends on stage0
-		cmp -s "$f" "obj/$(basename "$f")" || cp "$f" obj/
-	done
-	cp obj/hello hello
+	# The shipped prebuilts still use /redwood; they cannot boot this /polaris layout.
+	echo "build.sh: /polaris requires a source build; set up xnu-deps/setup.sh and unset PREBUILT" >&2
+	exit 1
 else
 	$CC $LD -o hello src/hello.c
 	$CC -Ilibmini -c libmini/mini.c -o obj/mini.o
@@ -182,14 +178,14 @@ for d in $EXTRA_SHARE; do
 	cp -rL "$d" root/share/
 done
 # Metal's compiled shader stages from an earlier boot (tools/metal-cache-seed.sh puts them in
-# userland/hakios-metal-cache): the window server reads them from /redwood/share/hakios-metal-cache
+# userland/hakios-metal-cache): the window server reads them from /polaris/share/hakios-metal-cache
 # (HakiosMetalCA.m: HM_CACHE_SEED) instead of compiling CoreAnimation's shaders during the first minute
 # of the boot. Stages compiled by another build of the compiler are filed under other names and simply
 # not found, so a stale seed costs room and nothing else.
 rm -rf root/share/hakios-metal-cache
 if [ -d hakios-metal-cache ] && [ -n "$(ls hakios-metal-cache 2>/dev/null)" ]; then
 	cp -r hakios-metal-cache root/share/
-	echo "build.sh: $(ls hakios-metal-cache | wc -l | tr -d ' ') compiled Metal stages seeded into /redwood/share/hakios-metal-cache"
+	echo "build.sh: $(ls hakios-metal-cache | wc -l | tr -d ' ') compiled Metal stages seeded into /polaris/share/hakios-metal-cache"
 fi
 if [ -d $DARWIN/rootfs/usr/lib ]; then
 	if [ -z "$PREBUILT" ]; then
@@ -238,18 +234,18 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# our library for inside stock Darwin programs (the jobs in INJECT are started with it)
-		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
+		$DYN -dynamiclib -install_name /polaris/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libhakios.dylib src/inject.c
-		$DYN -dynamiclib -install_name /redwood/lib/libhakios.sb.dylib -framework CoreFoundation -framework CoreGraphics -framework IOKit -framework IOSurface -lobjc \
+		$DYN -dynamiclib -install_name /polaris/lib/libhakios.sb.dylib -framework CoreFoundation -framework CoreGraphics -framework IOKit -framework IOSurface -lobjc \
 			-o obj/libhakios.sb.dylib src/inject_sb.c
 		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
 		# program either as the one library the kernel inserts or opened by a library of ours
-		$DYN -dynamiclib -install_name /redwood/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
+		$DYN -dynamiclib -install_name /polaris/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
 			-o obj/libhakios.tweaks.dylib src/inject_tweaks.c
 		# ... and inside an application, to say what killed it (src/inject_app.c)
-		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
+		$DYN -dynamiclib -install_name /polaris/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
-		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
+		$DYN -O2 -dynamiclib -install_name /polaris/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
@@ -316,7 +312,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/hakios-drm/* | sha256sum)" ] ||
 				../tools/mk-mesa.sh
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
-			$DYN -dynamiclib -install_name /redwood/lib/libhakios.gl.dylib -Iobj -framework CoreFoundation \
+			$DYN -dynamiclib -install_name /polaris/lib/libhakios.gl.dylib -Iobj -framework CoreFoundation \
 				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libhakios.gl.dylib \
 				src/eagl.c src/gl_osmesa.c
 			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
@@ -398,14 +394,14 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	fi
 	# a program is not started with a library that is not there: it would not start at all
 	echo "$INJECT" | while read -r library names; do
-		# a /redwood/lib library only if it was actually built; any other path (e.g. a tweak loader
+		# a /polaris/lib library only if it was actually built; any other path (e.g. a tweak loader
 		# in /var/jb) as it is, since it lives on the prefix and is there at run time
 		case "$library" in
 		"") ;;
 		# an "if" and not "&& echo": a last line whose library is absent would make the loop,
 		# and with it the pipeline and the whole build under set -e, fail -- which is what a tree
 		# with only prebuilt/userland in it does, since not every injection library is shipped there
-		/redwood/lib/*) if [ -f "root/lib/${library#/redwood/lib/}" ]; then echo "$library $names"; fi ;;
+		/polaris/lib/*) if [ -f "root/lib/${library#/polaris/lib/}" ]; then echo "$library $names"; fi ;;
 		*) echo "$library $names" ;;
 		esac
 	done > root/etc/inject.conf
@@ -549,28 +545,28 @@ mkdir -p root/empty root/xpc root/hal
 for f in extensions.plist extensions.plist.sig; do
 	[ -f $DARWIN/rootfs/System/Library/xpc/$f ] && cp $DARWIN/rootfs/System/Library/xpc/$f root/xpc/
 done
-[ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
+[ -d root/lib/HakiosAudio.driver ] && ln -s /polaris/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
 # Programs and libraries of more than 4 MB (Turnip, UniXNU's Metal on Vulkan: TURNIP=1, M2V=1) live in the system
-# image, in /usr/local/redwood, with a link in their place here: the small image is loaded with the kernel, in the
+# image, in /usr/local/polaris, with a link in their place here: the small image is loaded with the kernel, in the
 # 64 MB the loader takes for both (with them it grew from 6.6 to 26 MB).
 rm -rf big
 for f in $(cd root && find lib bin -type f -size +4M 2>/dev/null); do
 	mkdir -p big/$(dirname $f)
 	mv root/$f big/$f
-	ln -s /usr/local/redwood/$f root/$f
-	echo "build.sh: $f ($(wc -c < big/$f) bytes) in the system image, /usr/local/redwood/$f"
+	ln -s /usr/local/polaris/$f root/$f
+	echo "build.sh: $f ($(wc -c < big/$f) bytes) in the system image, /usr/local/polaris/$f"
 done
 [ -d big ] && SYSTEM=1          # (the links point into it: it is made again with them)
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (drivers/storage/hakios.image.c)
-python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
-[ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs redwood=root
+python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs polaris=root | tail -1
+[ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs polaris=root
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.apfs --------------------------------
 # With the Darwin volume on the phone's flash as the root, all that has to come from RAM is what is not
 # on it -- the two cryptexes, OS with the dyld shared cache and App -- and what starts the boot: three
 # APFS containers back to back in the one resident image. The first, the boot volume, is the root the
-# kernel starts from (rd=md0): stage0 as /sbin/launchd mounts the small image on /redwood and runs its
+# kernel starts from (rd=md0): stage0 as /sbin/launchd mounts the small image on /polaris and runs its
 # init, which with boot-arg root_apfs=DEV mounts the volume on /flash, makes it the root and moves the
 # boot volume to the volume's /private/preboot, then mounts the second container -- the OS cryptex -- on
 # the boot volume's empty Cryptexes/OS and the third -- Apple's App cryptex as it is -- on Cryptexes/App:
@@ -584,7 +580,7 @@ python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -
 # them from there, the same containers 1 and 2 of the root's own device.
 if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	rm -rf flashboot flashboot.os
-	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
+	mkdir -p flashboot/sbin flashboot/polaris flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
 	cp obj/stage0 flashboot/sbin/launchd
 	# the OS cryptex, and the shared cache in it, only where this image will carry it:
 	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
@@ -659,8 +655,8 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# launchd must load our choice of jobs, not all 500 that Darwin has
 	rm -rf sysroot/System/Library/LaunchDaemons sysroot/System/Library/NanoLaunchDaemons \
 		sysroot/System/Library/LaunchAngels sysroot/System/Library/xpc/launchd.plist
-	ln -s /redwood/LaunchDaemons sysroot/System/Library/LaunchDaemons
-	mkdir -p sysroot/redwood sysroot/sbin
+	ln -s /polaris/LaunchDaemons sysroot/System/Library/LaunchDaemons
+	mkdir -p sysroot/polaris sysroot/sbin
 	# where the kernel mounts the Darwin root container off the phone's flash (boot-arg apfs_volume=):
 	# Darwin has no /System/Volumes, and nothing can make a directory in this image once it is built
 	mkdir -p sysroot/System/Volumes/Darwin
@@ -724,12 +720,12 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
-	ln -s /redwood/lib/HakiosAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver
+	ln -s /polaris/lib/HakiosAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver
 	# the plug-in Metal opens when the accelerator names it (boot-arg metal=1; without it nothing names this bundle)
-	rm -rf sysroot/usr/local/redwood
-	[ -d big ] && mkdir -p sysroot/usr/local && cp -a big sysroot/usr/local/redwood
+	rm -rf sysroot/usr/local/polaris
+	[ -d big ] && mkdir -p sysroot/usr/local && cp -a big sysroot/usr/local/polaris
 	mkdir -p sysroot/System/Library/Extensions
-	[ -d root/lib/HakiosMetal.bundle ] && ln -sfn /redwood/lib/HakiosMetal.bundle sysroot/System/Library/Extensions/HakiosMetal.bundle
+	[ -d root/lib/HakiosMetal.bundle ] && ln -sfn /polaris/lib/HakiosMetal.bundle sysroot/System/Library/Extensions/HakiosMetal.bundle
 	# the OS cryptex: on a device a separate volume grafted at /System/Cryptexes/OS. It holds the dyld
 	# shared cache (dyld looks there first) and a few libraries and resources outside the cache.
 	mkdir -p sysroot/System/Cryptexes

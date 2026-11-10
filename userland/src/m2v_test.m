@@ -21,7 +21,7 @@ id native_bridge_metal_open(const char *loader, const char *cache, uint64_t regi
 size_t native_bridge_metal_status(char *out, size_t size);
 uint64_t native_bridge_metal_first_problem(char *out, size_t size);
 
-#define TURNIP "/redwood/lib/libvulkan_freedreno.dylib"
+#define TURNIP "/polaris/lib/libvulkan_freedreno.dylib"
 #define CACHE "/private/var/tmp/m2v"
 
 static double

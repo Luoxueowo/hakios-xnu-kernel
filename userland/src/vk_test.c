@@ -21,7 +21,7 @@
 /* (vk_icd.h's: the loader-to-driver handshake) */
 typedef VkResult (VKAPI_PTR *PFN_vkNegotiateLoaderICDInterfaceVersion)(uint32_t *pVersion);
 
-#define DRIVER "/redwood/lib/libvulkan_freedreno.dylib"
+#define DRIVER "/polaris/lib/libvulkan_freedreno.dylib"
 #define WORDS (1u << 20)        /* a 4 MB buffer */
 
 static PFN_vkGetInstanceProcAddr gipa;

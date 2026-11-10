@@ -4,7 +4,7 @@
 #   tools/metal-cache-seed.sh            the phone in Android (adb, root): read var_store's newest archive off
 #                                        darwin (read only), take db/hakios-metal-cache out of it into
 #                                        userland/hakios-metal-cache; userland/build.sh puts that into the image
-#                                        at /redwood/share/hakios-metal-cache, where the window server looks after
+#                                        at /polaris/share/hakios-metal-cache, where the window server looks after
 #                                        its own cache (HakiosMetalCA.m: HM_CACHE_SEED)
 #   tools/metal-cache-seed.sh --image F  the same from a copy of darwin taken from byte 8589934592
 #

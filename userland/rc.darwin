@@ -1,6 +1,6 @@
 # Commands init runs after its own checks: one per line, words separated by blanks.
 # Our own program first, then programs taken unmodified from Darwin userland 16.5.
-/redwood/bin/hello_dyn one two
+/polaris/bin/hello_dyn one two
 /bin/df
 /sbin/mount
 /bin/ps -A

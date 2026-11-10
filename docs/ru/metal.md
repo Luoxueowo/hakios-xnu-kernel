@@ -263,7 +263,7 @@ CoreAnimation — рендерер OpenGL ES, который порт уже и 
 
 Поскольку отказ Metal нигде не слышен, а весь план выше держится на утверждениях о том, кто и как
 падает, первое, что нужно, — это чтобы система сама говорила, что она про Metal думает.
-`userland/src/metal_test.m` (собирается `build.sh`, попадает в `/redwood/bin`, запускается
+`userland/src/metal_test.m` (собирается `build.sh`, попадает в `/polaris/bin`, запускается
 `RC_JOBS=rc.jobs.metal`) печатает всю цепочку раздела 1 по шагам:
 
 1. службы класса `IOAcceleratorES` и у каждой — `MetalPluginName` и `MetalPluginClassName`
@@ -491,8 +491,8 @@ CoreAnimation, — и `-sharegroup` среди них не было; а `my_init
 CoreImage пошёл дальше:
 
 ```
-$ /redwood/bin/metal_test ci-eagl-software
-metal_test:   /redwood/lib/libhakios.gl.dylib loaded; EAGLContext is ours now
+$ /polaris/bin/metal_test ci-eagl-software
+metal_test:   /polaris/lib/libhakios.gl.dylib loaded; EAGLContext is ours now
 metal_test:   EAGLContext: EAGLContext, API 3
 hakios-gl: -sharegroup asked for: none (nothing here shares a context)
 hakios-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa, off-screen (OSMesa): ...

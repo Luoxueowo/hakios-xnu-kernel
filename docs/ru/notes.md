@@ -175,7 +175,7 @@ codec DMA TX_CDC_DMA_TX_3 и звуковой процессор в поток, 
   разблокировано: программы записывают в неё пароли и читают их обратно (wifid — пароли сетей, подключённых из
   Настроек). Это не защищённая связка: Secure Enclave нет, ключи классов защиты заменяет обратимое
   преобразование в ядре (`iokit/Kernel/MiniAppleKeyStore.cpp`), и всё записанное лежит в `/private/var`, то есть в
-  памяти; без `var_store=1` оно пропадает при следующем старте (см. «Том данных между загрузками»). Проверка: `/redwood/bin/keychain_test` (подписывается `ldid`
+  памяти; без `var_store=1` оно пропадает при следующем старте (см. «Том данных между загрузками»). Проверка: `/polaris/bin/keychain_test` (подписывается `ldid`
   с группой доступа к связке; без `ldid` связка такой программе отказывает).
 - **Wi-Fi телефона (опытно): `wifi=1`.** Радио телефона подключается к одной сети WPA2 с паролем, и Darwin выходит
   через него в интернет: адрес по DHCP, DNS, HTTPS. Нужны прошивка радио в `fw-wifi/` (см. `wifi_step=N` в
@@ -766,9 +766,9 @@ Sileo работает от него и держит там свою базу.
 
 ```sh
 CRYPTEXES=flash FLASHBOOT=1 GL=1 REST=1 QUIET=1 RC_JOBS=rc.jobs.jb \
-  INJECT="$(printf '%s\n' '/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system' \
-    '/redwood/lib/libhakios.sb.dylib SpringBoard' '/redwood/lib/libhakios.media.dylib mediaserverd' \
-    '/redwood/lib/libhakios.app.dylib Sileo')" userland/build.sh
+  INJECT="$(printf '%s\n' '/polaris/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system' \
+    '/polaris/lib/libhakios.sb.dylib SpringBoard' '/polaris/lib/libhakios.media.dylib mediaserverd' \
+    '/polaris/lib/libhakios.app.dylib Sileo')" userland/build.sh
 ./xl ramdisk userland/flashboot.apfs
 XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1" XL_SECS=1800 ./xl run
 ```
@@ -947,16 +947,16 @@ Darwin доходит до того же домашнего экрана, что
 /dev/ufs_darwin on / (apfs, local, read-only)
 devfs on /dev (devfs, local, nobrowse)
 root_device on /private/preboot (apfs, local, read-only)
-/dev/md1 on /private/preboot/redwood (apfs, local, read-only)
-/redwood/LaunchDaemons on /System/Library/LaunchDaemons (bindfs, local, nosuid, read-only, nobrowse)
-/redwood/empty on /System/Library/NanoLaunchDaemons (bindfs, local, nosuid, read-only, nobrowse)
-/redwood/empty on /System/Library/LaunchAngels (bindfs, local, nosuid, read-only, nobrowse)
-/redwood/xpc on /System/Library/xpc (bindfs, local, nosuid, read-only, nobrowse)
-/redwood/hal on /System/Library/Audio/Plug-Ins/HAL (bindfs, local, nosuid, read-only, nobrowse)
+/dev/md1 on /private/preboot/polaris (apfs, local, read-only)
+/polaris/LaunchDaemons on /System/Library/LaunchDaemons (bindfs, local, nosuid, read-only, nobrowse)
+/polaris/empty on /System/Library/NanoLaunchDaemons (bindfs, local, nosuid, read-only, nobrowse)
+/polaris/empty on /System/Library/LaunchAngels (bindfs, local, nosuid, read-only, nobrowse)
+/polaris/xpc on /System/Library/xpc (bindfs, local, nosuid, read-only, nobrowse)
+/polaris/hal on /System/Library/Audio/Plug-Ins/HAL (bindfs, local, nosuid, read-only, nobrowse)
 /fw on /fw (bindfs, local, nosuid, read-only, nobrowse)
 /dev/ufs_darwin,c=1 on /private/preboot/Cryptexes/OS (apfs, local, read-only)
 /dev/ufs_darwin,c=2 on /private/preboot/Cryptexes/App (apfs, local, read-only)
-/private/preboot/redwood on /redwood (bindfs, local, nosuid, read-only, nobrowse)
+/private/preboot/polaris on /polaris (bindfs, local, nosuid, read-only, nobrowse)
 ramfs on /private/var (ramfs, local)
 ```
 
@@ -965,7 +965,7 @@ ramfs on /private/var (ramfs, local)
 
 - ядро стартует как всегда, с образа в памяти (`rd=md0` — ровно по этой строке launchd понимает, что задачи
   загрузки настоящего устройства не нужны: с `rd=md1` он выполнял их все и вставал на `keybag`); `stage0`
-  монтирует маленький образ на `/redwood` и запускает его `init`;
+  монтирует маленький образ на `/polaris` и запускает его `init`;
 - `init` (`flash_root`) монтирует том на `/flash`, кладёт поверх его каталогов (bindfs) наш список заданий
   launchd, пустые `NanoLaunchDaemons` и `LaunchAngels`, `xpc` без `launchd.plist` и только наш аудиоплагин,
   даёт `/Applications` 32 приложения, которые Darwin ставит при первом запуске, и просит ядро сделать том корнем
@@ -974,10 +974,10 @@ ramfs on /private/var (ramfs, local)
   `Cryptexes/App` криптексы — контейнеры 1 и 2 раздела `darwin` (`/dev/ufs_darwin,c=1`, `c=2`) или, если образ в
   памяти их несёт, его (`/dev/md0,c=1`, `c=2`); туда ведут `/System/Cryptexes/OS` и `App` самого тома, как на
   iPhone, где их прививает `graftdmg`; кроме корня, ядро принимает общий кеш только
-  оттуда; маленький образ на загрузочном томе привязывается обратно на `/redwood`.
+  оттуда; маленький образ на загрузочном томе привязывается обратно на `/polaris`.
 
 Для этого в драйвере APFS появились синтетические каталоги (`sysctl kern.apfs_synthetic=ПУТЬ`), как
-`synthetic.conf` у macOS для запечатанного тома: пустые каталоги для точек монтирования (`/redwood`) или
+`synthetic.conf` у macOS для запечатанного тома: пустые каталоги для точек монтирования (`/polaris`) или
 `ПУТЬ=ЦЕЛЬ` — другое имя для каталога того же тома; так приложения из `staged_system_apps` и стоят в
 `/Applications` (точками монтирования их тот, кто регистрирует системные приложения, пропускал). Ещё:
 `lookup` APFS находит существующее при любой операции и отказывает (EROFS) только в создании нового имени, —
@@ -1282,7 +1282,7 @@ APFS, и все их читает тот же драйвер APFS ядра, чт
 | криптекс App (службы Safari) | `Cryptex1,AppOS` на `/private/preboot/Cryptexes/App`, куда ведёт `/System/Cryptexes/App` | образ Apple байт в байт (10 МБ) — контейнер 2 раздела `darwin`, на том же месте (или третий контейнер `flashboot.apfs`); в `system.apfs` — каталог `/System/Cryptexes/App` |
 | Preboot | том Preboot | загрузочный том `flashboot.apfs` (`stage0`, прошивки звукового процессора, точки монтирования), после смены корня — на `/private/preboot` |
 | Data (`/private/var`) | том Data | ramfs; с `var_store=1` его содержимое переживает перезагрузку — архивом в свободном месте раздела `darwin` (см. «Том данных между загрузками») |
-| — | — | `root.apfs` на `/redwood`: наш init, программы, библиотеки-вставки, задания launchd, прошивки GPU и Wi-Fi |
+| — | — | `root.apfs` на `/polaris`: наш init, программы, библиотеки-вставки, задания launchd, прошивки GPU и Wi-Fi |
 
 | образ | контейнеров | размер | был packfs |
 |---|---|---|---|
@@ -1425,7 +1425,7 @@ Darwin, на блок за концом раздела, нули в суперб
 была «новым устройством». Том в памяти потому, что драйвер APFS ядра читает и не пишет, а оба пути ядра к
 накопителю телефона были «только чтение по построению».
 
-Сделан не «APFS на запись», а копия дерева. `/redwood/bin/var_store` (`userland/src/var_store.c`) упаковывает
+Сделан не «APFS на запись», а копия дерева. `/polaris/bin/var_store` (`userland/src/var_store.c`) упаковывает
 `/private/var` в простой архив и пишет его в единственное место флеша, которое принадлежит порту и которое ничто
 в нём не читает, — в раздел `darwin`, за томом Darwin и двумя криптексами; `init` при следующей загрузке
 распаковывает архив поверх шаблона (`var_store=1`). Имя, которое есть и в шаблоне, и в архиве, выходит таким,
@@ -1731,7 +1731,7 @@ REST=1 userland/build.sh
 сжатие zlib, как у Apple):
 
 - `userland/root.apfs` — маленький (наш init, библиотеки-вставки, задания launchd, прошивки); едет вместе с
-  ядром (`/dev/md1`, на `/redwood`), пересобирается за секунды;
+  ядром (`/dev/md1`, на `/polaris`), пересобирается за секунды;
 - `userland/system.apfs` — корень: отобранная часть Darwin userland 16.5 (`sysimage/select-system.py`), криптексы OS (с кэшем
   dyld) и App на `/System/Cryptexes`. Пересобирается только при изменении входных данных или с `SYSTEM=1`;
 - `userland/flashboot.apfs` (`FLASHBOOT=1`) — то, что нужно в памяти, когда корень — том Darwin на флеше: загрузочный
@@ -1757,7 +1757,7 @@ REST=1 userland/build.sh
 Остальные переменные (`JOBS`, `OSLOG`, `INJECT`, `RC_JOBS`) описаны в начале `userland/build.sh`.Остальные переменные (`JOBS`, `OSLOG`, `INJECT`, `RC_JOBS`, `EXTRA`, `EXTRA_SHARE`) описаны в начале
 `userland/build.sh`.
 
-Список заданий (`RC_JOBS=файл`, он же `/redwood/etc/rc.jobs`) выполняет не оболочка, а наш `init`
+Список заданий (`RC_JOBS=файл`, он же `/polaris/etc/rc.jobs`) выполняет не оболочка, а наш `init`
 (`run_command` в `userland/src/init.c`), и рассчитывать в нём нельзя на четыре вещи:
 
 - **на оболочку.** В корне самой Darwin userland 16.5 её нет вообще: `/bin` — это `df` и `ps`, и больше ничего. Строка,

@@ -1291,7 +1291,7 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	if (sensor >= sizeof(names) / sizeof(names[0])) {
 		return;
 	}
-	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names[sensor]);
+	snprintf(path, sizeof(path), "/polaris/fw/camera-%s.isp", names[sensor]);
 	if (isp_load_tuning(isp, path)) {
 		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
 		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);

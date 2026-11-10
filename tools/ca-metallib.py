@@ -10,7 +10,7 @@ in the repository), with one variant of each of the four uber shaders put in the
 variant a pipeline's label names (userland/src/HakiosMetalCA.m, hm_bitcode_for()).
 
 OUTDIR/QuartzCore-default.metallib is written; build the image with EXTRA_SHARE=OUTDIR and run with
-ca_metallib=/redwood/share/<OUTDIR's name>/QuartzCore-default.metallib (userland/src/inject.c).
+ca_metallib=/polaris/share/<OUTDIR's name>/QuartzCore-default.metallib (userland/src/inject.c).
 
 Off a Mac (Windows, WSL, Linux): CA_QC_METALLIB=FILE names the later CoreAnimation's library to take the air64 slice
 from -- a copy of a Mac's QuartzCore.framework/Versions/A/Resources/default.metallib, or iPadOS/iOS 17's

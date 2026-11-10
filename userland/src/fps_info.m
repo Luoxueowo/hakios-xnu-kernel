@@ -5,7 +5,7 @@
  * panel runs at 120 Hz here (fb_measure=1) while the frames came at 60 (tools/frames.py): this says which of them
  * holds the rate at 60. Every property is asked only if the object answers it; nothing is set.
  *
- *   usage: fps_info          (RC_JOBS: a line /redwood/bin/fps_info, after SpringBoard is up)
+ *   usage: fps_info          (RC_JOBS: a line /polaris/bin/fps_info, after SpringBoard is up)
  */
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
