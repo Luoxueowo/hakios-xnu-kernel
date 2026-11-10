@@ -1,5 +1,5 @@
 diff --git a/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c b/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
-index 170e2e2..8ab77b5 100644
+index 170e2e2..1b3e08c 100644
 --- a/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
 +++ b/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
 @@ -22,6 +22,8 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
@@ -11,12 +11,39 @@ index 170e2e2..8ab77b5 100644
  static BOOLEAN  mSecViolation = FALSE;
  
  /**
-@@ -187,5 +189,10 @@ PlatformBootManagerUnableToBoot (
+@@ -131,6 +133,26 @@ PlatformBootManagerPriorityBoot (
+   EFI_BOOT_MANAGER_LOAD_OPTION  BootManagerMenu;
+   EFI_STATUS                    Status = EFI_SUCCESS;
+ 
++  //
++  // HakiOS: a payload in memory is what this phone runs. Its loader is started here,
++  // before BDS looks for a boot option, because the front page is a boot option
++  // itself: reached from UnableToBoot instead, the loader is never called. Nothing
++  // of the phone's own is installed, so there is nothing else worth booting.
++  //
++  {
++    XNU_PAYLOAD_HEADER  *Header = (XNU_PAYLOAD_HEADER *)(UINTN)XNU_PAYLOAD_BASE;
++
++    if (Header->Magic == XNU_PAYLOAD_MAGIC) {
++      // does not return unless the payload carries no "loader.efi" entry
++      XnuLoaderStartPayload ();
++      Print (L"HakiOS: the payload at 0x%08lx has no loader to start; BDS carries on\r\n", XNU_PAYLOAD_BASE);
++      gBS->Stall (15 * 1000 * 1000);
++    } else {
++      Print (L"HakiOS: no payload at 0x%08lx (magic %08x); BDS carries on\r\n", XNU_PAYLOAD_BASE, Header->Magic);
++      gBS->Stall (15 * 1000 * 1000);
++    }
++  }
++
+   Status = DeviceBootManagerPriorityBoot (&BootOption);
+ 
+   //
+@@ -187,5 +209,10 @@ PlatformBootManagerUnableToBoot (
    VOID
    )
  {
 +  //
-+  // Nothing else to boot: hand over to the XNU loader (does not return).
++  // HakiOS: the fallback, for a payload that PriorityBoot could not start.
 +  //
 +  XnuLoaderMain ();
 +

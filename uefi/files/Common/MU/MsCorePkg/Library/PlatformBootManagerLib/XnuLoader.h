@@ -30,4 +30,13 @@ typedef struct {
 VOID
 XnuLoaderMain ();
 
+//
+// Starts the payload's loader.efi, if it has one. Writes what the payload holds,
+// and what StartImage answered, to the log partition either way. Returns when the
+// payload has no loader.efi, when that image could not be started, or when it did
+// return: BDS then carries on as it would without a payload.
+//
+VOID
+XnuLoaderStartPayload ();
+
 #endif /* _XNU_LOADER_H_ */

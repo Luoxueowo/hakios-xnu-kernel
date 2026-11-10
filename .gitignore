@@ -4,6 +4,7 @@
 /*
 !/hakios-metal/
 !/.gitignore
+!/.gitmodules
 !/.gitattributes
 !/VERSION
 !/README.md
@@ -33,6 +34,7 @@
 !/qemu/
 !/tools/
 !/uefi/
+!/mu_aloha_platforms/
 !/userland/
 !/sysimage/
 !/xnu/
@@ -115,8 +117,9 @@ __pycache__/
 !/devices/*/uefi/files/Binaries/*/README.md
 /devices/*/prebuilt/UEFI.fd
 
-# the UEFI, its submodules and what building it leaves: a clone of the phone's own tree (uefi/apply.sh)
-/mu_aloha_platforms/
+# the UEFI tree is a submodule (../mu_aloha_platforms, pinned by uefi/BASE). Its own history is kept
+# there; HakiOS's changes live in uefi/hakios.patch, uefi/submodule.patch and uefi/files/, and what
+# building it leaves (Build/, its own submodules) stays out of this repository.
 
 # The SoC, device and UEFI repositories that tools/hakios-device.py sync clones into place (devices/manifest.conf) are their own:
 /socs/*

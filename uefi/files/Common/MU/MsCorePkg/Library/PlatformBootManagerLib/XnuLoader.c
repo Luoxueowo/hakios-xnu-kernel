@@ -18,6 +18,7 @@
 #include <Library/BaseMemoryLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/PrintLib.h>
+#include <Library/UefiBootManagerLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiRuntimeServicesTableLib.h>
 
@@ -31,6 +32,7 @@
 
 STATIC CHAR8  *mLog;
 STATIC UINTN   mLogLen;
+STATIC BOOLEAN mLogOpen;
 
 STATIC
 VOID
@@ -230,20 +232,39 @@ FlushLog ()
   }
 }
 
-//
-// The payload is a list of named blobs. If it carries "loader.efi", that is
-// the real XNU loader: start it straight from memory, so the loader can be
-// iterated on without rebuilding this firmware.
-//
 STATIC
 VOID
-StartPayloadLoader ()
+LogOpen ()
+{
+  EFI_TIME  Time;
+
+  if (mLogOpen) {
+    return;
+  }
+
+  mLog = AllocateZeroPool (LOG_SIZE);
+  if (mLog == NULL) {
+    return;
+  }
+
+  mLogOpen = TRUE;
+  Log ("== XNULOADER LOG v1 ==\n");
+  if (!EFI_ERROR (gRT->GetTime (&Time, NULL))) {
+    Log ("time=%04d-%02d-%02d %02d:%02d:%02d\n", Time.Year, Time.Month, Time.Day, Time.Hour, Time.Minute, Time.Second);
+  }
+}
+
+STATIC
+VOID
+LogPayloadEntries ()
 {
   XNU_PAYLOAD_HEADER *Header = (XNU_PAYLOAD_HEADER *)XNU_PAYLOAD_BASE;
   UINT8              *Cursor;
   UINT8              *End;
 
+  Log ("[entries]\n");
   if (Header->Magic != XNU_PAYLOAD_MAGIC || Header->Size > XNU_PAYLOAD_MAX_SIZE) {
+    Log ("header rejected\n");
     return;
   }
 
@@ -257,37 +278,99 @@ StartPayloadLoader ()
       break;
     }
 
-    if (AsciiStrnCmp (Entry->Name, "loader.efi", sizeof (Entry->Name)) == 0) {
-      EFI_HANDLE Handle;
+    Log ("%a %x\n", Entry->Name, Entry->Size);
+    Cursor += sizeof (XNU_PAYLOAD_ENTRY) + ALIGN_VALUE (Entry->Size, 16);
+  }
+}
 
-      if (!EFI_ERROR (gBS->LoadImage (FALSE, gImageHandle, NULL, Entry + 1, Entry->Size, &Handle))) {
-        gBS->StartImage (Handle, NULL, NULL);
+//
+// The payload is a list of named blobs. If it carries "loader.efi", that is
+// the real XNU loader: start it straight from memory, so the loader can be
+// iterated on without rebuilding this firmware.
+//
+STATIC
+EFI_STATUS
+StartPayloadLoader ()
+{
+  XNU_PAYLOAD_HEADER *Header = (XNU_PAYLOAD_HEADER *)XNU_PAYLOAD_BASE;
+  UINT8              *Cursor;
+  UINT8              *End;
+
+  if (Header->Magic != XNU_PAYLOAD_MAGIC || Header->Size > XNU_PAYLOAD_MAX_SIZE) {
+    return EFI_NOT_FOUND;
+  }
+
+  Cursor = (UINT8 *)(Header + 1);
+  End    = Cursor + Header->Size;
+
+  while (Cursor + sizeof (XNU_PAYLOAD_ENTRY) <= End) {
+    XNU_PAYLOAD_ENTRY *Entry = (XNU_PAYLOAD_ENTRY *)Cursor;
+    EFI_STATUS         Status;
+    EFI_HANDLE         Handle;
+
+    if (Entry->Name[0] == 0) {
+      break;
+    }
+
+    if (AsciiStrnCmp (Entry->Name, "loader.efi", sizeof (Entry->Name)) == 0) {
+      Status = gBS->LoadImage (FALSE, gImageHandle, NULL, Entry + 1, Entry->Size, &Handle);
+      if (EFI_ERROR (Status)) {
+        return Status;
       }
 
-      return;
+      return gBS->StartImage (Handle, NULL, NULL);
     }
 
     Cursor += sizeof (XNU_PAYLOAD_ENTRY) + ALIGN_VALUE (Entry->Size, 16);
   }
+
+  return EFI_NOT_FOUND;
+}
+
+VOID
+XnuLoaderStartPayload ()
+{
+  EFI_STATUS  Status;
+
+  //
+  // BDS prints one line on the screen; the appending payload can only be
+  // inspected from here. Everything the hand-over depends on goes to the log
+  // partition first, so a run that never reaches the loader's own log is
+  // still readable from recovery.
+  //
+  //
+  // This runs before BDS has connected the storage: no block device, no partition,
+  // so nothing would be written. Connect them now, or the log stays empty.
+  //
+  EfiBootManagerConnectAll ();
+
+  LogOpen ();
+  Log ("[stage] bds hook\n");
+  LogPayload ();
+  LogPayloadEntries ();
+  LogDisplay ();
+  FlushLog ();
+
+  Status = StartPayloadLoader ();
+  Log ("[loader] returned status=%r\n", Status);
+  FlushLog ();
 }
 
 VOID
 XnuLoaderMain ()
 {
-  EFI_TIME Time;
+  EFI_STATUS  Status;
+
+  LogOpen ();
+  Log ("[stage] unable to boot\n");
+  FlushLog ();
 
   // Normally does not return
-  StartPayloadLoader ();
+  Status = StartPayloadLoader ();
+  Log ("[loader] returned status=%r\n", Status);
+  FlushLog ();
 
-  mLog = AllocateZeroPool (LOG_SIZE);
-  if (mLog != NULL) {
-    Log ("== XNULOADER LOG v1 ==\n");
-
-    if (!EFI_ERROR (gRT->GetTime (&Time, NULL))) {
-      Log ("time=%04d-%02d-%02d %02d:%02d:%02d\n", Time.Year, Time.Month, Time.Day, Time.Hour, Time.Minute, Time.Second);
-    }
-
-    FlushLog ();
+  if (mLogOpen) {
     LogCpu ();
     FlushLog ();
     LogDisplay ();

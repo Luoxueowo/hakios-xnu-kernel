@@ -1,0 +1,4 @@
+[submodule "mu_aloha_platforms"]
+	path = mu_aloha_platforms
+	url = https://github.com/Luoxueowo/mu_aloha_platforms.git
+	branch = polaris-device-support
