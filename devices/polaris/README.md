@@ -4,8 +4,24 @@ Made by `tools/new-device.py` on 2026-11-10, from the file polaris.dtb. Edit it 
 
 | What | Value |
 |---|---|
-| Board (the tree's `model`) | Xiaomi Technologies, Inc. Polaris MP v2.1 |
+| Board (the tree's `model`) | Xiaomi Technologies, Inc. Polaris P2 v2.1 |
 | Compatible | `qcom,sdm845-mtp qcom,sdm845 qcom,mtp` |
+
+## XNU loader platform
+
+The common loader selects the Polaris/SDM845 profile when UEFI reports the framebuffer at `0x9D400000`, the
+`Display Reserved` region in this device's memory map. The profile is based on the checked-in [Android device tree](../../mu_aloha_platforms/Platforms/NapaliPkg/Device/xiaomi-polaris/DeviceTreeBlob/Android/android-polaris.dtb)
+and [UEFI memory map](../../mu_aloha_platforms/Platforms/NapaliPkg/Device/xiaomi-polaris/Library/PlatformMemoryMapLib/PlatformMemoryMapLib.c):
+
+| Property | Value |
+|---|---|
+| GICv3 distributor | `0x17A00000` |
+| GICv3 redistributors | `0x17A60000` |
+| PSCI method | SMC |
+| CPU MPIDRs | `0x000` through `0x700`, Aff1 (8 CPUs) |
+| Generic timer frequency | `19.2 MHz` |
+
+This loader profile is integrated; an XNU boot on the phone has not yet been verified.
 
 ## The SoC addresses
 

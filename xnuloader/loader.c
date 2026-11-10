@@ -588,6 +588,19 @@ static const struct platform platform_redwood = {
 	.small_cores = 0x0f,
 };
 
+/* Xiaomi MIX 2S (Polaris), from its Android DTB and the UEFI memory map. */
+static const struct platform platform_polaris = {
+	/* The first MMIO region in PlatformMemoryMapLib; XNU requires this anchor to be non-zero. */
+	.name = "sdm845", .io_base = 0x00100000, .io_size = 0x3FF00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .psci_hvc = 0, .log_other_cpu = 1,
+	/* android-polaris.dtb: PSCI uses SMC; CPU MPIDRs are 0x000..0x700 (Aff1, shift 8). */
+	.cores = 8, .core_shift = 8,
+	/* SDM845 CPUs 0-3 are the slower Silver cluster; CPUs 4-7 are Gold. */
+	.small_cores = 0x0f,
+};
+
+#define POLARIS_FRAMEBUFFER_BASE 0x9D400000ULL /* Display Reserved in Polaris PlatformMemoryMapLib */
+
 /* ------------------------------------------------------------------------ */
 
 static void
@@ -4345,6 +4358,8 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.base == POLARIS_FRAMEBUFFER_BASE) {
+			PLAT = &platform_polaris;
 		} else {
 			ramfb_phone_screen();
 		}
