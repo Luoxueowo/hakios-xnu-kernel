@@ -1,0 +1,5 @@
+# The MIX 2S's Synaptics S3330 is device-specific; it uses the touchscreen=1 gate.
+driver SYNAPTICS
+    file    bsd/dev/hakios.synaptics.c
+    default n
+    help    the Xiaomi MIX 2S Synaptics S3330 RMI4 touch screen on its bit-banged I2C bus (touchscreen=1)

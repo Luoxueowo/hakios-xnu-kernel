@@ -19,8 +19,8 @@ fails the build when the two files disagree with the code. It says WHICH driver 
 an argument means is in the head of that file, and for the stable ones in tools/hakios-config.py (`help SYMBOL`).
 
 What is looked for:
-  the kernel   PE_parse_boot_argn("name" ...) and PE_parse_boot_arg_str("name" ...), in xnu/files/ and in the lines
-               xnu/hakios.patch adds to Apple's files
+  the kernel   PE_parse_boot_argn("name" ...) and PE_parse_boot_arg_str("name" ...), in xnu/files/, drivers/, and
+               the SoC and device repositories' drivers/, and in the lines xnu/hakios.patch adds to Apple's files
   the loader   starts_with(c, "name=...") on the payload's command line, in xnuloader/
   user space   a name given to strstr()/strncmp() on sysctl kern.bootargs, in userland/src/ (seen: sb_delay=, touch_lat=1,
                ca_vbl=1 ...), or to the Metal plug-in's helper hm_boot_arg_set("metal_m2v=1")
@@ -66,7 +66,7 @@ GROUPS = [
     ("Cellular", r"hakios\.(mpss|ipa|cell|nas|qmi)\."),
     ("Audio and battery", r"hakios\.(adsp|audio|sound|speaker|mic|virtio_sound|battery|battguard)\."),
     ("Cameras", r"hakios\.camera\."),
-    ("Touch and buttons", r"hakios\.(goodix|input|buttons|virtio_input)\."),
+    ("Touch and buttons", r"hakios\.(goodix|synaptics|input|buttons|virtio_input)\."),
     ("Storage and APFS", r"hakios\.(ufs|ufshc|virtio_blk|sparse|apfs_check)\.|apfs_vfsops\."),
     ("Network", r"hakios\.(net|virtio_net)\."),
     ("Haptics and torch", r"hakios\.(haptic|torch)\."),
@@ -100,12 +100,13 @@ SET_BY = {
 
 
 def tracked(root):
-    out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True).stdout
+    """Files in the index and non-ignored working tree, so new source is catalogued before it is staged."""
+    out = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=root, capture_output=True, check=True).stdout
     return [p.decode() for p in out.split(b"\0") if p]
 
 
 def scan(root, keep=None):
-    """{name: {"kernel": {files}, "loader": {files}, "user": {files}, "str": {files}}} found in the tracked source.
+    """{name: {"kernel": {files}, "loader": {files}, "user": {files}, "str": {files}}} found in the repository source.
     `keep`, if given, is filled with {file name: text} of every source file read (the descriptions are taken from it)."""
     found = collections.defaultdict(lambda: {"kernel": set(), "loader": set(), "user": set(), "str": set()})
     for f in tracked(root):
@@ -121,8 +122,8 @@ def scan(root, keep=None):
         if f == "xnu/hakios.patch":
             text = "\n".join(l[1:] for l in text.splitlines() if l.startswith("+") and not l.startswith("+++"))
             base = "(patch)"
-        # the kernel's side: where the drivers are kept (xnu/files/ until they moved to drivers/<subsystem>/) and the Linux layer
-        if f.startswith(("xnu/", "drivers/", "wifi/lx/src/")):
+        # the kernel's side: xnu/files/, common and device/SoC drivers, and the Linux layer
+        if f.startswith(("xnu/", "drivers/", "socs/", "devices/", "wifi/lx/src/")):
             for m in KERNEL.finditer(text):
                 found[m.group(1)]["kernel"].add(base)
             for m in STRING.finditer(text):

@@ -243,6 +243,12 @@ SURF_WRAP	arg	surf_wrap	GPU and display	k	MiniIOSurface.cpp	surfaces around the 
 SURFTRACE	arg	surftrace	GPU and display	k	MiniIOSurface.cpp	log the first N surfaces created (default 24)
 SURFTRACE_OF	arg	surftrace_of	GPU and display	k	MiniIOSurface.cpp	
 SWITCHER_WALLPAPER	arg	switcher_wallpaper	User space	u	inject_sb.c	
+SYNAPTICS_FINGERS	arg	synaptics_fingers	Touch and buttons	k	hakios.synaptics.c	ignore Control 23 and use N slots
+SYNAPTICS_MAX_X	arg	synaptics_max_x	Touch and buttons	k	hakios.synaptics.c	the panel's X coordinate range (default 1080)
+SYNAPTICS_MAX_Y	arg	synaptics_max_y	Touch and buttons	k	hakios.synaptics.c	the panel's Y coordinate range (default 2160)
+SYNAPTICS_POLL_US	arg	synaptics_poll_us	Touch and buttons	k	hakios.synaptics.c	polling interval in microseconds (500..1000000; default 20000)
+SYNAPTICS_RESET	arg	synaptics_reset	Touch and buttons	k	hakios.synaptics.c	leave RESET99 alone (by default, release it if the loader left it asserted)
+SYNAPTICS_TRACE	arg	synaptics_trace	Touch and buttons	k	hakios.synaptics.c	a line for every frame (bring-up)
 SYSSLEEP	arg	syssleep	CPU, memory and boot	k	(patch)	
 SYSTRACE	arg	systrace	CPU, memory and boot	k	(patch),user_exception_trace.c	
 SYSTRACE_NAME	arg	systrace_name	CPU, memory and boot	k	(patch)	

@@ -267,6 +267,12 @@ surf_wrap	k
 surftrace	k
 surftrace_of	k
 switcher_wallpaper	u
+synaptics_fingers	k
+synaptics_max_x	k
+synaptics_max_y	k
+synaptics_poll_us	k
+synaptics_reset	k
+synaptics_trace	k
 syssleep	k
 systrace	k
 systrace_name	k

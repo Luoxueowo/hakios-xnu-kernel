@@ -16,5 +16,6 @@
 | Part | State | |
 |---|---|---|
 | display | partly | UEFI's framebuffer, through the loader (to be checked) |
+| touch | partly | Synaptics S3330 driver ported from the old Polaris project; not yet validated from this repository |
 
 The state is what has been seen on this device, written down in `devices/polaris/device.conf`; a part the table does not name has not been looked at.
