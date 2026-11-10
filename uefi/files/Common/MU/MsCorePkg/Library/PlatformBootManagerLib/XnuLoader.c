@@ -34,6 +34,72 @@ STATIC CHAR8  *mLog;
 STATIC UINTN   mLogLen;
 STATIC BOOLEAN mLogOpen;
 
+//
+// Early trace: a line a stage, written by LBA to the first block of the logdump partition. FindPartition ()
+// below needs the firmware to have published the partitions, which the vendor's DiskIoDxe does not do, so a
+// log written through it never lands; this does not need them, and tells a run that never got as far as the
+// loader (or whose screen stays empty) how far BDS got. The LBA is logdump's start on the phone's GPT.
+//
+#define TRACE_BYTE  (49152ULL * 4096)   // where logdump starts on the flash
+
+STATIC CHAR8                 *mTrace;
+STATIC UINTN                  mTraceLen;
+STATIC EFI_BLOCK_IO_PROTOCOL *mTraceBio;
+STATIC UINT64                 mTraceLba;     // TRACE_BYTE in the unit's own blocks
+
+STATIC
+VOID
+Trace (
+  IN CONST CHAR8 *Line)
+{
+  EFI_STATUS              Status;
+  UINTN                   Index, Count;
+  EFI_HANDLE              *Handles;
+  EFI_BLOCK_IO_PROTOCOL   *Bio;
+
+  if (mTrace == NULL) {
+    mTrace = AllocateZeroPool (4096);
+    if (mTrace == NULL) {
+      return;
+    }
+  }
+
+  if (mTraceBio == NULL) {
+    Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiBlockIoProtocolGuid, NULL, &Count, &Handles);
+    if (EFI_ERROR (Status)) {
+      return;
+    }
+    for (Index = 0; Index < Count; Index++) {
+      Status = gBS->HandleProtocol (Handles[Index], &gEfiBlockIoProtocolGuid, (VOID **)&Bio);
+      if (EFI_ERROR (Status) || Bio->Media == NULL) {
+        continue;
+      }
+      // the whole unit (128 GB), not a partition
+      if (Bio->Media->BlockSize == 0 || (TRACE_BYTE % Bio->Media->BlockSize) != 0 ||
+          MultU64x32 (Bio->Media->LastBlock + 1, Bio->Media->BlockSize) < (64ULL << 30)) {
+        continue;
+      }
+      mTraceBio = Bio;
+      mTraceLba = TRACE_BYTE / Bio->Media->BlockSize;
+      break;
+    }
+    gBS->FreePool (Handles);
+    if (mTraceBio == NULL) {
+      return;
+    }
+  }
+
+  if (mTraceLen >= 4096 - 2) {
+    mTraceLen = 0;
+    ZeroMem (mTrace, 4096);
+  }
+  while (*Line != 0 && mTraceLen < 4096 - 2) {
+    mTrace[mTraceLen++] = *Line++;
+  }
+  mTrace[mTraceLen++] = '\n';
+  mTraceBio->WriteBlocks (mTraceBio, mTraceBio->Media->MediaId, mTraceLba, 4096, mTrace);
+}
+
 STATIC
 VOID
 EFIAPI
@@ -297,6 +363,7 @@ StartPayloadLoader ()
   UINT8              *End;
 
   if (Header->Magic != XNU_PAYLOAD_MAGIC || Header->Size > XNU_PAYLOAD_MAX_SIZE) {
+    Trace ("bds: no payload in memory");
     return EFI_NOT_FOUND;
   }
 
@@ -313,12 +380,18 @@ StartPayloadLoader ()
     }
 
     if (AsciiStrnCmp (Entry->Name, "loader.efi", sizeof (Entry->Name)) == 0) {
+      Trace ("bds: loader.efi found");
       Status = gBS->LoadImage (FALSE, gImageHandle, NULL, Entry + 1, Entry->Size, &Handle);
       if (EFI_ERROR (Status)) {
+        Trace (Status == EFI_SECURITY_VIOLATION ? "bds: LoadImage refused (security)" :
+               "bds: LoadImage failed");
         return Status;
       }
-
-      return gBS->StartImage (Handle, NULL, NULL);
+      Trace ("bds: image loaded, starting it");
+      Status = gBS->StartImage (Handle, NULL, NULL);
+      Trace (Status == EFI_SECURITY_VIOLATION ? "bds: StartImage refused (security)" :
+             "bds: StartImage returned");
+      return Status;
     }
 
     Cursor += sizeof (XNU_PAYLOAD_ENTRY) + ALIGN_VALUE (Entry->Size, 16);
@@ -338,12 +411,13 @@ XnuLoaderStartPayload ()
   // partition first, so a run that never reaches the loader's own log is
   // still readable from recovery.
   //
+  // This is called before BDS has connected the storage, so nothing here can be
+  // written to a partition: EfiBootManagerConnectAll () at this point is what a
+  // phone with the vendor's DiskIoDxe resets in -- and the log it was there for
+  // comes from the loader itself at the end of its run anyway. The payload is
+  // started first; only a payload that came back is worth writing about.
   //
-  // This runs before BDS has connected the storage: no block device, no partition,
-  // so nothing would be written. Connect them now, or the log stays empty.
-  //
-  EfiBootManagerConnectAll ();
-
+  Trace ("bds: priority boot hook");
   LogOpen ();
   Log ("[stage] bds hook\n");
   LogPayload ();
@@ -361,6 +435,7 @@ XnuLoaderMain ()
 {
   EFI_STATUS  Status;
 
+  Trace ("bds: unable-to-boot hook");
   LogOpen ();
   Log ("[stage] unable to boot\n");
   FlushLog ();

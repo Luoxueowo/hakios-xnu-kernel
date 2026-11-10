@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""The boot logo HakiOS's UEFI shows in place of the one mu_aloha_platforms ships: the site's mark (hakios-web: a
-lowercase h and a red dot, the core), white on black, because the phone's screen is black when the firmware draws it.
-Drawn here from the mark's shapes and smoothed, with nothing to install, so that anyone can change it and make it again.
+"""The Apple logo HakiOS's UEFI shows in place of the one mu_aloha_platforms ships: a white apple silhouette on black,
+because the phone's screen is black when the firmware draws it. Drawn here from smooth curves, with nothing to install,
+so that anyone can change it and make it again.
 
 The file is the one Frontpage.fdf.inc embeds as AndromedaPkg/Include/Resources/BootLogo.bmp: an 8-bit BMP with a
-256-colour palette, 236x236. The palette is 128 greys (black to white) and 128 reds (black to the mark's red), which is
-every colour the smoothing makes.
+256-shade grey palette, 236x236.
 
 usage: branding/banner.py OUTDIR [SIZE]        (uefi/apply.sh runs it into the tree; SIZE defaults to 236)
 """
+import math
 import os
 import struct
 import sys
 
-RED = (0xE8, 0x17, 0x0F)
 SS = 4                                          # drawn this many times larger, then averaged
 SIZE = 236                                      # what AndromedaPkg/Include/Resources/BootLogo.bmp is
 
@@ -23,40 +22,69 @@ class Canvas:
         self.size, self.n = size, size * SS
         self.px = [(0, 0, 0)] * (self.n * self.n)
 
-    def disc(self, cx, cy, r, c):
+    def fill(self, points, c):
+        """Fill a closed polygon using scanlines at the supersampled resolution."""
         n = self.n
-        for y in range(max(0, int(cy - r) - 1), min(n, int(cy + r) + 2)):
-            for x in range(max(0, int(cx - r) - 1), min(n, int(cx + r) + 2)):
-                if (x + .5 - cx) ** 2 + (y + .5 - cy) ** 2 <= r * r:
+        edges = list(zip(points, points[1:] + points[:1]))
+        min_y = max(0, int(min(y for _, y in points)))
+        max_y = min(n, int(max(y for _, y in points)) + 1)
+        for y in range(min_y, max_y):
+            scan_y = y + .5
+            intersections = []
+            for (x0, y0), (x1, y1) in edges:
+                if (y0 <= scan_y < y1) or (y1 <= scan_y < y0):
+                    intersections.append(x0 + (scan_y - y0) * (x1 - x0) / (y1 - y0))
+            intersections.sort()
+            for left, right in zip(intersections[::2], intersections[1::2]):
+                start = max(0, math.ceil(left - .5))
+                end = min(n, math.ceil(right - .5))
+                for x in range(start, end):
                     self.px[y * n + x] = c
 
-    def stroke(self, points, width, c):
-        for (x0, y0), (x1, y1) in zip(points, points[1:]):
-            steps = int(max(abs(x1 - x0), abs(y1 - y0)) / 1.5) + 1
-            for i in range(steps + 1):
-                t = i / steps
-                self.disc(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, width / 2, c)
-
-    def mark(self, cx, top, size):
-        """The site's mark (a 64-unit square: a lowercase h, and the red dot top right), SIZE pixels wide."""
+    def apple(self, cx, top, size):
+        """Draw a white Apple silhouette, fitted to a 64-unit square."""
         u = size * SS / 64
         ox, oy = cx * SS - 32 * u, top * SS
         p = lambda x, y: (ox + x * u, oy + y * u)
 
-        def cubic(p0, p1, p2, p3, k=48):
-            return [tuple((1 - t) ** 3 * a + 3 * (1 - t) ** 2 * t * b + 3 * (1 - t) * t * t * c + t ** 3 * d
-                          for a, b, c, d in zip(p0, p1, p2, p3)) for t in (i / k for i in range(k + 1))]
+        def path(segments, k=96):
+            points = []
+            for p0, p1, p2, p3 in segments:
+                for i in range(k):
+                    t = i / k
+                    q = 1 - t
+                    points.append(p(q ** 3 * p0[0] + 3 * q ** 2 * t * p1[0] +
+                                    3 * q * t ** 2 * p2[0] + t ** 3 * p3[0],
+                                    q ** 3 * p0[1] + 3 * q ** 2 * t * p1[1] +
+                                    3 * q * t ** 2 * p2[1] + t ** 3 * p3[1]))
+            return points
+
         white = (255, 255, 255)
-        self.stroke([p(22, 14), p(22, 50)], 7 * u, white)
-        arch = cubic(p(22, 33), p(22, 27), p(26.5, 23.5), p(31.5, 23.5)) + cubic(p(31.5, 23.5), p(36.5, 23.5), p(41, 27), p(41, 33))
-        self.stroke(arch + [p(41, 50)], 7 * u, white)
-        self.disc(*p(45.5, 16.5), 4.5 * u, RED)
+        body = [
+            ((32, 23), (35, 19), (41, 16), (47, 18)),
+            ((47, 18), (52, 20), (55, 23), (56, 27)),
+            # The inward curve and its return make the bite on the right edge.
+            ((56, 27), (51, 27), (47, 30), (47, 34)),
+            ((47, 34), (47, 38), (52, 40), (57, 42)),
+            ((57, 42), (55, 51), (50, 59), (43, 63)),
+            ((43, 63), (39, 65), (36, 61), (33, 61)),
+            ((33, 61), (30, 61), (27, 64), (23, 63)),
+            ((23, 63), (14, 61), (6, 49), (6, 37)),
+            ((6, 37), (6, 26), (11, 18), (20, 18)),
+            ((20, 18), (25, 17), (29, 20), (32, 23)),
+        ]
+        leaf = [
+            ((34, 18), (33.5, 11), (37.5, 5.5), (47, 4)),
+            ((47, 4), (47, 11.5), (43, 17), (36, 19.5)),
+            ((36, 19.5), (35, 19.5), (34.5, 19), (34, 18)),
+        ]
+        self.fill(path(body), white)
+        self.fill(path(leaf), white)
 
     def bmp(self, path):
-        """An 8-bit BMP (BITMAPINFOHEADER, the grey-and-red palette, rows bottom-up, each a multiple of 4 bytes)."""
+        """An 8-bit BMP (BITMAPINFOHEADER, greyscale palette, rows bottom-up, each a multiple of 4 bytes)."""
         size, n = self.size, self.n
-        palette = [(round(255 * i / 127),) * 3 for i in range(128)] + \
-                  [tuple(round(c * i / 127) for c in RED) for i in range(128)]
+        palette = [(i, i, i) for i in range(256)]
         index = bytearray(size * size)
         for y in range(size):
             for x in range(size):
@@ -66,11 +94,7 @@ class Canvas:
                     for dx in range(SS):
                         q = self.px[base + dx]
                         acc[0] += q[0]; acc[1] += q[1]; acc[2] += q[2]
-                r, g, b = (v / (SS * SS) for v in acc)
-                if r > g + 24:                  # a red the dot made, on black
-                    index[y * size + x] = 128 + min(127, round(r / RED[0] * 127))
-                else:
-                    index[y * size + x] = min(127, round((r + g + b) / 3 / 255 * 127))
+                index[y * size + x] = round((acc[0] + acc[1] + acc[2]) / (3 * SS * SS))
         stride = (size + 3) & ~3
         pal = b"".join(struct.pack("<BBBB", b, g, r, 0) for r, g, b in palette)
         rows = b"".join(bytes(index[y * size:(y + 1) * size]) + b"\0" * (stride - size) for y in reversed(range(size)))
@@ -88,7 +112,7 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     logo = Canvas(size)
-    logo.mark(size // 2, size // 5, size * 3 // 5)
+    logo.apple(size // 2, size // 5, size * 3 // 5)
     path = os.path.join(out, "BootLogo.bmp")
     logo.bmp(path)
     print("banner: %s (%dx%d)" % (path, size, size))

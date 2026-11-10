@@ -1,5 +1,31 @@
+diff --git a/MsCorePkg/Library/PlatformBootManagerLib/BdsPlatform.c b/MsCorePkg/Library/PlatformBootManagerLib/BdsPlatform.c
+index e4735d5..7aeabbf 100644
+--- a/MsCorePkg/Library/PlatformBootManagerLib/BdsPlatform.c
++++ b/MsCorePkg/Library/PlatformBootManagerLib/BdsPlatform.c
+@@ -354,6 +354,12 @@ PlatformBootManagerAfterConsole (
+ 
+   //  EFI_INPUT_KEY                 Key;
+ 
++  //
++  // HakiOS: the console is up from here on; said on the screen so that a run which
++  // resets before the payload is started can be told from one that does not.
++  //
++  Print (L"HakiOS: after console\r\n");
++
+   if (PcdGetBool (PcdTestKeyUsed) == TRUE) {
+     Print (L"WARNING: Capsule Test Key is used.\n");
+     DEBUG ((DEBUG_INFO, "WARNING: Capsule Test Key is used.\n"));
+@@ -361,6 +367,8 @@ PlatformBootManagerAfterConsole (
+ 
+   mPlatformConnectSequence = DeviceBootManagerAfterConsole ();
+ 
++  Print (L"HakiOS: devices connected\r\n");
++
+   //
+   // Boot Mode obtained in BeforeConsole action.
+   //
 diff --git a/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c b/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
-index 170e2e2..1b3e08c 100644
+index 170e2e2..12af384 100644
 --- a/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
 +++ b/MsCorePkg/Library/PlatformBootManagerLib/MsPlatform.c
 @@ -22,6 +22,8 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
@@ -11,7 +37,7 @@ index 170e2e2..1b3e08c 100644
  static BOOLEAN  mSecViolation = FALSE;
  
  /**
-@@ -131,6 +133,26 @@ PlatformBootManagerPriorityBoot (
+@@ -131,6 +133,28 @@ PlatformBootManagerPriorityBoot (
    EFI_BOOT_MANAGER_LOAD_OPTION  BootManagerMenu;
    EFI_STATUS                    Status = EFI_SUCCESS;
  
@@ -25,6 +51,8 @@ index 170e2e2..1b3e08c 100644
 +    XNU_PAYLOAD_HEADER  *Header = (XNU_PAYLOAD_HEADER *)(UINTN)XNU_PAYLOAD_BASE;
 +
 +    if (Header->Magic == XNU_PAYLOAD_MAGIC) {
++      Print (L"HakiOS: payload at 0x%08lx, magic %08x, size %x: starting the loader\r\n",
++             XNU_PAYLOAD_BASE, Header->Magic, Header->Size);
 +      // does not return unless the payload carries no "loader.efi" entry
 +      XnuLoaderStartPayload ();
 +      Print (L"HakiOS: the payload at 0x%08lx has no loader to start; BDS carries on\r\n", XNU_PAYLOAD_BASE);
@@ -38,7 +66,7 @@ index 170e2e2..1b3e08c 100644
    Status = DeviceBootManagerPriorityBoot (&BootOption);
  
    //
-@@ -187,5 +209,10 @@ PlatformBootManagerUnableToBoot (
+@@ -187,5 +211,10 @@ PlatformBootManagerUnableToBoot (
    VOID
    )
  {

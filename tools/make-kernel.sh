@@ -43,6 +43,8 @@ fi
 # what was edited in drivers/ goes into the kernel tree first (only what is newer than the tree's copy), and then the
 # drivers the .config builds (CONFIG_HAKIOS_*; every driver when there is no .config): docs/drivers-config.md
 if [ -d xnu-src/xnu-8796.121.2 ]; then
+	# xnu/files is the tracked source for HakiOS overlays; keep an existing build tree in step too.
+	cp -a xnu/files/. xnu-src/xnu-8796.121.2/
 	xnu/sync-drivers.sh xnu-src/xnu-8796.121.2 || exit 1
 	python3 tools/hakios-config.py kernel --tree xnu-src/xnu-8796.121.2 || exit 1
 fi

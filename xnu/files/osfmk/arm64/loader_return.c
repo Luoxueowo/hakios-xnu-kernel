@@ -37,6 +37,9 @@
 #define LOADER_LOG_HEAD (256 * 1024)
 #define LOADER_LOG_RING (1024 * 1024)
 
+struct msgbuf;
+extern struct msgbuf *msgbufp;
+
 #if defined(GENERIC_GIC_V3_IRQ)
 extern void gic_v3_irq_quiesce(void);
 extern void gic_v3_irq_cpu_shutdown(void);
@@ -200,6 +203,8 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the live message-buffer pointer follows */
+	const void *message_buffer;     /* address of msgbufp, for a loader to snapshot while we run */
 };
 
 /*
@@ -215,6 +220,7 @@ struct loader_live loader_live = {
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+	.magic3 = 0x334556494c554e58ULL, .message_buffer = &msgbufp,
 };
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
@@ -325,7 +331,6 @@ struct msgbuf {
 	int   msg_bufr;         /* read pointer */
 	char *msg_bufc;         /* buffer */
 };
-extern struct msgbuf *msgbufp;
 
 static void
 loader_log_puts(const char *s)

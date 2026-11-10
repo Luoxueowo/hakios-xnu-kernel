@@ -24,7 +24,7 @@ Start with [Getting started](docs/getting-started/index.md), [On the phone](docs
 | [hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) | **common**: the kernel port, every common driver, the loader, user space, the tools, this documentation, and `devices/qemu` |
 | [`hakios-metal/`](hakios-metal) | Metal's command model on the Adreno, through the kernel's GPU driver |
 | [hakios-sm7325](https://github.com/oosexgang/hakios-sm7325) | POCO X5 Pro 5G: its defconfig, status, UEFI platform, firmware script, and its SoC's layer (Qualcomm SC7280 family) |
-| [devices/polaris/](devices/polaris/README.md) | Xiaomi MIX 2S (Polaris, SDM845): device configuration and XNU loader platform profile; phone boot not yet verified |
+| [devices/polaris/](devices/polaris/README.md) | Xiaomi MIX 2S (Polaris, SDM845): device configuration and XNU loader platform profile; XNU boot verified on the phone |
 | [hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) | Infinix Hot 20 (MediaTek Helio G85): an experimental port with its own loader. Not in this repository's manifest |
 | [uefi/](uefi/README.md) | the firmware that starts the loader: mu_aloha_platforms with HakiOS's boot path, logo and name, and HakiOS's U-Boot |
 | [hackios-web](https://github.com/oosexgang/hackios-web) | the website |

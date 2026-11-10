@@ -74,6 +74,7 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* a whole logical unit, not a partition */
+#define BLOCK_PART_RAW_VIEW 2u                         /* a partition entry read through its raw unit */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
 #define BLOCK_OP_WRITE_FAST 2u                         /* written only: the data volume's (the loader, BLOCK_OP_WRITE_FAST) */
@@ -110,7 +111,7 @@ struct loader_block_part {
 	uint64_t start_lba;            /* where it begins on its unit, in the unit's blocks */
 	uint16_t unit;                 /* the unit it is on, its number among the units; 0xffff: not known */
 	uint8_t lun;                   /* a unit's logical unit number as its device path says; 0xff: it does not */
-	uint8_t flags;                 /* BLOCK_PART_UNIT */
+	uint8_t flags;                 /* BLOCK_PART_UNIT, BLOCK_PART_RAW_VIEW */
 	uint32_t reserved;
 };
 

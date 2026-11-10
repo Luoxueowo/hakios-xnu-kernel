@@ -298,12 +298,78 @@ find_log_partition(void)
 }
 
 /*
+ * Early trace: a line a stage, written straight to the blocks of the logdump partition by LBA.
+ * find_log_partition () needs the firmware to have published the partitions, which the vendor's
+ * DiskIoDxe does not do; this does not, so a run that never reaches the end (a reset, a fault
+ * before the console is up) still says how far it got. Block 0 is the UEFI side's, block 1 this
+ * one's; the LBA is logdump's start on the phone's GPT (4096-byte blocks).
+ */
+#define TRACE_BYTE  (49152ULL * 4096)   /* where logdump starts on the flash */
+static efi_block_io *trace_bio;
+static char trace_text[4096] __attribute__((aligned(0x1000)));
+static uint64_t trace_len;
+static uint64_t trace_lba;              /* TRACE_BYTE in the unit's own blocks */
+struct kernel_live;
+static const struct kernel_live *running_live;
+static uint64_t running_slide;
+static void compose_live_log(const struct kernel_live *live, uint64_t slide);
+static void write_staged_logs(const char *console_klog, uint64_t console_klog_len);
+static void write_live_logs(const struct kernel_live *live, uint64_t slide);
+static void clear_raw_log_area(void);
+
+static void
+trace_start(void)
+{
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count;
+
+	for (uint64_t i = 0; i < sizeof(trace_text); i++) {
+		trace_text[i] = 0;
+	}
+	trace_len = 0;
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
+		return;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_block_io *bio;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || bio->media == NULL) {
+			continue;
+		}
+		/* the whole unit, not a partition (a partition is far smaller than the 128 GB of the flash) */
+		if (bio->media->block_size == 0 || TRACE_BYTE % bio->media->block_size != 0 ||
+		    (bio->media->last_block + 1) * bio->media->block_size < 64ULL << 30) {
+			continue;
+		}
+		trace_bio = bio;
+		trace_lba = TRACE_BYTE / bio->media->block_size + 1;   /* block 0 is the UEFI side's */
+		break;
+	}
+	BS->free_pool(handles);
+}
+
+static void
+trace(const char *s)
+{
+	if (trace_bio == NULL) {
+		return;
+	}
+	while (*s && trace_len < sizeof(trace_text) - 2) {
+		trace_text[trace_len++] = *s++;
+	}
+	trace_text[trace_len++] = '\n';
+	trace_bio->write_blocks(trace_bio, trace_bio->media->media_id, trace_lba, 4096, trace_text);
+}
+
+/*
  * The "staged" buffer holds the loader log followed by the kernel log of the
  * last run. It is what gets written to the log partition and what the host
  * fetches over USB (fastboot get_staged).
  */
 /* aligned for any firmware's block I/O: U-Boot's wants a buffer aligned to the block size (media->io_align) */
 static char out_buf[2 * 1024 * 1024] __attribute__((aligned(0x2000)));
+static uint64_t raw_log_highwater;
 /* the storage's reads for the kernel land here (block_poll), and nothing else may be put in it */
 #define BLOCK_BUFFER_SIZE  (4u << 20)
 static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
@@ -341,21 +407,56 @@ compose_logs(const char *klog, uint64_t klog_len)
 
 static int hc_list_is_uefis(void);
 static int hc_log_skips;                /* logs not written this run (said twice at most) */
+static int run_active;                  /* the kernel is on another core; do not write raw logdump while it runs */
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
 
 static void
-write_logs(const char *klog, uint64_t klog_len)
+write_staged_logs(const char *console_klog, uint64_t console_klog_len)
 {
 	efi_block_io *bio = find_log_partition();
 
-	compose_logs(klog, klog_len);
 	if (bio == NULL) {
+		/*
+		 * Some phone firmware (Polaris) exposes the parent UFS BlockIo before it publishes partition
+		 * handles. Keep the two early trace blocks intact, then place the normal log at block 2 of
+		 * logdump using that same raw device. Write only while the UEFI transfer list owns the UFS
+		 * controller (the same guard as the partition-handle path); QEMU has no such large device.
+		 */
+		if (trace_bio != NULL && trace_bio->media != NULL && trace_bio->media->block_size == 4096 &&
+		    hc_list_is_uefis()) {
+			uint64_t raw_bs = trace_bio->media->block_size;
+			uint64_t raw_lba = trace_lba + 1;
+			uint64_t raw_len = (staged_len + 1 + raw_bs - 1) / raw_bs * raw_bs;
+			if (raw_log_highwater > raw_len) {
+				raw_len = (raw_log_highwater + raw_bs - 1) / raw_bs * raw_bs;
+			}
+
+			if (raw_len <= sizeof(log_verify) && raw_len <= (64ULL << 20) - 8192 &&
+			    raw_lba + raw_len / raw_bs <= trace_bio->media->last_block + 1) {
+				efi_status raw_ws = trace_bio->write_blocks(trace_bio, trace_bio->media->media_id,
+				    raw_lba, raw_len, out_buf);
+
+				if (!EFI_ERROR(raw_ws)) {
+					raw_log_highwater = raw_len;
+					trace_bio->flush_blocks(trace_bio);
+					efi_status raw_rs = trace_bio->read_blocks(trace_bio, trace_bio->media->media_id,
+					    raw_lba, raw_len, log_verify);
+					flush_dcache((uint64_t)(uintptr_t)log_verify,
+					    (uint64_t)(uintptr_t)log_verify + raw_len);
+					if (!EFI_ERROR(raw_rs) && memcmp(log_verify, out_buf, raw_len) == 0) {
+						if (!run_active) {
+							trace("raw logdump fallback wrote and verified full log");
+						}
+					}
+				}
+			}
+		}
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
-		if (klog != NULL) {
+		if (console_klog != NULL) {
 			print("\n== KERNEL LOG ==\n");
-			for (uint64_t i = 0; i < klog_len; i++) {
-				put_char(klog[i]);
+			for (uint64_t i = 0; i < console_klog_len; i++) {
+				put_char(console_klog[i]);
 			}
 			print("\n== END OF LOG ==\n");
 		}
@@ -372,7 +473,6 @@ write_logs(const char *klog, uint64_t klog_len)
 			hc_print_state("log not written");
 			print("log: NOT WRITTEN to logdump: UEFI's transfer list is not the one in the controller\n");
 		}
-		compose_logs(klog, klog_len);
 		return;
 	}
 	ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf);
@@ -392,7 +492,57 @@ write_logs(const char *klog, uint64_t klog_len)
 	}
 	print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
 	    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
-	compose_logs(klog, klog_len);
+}
+
+static void
+write_logs(const char *klog, uint64_t klog_len)
+{
+	if (run_active && running_live != NULL) {
+		compose_live_log(running_live, running_slide);
+	} else {
+		compose_logs(klog, klog_len);
+	}
+	write_staged_logs(klog, klog_len);
+}
+
+static void
+write_live_logs(const struct kernel_live *live, uint64_t slide)
+{
+	compose_live_log(live, slide);
+	write_staged_logs(NULL, 0);
+}
+
+static void
+clear_raw_log_area(void)
+{
+	const uint64_t bytes = sizeof(out_buf);
+	uint64_t lba = trace_lba + 1;
+	efi_status ws, rs;
+
+	if (trace_bio == NULL || trace_bio->media == NULL || trace_bio->media->block_size != 4096 ||
+	    !hc_list_is_uefis() || bytes > (64ULL << 20) - 8192 ||
+	    lba + bytes / trace_bio->media->block_size > trace_bio->media->last_block + 1) {
+		raw_log_highwater = sizeof(out_buf);
+		return;
+	}
+	memset(out_buf, 0, sizeof(out_buf));
+	clean_dcache((uint64_t)(uintptr_t)out_buf, (uint64_t)(uintptr_t)out_buf + bytes);
+	ws = trace_bio->write_blocks(trace_bio, trace_bio->media->media_id, lba, bytes, out_buf);
+	if (EFI_ERROR(ws)) {
+		raw_log_highwater = sizeof(out_buf);
+		trace("logdump clear failed");
+		return;
+	}
+	trace_bio->flush_blocks(trace_bio);
+	rs = trace_bio->read_blocks(trace_bio, trace_bio->media->media_id, lba, 4096, log_verify);
+	flush_dcache((uint64_t)(uintptr_t)log_verify, (uint64_t)(uintptr_t)log_verify + 4096);
+	if (!EFI_ERROR(rs) && memcmp(log_verify, out_buf, 4096) == 0) {
+		raw_log_highwater = 0;
+		trace("logdump cleared");
+	} else {
+		raw_log_highwater = sizeof(out_buf);
+		trace("logdump clear readback failed");
+	}
 }
 
 static void
@@ -554,6 +704,7 @@ struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint32_t vtimer_intid;           /* EL1 virtual timer PPI, as a GIC INTID */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
@@ -568,6 +719,7 @@ struct platform {
 static const struct platform platform_qemu_virt = {
 	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
 	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .uart = 0x09000000, .psci_hvc = 1,
+	.vtimer_intid = 27,
 	.cores = 8, .core_shift = 0,
 	/*
 	 * QEMU's emulated cores stop each other all the time (every flush of a page from all the
@@ -581,6 +733,7 @@ static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.vtimer_intid = 27,
 	.cores = 8, .core_shift = 8,
 	/*
 	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
@@ -596,6 +749,7 @@ static const struct platform platform_polaris = {
 	/* The first MMIO region in PlatformMemoryMapLib; XNU requires this anchor to be non-zero. */
 	.name = "sdm845", .io_base = 0x00100000, .io_size = 0x3FF00000,
 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .psci_hvc = 0, .log_other_cpu = 1,
+	.vtimer_intid = 19,
 	/* android-polaris.dtb: PSCI uses SMC; CPU MPIDRs are 0x000..0x700 (Aff1, shift 8). */
 	.cores = 8, .core_shift = 8,
 	/* SDM845 CPUs 0-3 are the slower Silver cluster; CPUs 4-7 are Gold. */
@@ -917,6 +1071,13 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": a live pointer to XNU's message buffer follows */
+	uint64_t message_buffer;        /* address of msgbufp, another kernel virtual address */
+};
+
+struct kernel_message_buffer {
+	int32_t magic, size, bufx, bufr;
+	uint64_t buf;
 };
 
 /*
@@ -984,6 +1145,7 @@ static uint64_t recording_len;
 static const char *sound_data;
 static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
+#define KERNEL_LIVE_MAGIC3      0x334556494c554e58ULL
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
@@ -994,35 +1156,12 @@ static uint64_t sound_len;
 static void wdt_pet(void);
 static int wdt_armed;
 
-/*
- * While a kernel runs on another core and this one watches it: where it shows its signs of life,
- * for the commands that the host sends meanwhile (usb_poll_command).
- */
-static const struct kernel_live *running_live;
-/*
- * Set for the whole of run_on_other_cpu(), whether the kernel has a live block or not.
- * running_live is NULL for a kernel without one, so it cannot say that a kernel is running.
- */
-static int run_active;
-static uint64_t running_slide;
 static void usb_poll_command(void);
 
 static uint64_t
 seconds_since(uint64_t then)
 {
 	return (READ_SYSREG(CNTVCT_EL0) - then) / READ_SYSREG(CNTFRQ_EL0);
-}
-
-/* Reverse a stretch of memory in place. */
-static void
-reverse(char *p, uint64_t n)
-{
-	for (uint64_t i = 0; i < n / 2; i++) {
-		char c = p[i];
-
-		p[i] = p[n - 1 - i];
-		p[n - 1 - i] = c;
-	}
 }
 
 /*
@@ -1032,21 +1171,17 @@ reverse(char *p, uint64_t n)
 static void
 log_of_hung_kernel(const struct kernel_live *live, uint64_t slide)
 {
-	char *log = (char *)(live->log + slide);
-	uint32_t len, ring_at;
+	uint32_t len;
 
 	loader_ctx[CTX_LOG_PA] = loader_ctx[CTX_LOG_LEN] = 0;
+	flush_dcache(live->log_len + slide, live->log_len + slide + sizeof(uint32_t));
 	len = *(volatile uint32_t *)(live->log_len + slide);
-	ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
-	if (*(volatile uint8_t *)(live->log_wrapped + slide) && ring_at < live->log_ring) {
-		/* rotate the ring left by ring_at: three reversals */
-		reverse(log + live->log_head, ring_at);
-		reverse(log + live->log_head + ring_at, live->log_ring - ring_at);
-		reverse(log + live->log_head, live->log_ring);
+	flush_dcache(live->log_wrapped + slide, live->log_wrapped + slide + sizeof(uint8_t));
+	if (*(volatile uint8_t *)(live->log_wrapped + slide)) {
 		len = (uint32_t)(live->log_head + live->log_ring);
 	}
 	if (len <= live->log_head + live->log_ring) {
-		loader_ctx[CTX_LOG_PA] = (uint64_t)(uintptr_t)log;
+		loader_ctx[CTX_LOG_PA] = live->log + slide;
 		loader_ctx[CTX_LOG_LEN] = len;
 	}
 }
@@ -1060,7 +1195,14 @@ static void
 compose_live_log(const struct kernel_live *live, uint64_t slide)
 {
 	static const char sep[] = "\n== KERNEL LOG (the kernel is still running) ==\n";
+	static const char msgbuf_sep[] = "\n== XNU MESSAGE BUFFER (live) ==\n";
 	const char *log = (const char *)(live->log + slide);
+	uint64_t log_len_pa = live->log_len + slide;
+	uint64_t ring_at_pa = live->log_ring_at + slide;
+	uint64_t wrapped_pa = live->log_wrapped + slide;
+	flush_dcache(log_len_pa, log_len_pa + sizeof(uint32_t));
+	flush_dcache(ring_at_pa, ring_at_pa + sizeof(uint32_t));
+	flush_dcache(wrapped_pa, wrapped_pa + sizeof(uint8_t));
 	uint32_t len = *(volatile uint32_t *)(live->log_len + slide);
 	uint32_t ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
 	int wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
@@ -1083,6 +1225,44 @@ compose_live_log(const struct kernel_live *live, uint64_t slide)
 		PUT(log, live->log_head);
 		PUT(log + live->log_head + ring_at, live->log_ring - ring_at);
 		PUT(log + live->log_head, ring_at);
+	}
+	if (live->magic3 == KERNEL_LIVE_MAGIC3 && live->message_buffer != 0) {
+		uint64_t msgbufp_pa = live->message_buffer + slide;
+		uint64_t msgbuf_va = 0;
+
+		flush_dcache(msgbufp_pa, msgbufp_pa + sizeof(uint64_t));
+		msgbuf_va = *(volatile uint64_t *)(uintptr_t)msgbufp_pa;
+		/* Kernel VA -> PA uses this unsigned slide modulo 2^64; wrap is expected. */
+		if (msgbuf_va != 0) {
+			uint64_t msgbuf_pa = msgbuf_va + slide;
+			struct kernel_message_buffer *mb = (struct kernel_message_buffer *)(uintptr_t)msgbuf_pa;
+
+			flush_dcache(msgbuf_pa, msgbuf_pa + sizeof(*mb));
+			int32_t size = mb->size, bufx = mb->bufx;
+			uint64_t buf_va = mb->buf;
+
+			if (size > 0 && size <= (1 << 20) && bufx >= 0 && bufx <= size && buf_va != 0) {
+				uint64_t buf_pa = buf_va + slide;
+				volatile const char *msgbuf = (volatile const char *)(uintptr_t)buf_pa;
+				uint32_t from = (uint32_t)bufx;
+
+				flush_dcache(buf_pa, buf_pa + (uint32_t)size);
+				PUT(msgbuf_sep, sizeof(msgbuf_sep) - 1);
+				for (int pass = 0; pass < 2 && n < room; pass++) {
+					uint32_t first = pass == 0 ? from : 0;
+					uint32_t last = pass == 0 ? (uint32_t)size : from;
+
+					for (uint32_t i = first; i < last && n < room; i++) {
+						char c = msgbuf[i];
+
+						if (c != 0) {
+						out_buf[n++] = c == '\r' ? '\n' :
+						    (c < 0x20 && c != '\n' && c != '\t') ? '.' : c;
+						}
+					}
+				}
+			}
+		}
 	}
 #undef PUT
 	staged_len = n;
@@ -1529,6 +1709,7 @@ ufs_survey(void)
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
+#define BLOCK_PART_RAW_VIEW 2u                         /* partition blocks are viewed through the whole unit */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
 /*
@@ -1569,7 +1750,7 @@ struct loader_block_part {
 	uint64_t start_lba;            /* where it begins on its unit, in the unit's blocks (0 for a unit) */
 	uint16_t unit;                 /* the unit it is on, its number among the units; 0xffff: not known */
 	uint8_t lun;                   /* a unit's logical unit number as its device path says; 0xff: it does not */
-	uint8_t flags;                 /* BLOCK_PART_UNIT */
+	uint8_t flags;                 /* BLOCK_PART_UNIT, BLOCK_PART_RAW_VIEW */
 	uint32_t reserved;
 };
 
@@ -1927,12 +2108,146 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 }
 
 static void
+block_gpt_name(const uint8_t *entry, char *name, unsigned size)
+{
+	unsigned i = 0;
+
+	for (; i + 1 < size && i < 36; i++) {
+		uint16_t c = (uint16_t)entry[56 + i * 2] | (uint16_t)entry[57 + i * 2] << 8;
+
+		if (c == 0) {
+			break;
+		}
+		name[i] = c < 0x80 && c >= 0x20 ? (char)c : '?';
+	}
+	name[i] = 0;
+}
+
+static int
+block_is_gpt_darwin(const efi_guid *type_guid, const efi_block_io *bio, const struct loader_block_part *bp)
+{
+	static const efi_guid type = BLOCK_DARWIN_TYPE;
+	const char *why = NULL;
+
+	if (!str_eq(bp->name, "darwin")) {
+		return 0;
+	}
+	if (memcmp(type_guid, &type, sizeof(type)) != 0) {
+		why = "its type GUID is not the APFS container type";
+	} else if (bp->unit != 0) {
+		why = "it is not on the first logical unit";
+	} else if (bp->block_size != 4096 || bp->blocks < BLOCK_DARWIN_MIN) {
+		why = "it is not at least 20 GiB in blocks of 4096";
+	} else if (bio->media->read_only) {
+		why = "the raw unit is read only";
+	}
+	if (why != NULL) {
+		print("ufs: darwin: no write will be served: %s\n", why);
+		return 0;
+	}
+	print("ufs: darwin: GPT-verified raw-unit view; blocks from %d on may be written this run\n", BLOCK_WRITE_FIRST);
+	return 1;
+}
+
+/* UEFI sometimes publishes the whole UFS LUNs but no EFI_PARTITION_INFO handles. */
+static void
+block_synthesize_gpt(efi_block_io *bio, uint64_t unit, uint8_t lun, uint64_t reserve)
+{
+	static uint8_t header[4096] __attribute__((aligned(4096)));
+	uint32_t header_size, header_crc, entries_crc, count, entry_size;
+	uint64_t entries_lba, entries_bytes, read_bytes, read_blocks;
+
+	if (bio->media->block_size != sizeof(header) || bio->media->last_block < 1 ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, sizeof(header), ufs_buffer))) {
+		print("ufs: unit %d: no readable 4096-byte GPT header for the fallback partition table\n", unit);
+		return;
+	}
+	if (memcmp(ufs_buffer, "EFI PART", 8) != 0) {
+		return;
+	}
+	memcpy(header, ufs_buffer, sizeof(header));
+	header_size = *(uint32_t *)(header + 12);
+	header_crc = *(uint32_t *)(header + 16);
+	entries_lba = *(uint64_t *)(header + 72);
+	count = *(uint32_t *)(header + 80);
+	entry_size = *(uint32_t *)(header + 84);
+	entries_crc = *(uint32_t *)(header + 88);
+	if (header_size < 92 || header_size > sizeof(header)) {
+		print("ufs: unit %d: GPT header size %d is invalid\n", unit, (uint64_t)header_size);
+		return;
+	}
+	*(uint32_t *)(header + 16) = 0;
+	if (ufs_crc32(header, header_size) != header_crc || count == 0 || entry_size < 128 ||
+	    entry_size > 4096 || count > sizeof(ufs_buffer) / entry_size) {
+		print("ufs: unit %d: GPT header CRC or entry table dimensions are invalid\n", unit);
+		return;
+	}
+	entries_bytes = (uint64_t)count * entry_size;
+	read_blocks = (entries_bytes + bio->media->block_size - 1) / bio->media->block_size;
+	read_bytes = read_blocks * bio->media->block_size;
+	if (read_bytes > sizeof(ufs_buffer) || entries_lba > bio->media->last_block ||
+	    read_blocks > bio->media->last_block + 1 - entries_lba ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, entries_lba, read_bytes, ufs_buffer)) ||
+	    ufs_crc32(ufs_buffer, entries_bytes) != entries_crc) {
+		print("ufs: unit %d: GPT partition table did not pass its bounds and CRC checks\n", unit);
+		return;
+	}
+	int added = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const uint8_t *entry = ufs_buffer + (uint64_t)i * entry_size;
+		efi_guid type_guid;
+		uint64_t start_lba, end_lba;
+		int nonzero = 0;
+
+		for (unsigned k = 0; k < sizeof(type_guid); k++) {
+			nonzero |= entry[k];
+		}
+		if (!nonzero) {
+			continue;
+		}
+		start_lba = *(const uint64_t *)(entry + 32);
+		end_lba = *(const uint64_t *)(entry + 40);
+		if (start_lba > end_lba || end_lba > bio->media->last_block ||
+		    block_shared.parts + reserve >= BLOCK_MAX_PARTS) {
+			print("ufs: unit %d: GPT entry %d is invalid or the shared table is full\n", unit, (uint64_t)i);
+			continue;
+		}
+		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
+		memset(bp, 0, sizeof(*bp));
+		block_gpt_name(entry, bp->name, sizeof(bp->name));
+		if (bp->name[0] == 0) {
+			bp->name[0] = 'p';
+			bp->name[1] = 'a';
+			bp->name[2] = 'r';
+			bp->name[3] = 't';
+			bp->name[4] = (char)('0' + i / 10 % 10);
+			bp->name[5] = (char)('0' + i % 10);
+			bp->name[6] = 0;
+		}
+		bp->block_size = bio->media->block_size;
+		bp->blocks = end_lba - start_lba + 1;
+		bp->start_lba = start_lba;
+		bp->unit = (uint16_t)unit;
+		bp->lun = lun;
+		bp->flags = BLOCK_PART_RAW_VIEW;
+		memcpy(&type_guid, entry, sizeof(type_guid));
+		if (block_write_requested && block_is_gpt_darwin(&type_guid, bio, bp)) {
+			block_write_part = (int)block_shared.parts;
+		}
+		block_bios[block_shared.parts++] = bio;
+		added++;
+	}
+	print("ufs: unit %d: built %d GPT partition views from its raw LUN\n", unit, (uint64_t)added);
+}
+
+static void
 block_start(void)
 {
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
 	efi_handle *handles;
 	uint64_t count;
+	efi_status part_status;
 
 	static const efi_guid dp_guid = EFI_DEVICE_PATH_GUID;
 	static struct {
@@ -1965,49 +2280,56 @@ block_start(void)
 		/* (the handle array is pool memory this function owns; units[] holds the protocols, not the array) */
 		BS->free_pool(handles);
 	}
-	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
-		print("ufs: no partition information: the block service is off\n");
-		return;
-	}
-	for (uint64_t i = 0; i < count && block_shared.parts + nunits < BLOCK_MAX_PARTS; i++) {
-		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
-		efi_partition_info *info;
-		efi_block_io *bio;
-		efi_device_path *dp;
-
-		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
-		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) ||
-		    bio->media->block_size == 0 || bio->media->block_size > BLOCK_BUFFER_SIZE) {
-			continue;
+	part_status = BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles);
+	if (EFI_ERROR(part_status)) {
+		print("ufs: no EFI partition information; validating GPT on the raw units instead\n");
+		for (uint64_t u = 0; u < nunits; u++) {
+			block_synthesize_gpt(units[u].bio, u, units[u].lun, nunits);
 		}
-		ufs_name(info, bp->name, sizeof(bp->name));
-		bp->block_size = bio->media->block_size;
-		bp->blocks = bio->media->last_block + 1;
-		bp->start_lba = info->start_lba;
-		bp->unit = 0xffff;
-		bp->lun = 0xff;
-		/* its unit: the one whose device path its own begins with */
-		if (!EFI_ERROR(BS->handle_protocol(handles[i], &dp_guid, (void **)&dp))) {
-			uint64_t bytes = device_path_bytes(dp);
+		if (block_probe_requested) {
+			print("ufs: ufs_probe=1 needs EFI partition handles; the raw GPT fallback cannot probe BlockIo2\n");
+		}
+	} else {
+		for (uint64_t i = 0; i < count && block_shared.parts + nunits < BLOCK_MAX_PARTS; i++) {
+			struct loader_block_part *bp = &block_shared.part[block_shared.parts];
+			efi_partition_info *info;
+			efi_block_io *bio;
+			efi_device_path *dp;
 
-			for (uint64_t u = 0; u < nunits; u++) {
-				if (units[u].path_bytes < bytes &&
-				    memcmp(units[u].path, dp, units[u].path_bytes) == 0) {
-					bp->unit = (uint16_t)u;
-					bp->lun = units[u].lun;
+			if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
+			    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) ||
+			    bio->media->block_size == 0 || bio->media->block_size > BLOCK_BUFFER_SIZE) {
+				continue;
+			}
+			ufs_name(info, bp->name, sizeof(bp->name));
+			bp->block_size = bio->media->block_size;
+			bp->blocks = bio->media->last_block + 1;
+			bp->start_lba = info->start_lba;
+			bp->unit = 0xffff;
+			bp->lun = 0xff;
+			/* its unit: the one whose device path its own begins with */
+			if (!EFI_ERROR(BS->handle_protocol(handles[i], &dp_guid, (void **)&dp))) {
+				uint64_t bytes = device_path_bytes(dp);
+
+				for (uint64_t u = 0; u < nunits; u++) {
+					if (units[u].path_bytes < bytes &&
+					    memcmp(units[u].path, dp, units[u].path_bytes) == 0) {
+						bp->unit = (uint16_t)u;
+						bp->lun = units[u].lun;
+					}
 				}
 			}
+			if (block_write_requested && block_is_darwin(info, bio, bp)) {
+				block_write_part = (int)block_shared.parts;
+			}
+			block_bios[block_shared.parts++] = bio;
+			if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
+			    bp->name[3] == 'w' && bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == 0) {
+				block_io2_probe(handles[i], bio);
+			}
 		}
-		if (block_write_requested && block_is_darwin(info, bio, bp)) {
-			block_write_part = (int)block_shared.parts;
-		}
-		block_bios[block_shared.parts++] = bio;
-		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
-		    bp->name[3] == 'w' && bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == 0) {
-			block_io2_probe(handles[i], bio);
-		}
+		BS->free_pool(handles);
 	}
-	BS->free_pool(handles);
 	for (uint64_t u = 0; u < nunits; u++) {
 		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
 		char *n = bp->name;
@@ -2148,7 +2470,7 @@ block_poll(void)
 {
 	uint64_t ask = (uint64_t)(uintptr_t)&block_shared.ask;
 	uint32_t request, part, op;
-	uint64_t lba, count, bytes, started;
+	uint64_t lba, io_lba, count, bytes, started;
 	efi_status s = 0x8000000000000002ULL;     /* EFI_INVALID_PARAMETER: a request out of bounds */
 
 	/* the kernel writes the request into memory past this core's cache: look at memory */
@@ -2161,14 +2483,29 @@ block_poll(void)
 	lba = block_shared.ask.lba;
 	count = block_shared.ask.count;
 	op = block_shared.ask.op;
+	io_lba = lba;
 	started = READ_SYSREG(CNTVCT_EL0);
 	bytes = 0;
 	if (part < block_shared.parts && count != 0 && count <= BLOCK_BUFFER_SIZE / block_shared.part[part].block_size &&
 	    lba < block_shared.part[part].blocks && count <= block_shared.part[part].blocks - lba) {
 		efi_block_io *bio = block_bios[part];
+		int valid_io_lba = 1;
 
 		bytes = count * block_shared.part[part].block_size;
-		if (!hc_list_is_uefis()) {
+		if (block_shared.part[part].flags & BLOCK_PART_RAW_VIEW) {
+			if (block_shared.part[part].start_lba > UINT64_MAX - lba) {
+				valid_io_lba = 0;
+			} else {
+				io_lba += block_shared.part[part].start_lba;
+				if (io_lba > bio->media->last_block || count > bio->media->last_block + 1 - io_lba) {
+					valid_io_lba = 0;
+				}
+			}
+		}
+		if (!valid_io_lba) {
+			s = 0x8000000000000002ULL;  /* EFI_INVALID_PARAMETER */
+			bytes = 0;
+		} else if (!hc_list_is_uefis()) {
 			/* the kernel's own list is in: UEFI's driver must not ring now (the kernel should not ask) */
 			if (hc_refused_reads++ < 4) {
 				print("ufs: a read asked for while the kernel's own transfer list is in the controller: refused\n");
@@ -2190,7 +2527,7 @@ block_poll(void)
 			} else if (op == BLOCK_OP_WRITE_FAST) {
 				flush_dcache((uint64_t)(uintptr_t)block_buffer,
 				    (uint64_t)(uintptr_t)block_buffer + bytes);
-				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				s = bio->write_blocks(bio, bio->media->media_id, io_lba, bytes, block_buffer);
 				if (!EFI_ERROR(s)) {
 					block_writes++;
 					block_write_bytes += bytes;
@@ -2207,10 +2544,10 @@ block_poll(void)
 				flush_dcache((uint64_t)(uintptr_t)block_buffer,
 				    (uint64_t)(uintptr_t)block_buffer + bytes);
 				want = ufs_crc32(block_buffer, bytes);
-				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				s = bio->write_blocks(bio, bio->media->media_id, io_lba, bytes, block_buffer);
 				if (!EFI_ERROR(s)) {
 					bio->flush_blocks(bio);
-					s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+					s = bio->read_blocks(bio, bio->media->media_id, io_lba, bytes, block_buffer);
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
 					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
@@ -2225,7 +2562,7 @@ block_poll(void)
 				}
 			}
 		} else if (op == BLOCK_OP_READ) {
-			s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+			s = bio->read_blocks(bio, bio->media->media_id, io_lba, bytes, block_buffer);
 			/* what the controller wrote is in memory; drop whatever this core held of the buffer */
 			flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
 		} else {
@@ -2851,6 +3188,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint32_t desc_ver;
 	struct payload_info pi;
 
+	clear_raw_log_area();
 	if (!parse_payload(&pi, 1) || pi.kernel == NULL) {
 		print("no kernel in payload\n");
 		return 0;
@@ -3471,6 +3809,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
 	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	dt_prop_u32(&w, "vtimer-intid", plat->vtimer_intid);
 	dt_end(&w);
 	if (plat->uart != 0) {
 		dt_begin(&w, "uart0");
@@ -3548,7 +3887,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				print("THE KERNEL HUNG on core %x: no sign of life for %d seconds; its log follows\n", kernel_mpidr,
 				    (uint64_t)SILENCE_SECONDS);
 				set_result("hung", loader_ctx[CTX_LOG_LEN], 0);
-				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
+				write_live_logs(kernel_live, slide);
 				return 1;
 			} else if (status != 0) {
 				/* the kernel was told it would be on that core (return path, device tree): no second try */
@@ -4360,10 +4699,14 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	trace_start();
+	trace("loader entered");
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
 	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
 		load_payload_from_volume();
 	}
+	trace(((const struct payload_header *)PAYLOAD_BASE)->magic == PAYLOAD_MAGIC ?
+	    "payload in memory" : "no payload in memory");
 	print("== XNULOADER v3 ==\n");
 	print_banner();
 	if (volume_payload_bytes != 0) {
@@ -4374,39 +4717,68 @@ efi_main(efi_handle image, efi_system_table *st)
 	}
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
+	trace("banner printed");
 
 	PLAT = &platform_qemu_virt;
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
+		trace("no gop");
 	} else {
+		trace("gop found");
 		SCREEN.base = GOP->mode->fb_base;
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+			trace("platform redwood");
 		} else if (SCREEN.base == POLARIS_FRAMEBUFFER_BASE) {
 			PLAT = &platform_polaris;
-		} else {
+			trace("platform polaris (sdm845)");
+		} else if (trace_bio != NULL) {
+			/*
+			 * The Polaris UEFI reports a generic timer frequency of 62.5 MHz, the same as QEMU, and its GOP
+			 * framebuffer base is not the reserved-region base from PlatformMemoryMapLib. The early trace
+			 * already found the phone's large UFS device; use that to select the phone profile and never
+			 * touch QEMU's fw_cfg MMIO on the handset.
+			 */
+			PLAT = &platform_polaris;
+			trace("platform polaris (large UFS device)");
+		} else if (READ_SYSREG(CNTFRQ_EL0) == 62500000ULL) {
+			/*
+			 * ramfb is QEMU's: asking for it means writing to fw_cfg at 0x09020000, which is not fw_cfg on a
+			 * phone -- the write faults and the SoC resets (the run stopped there, said by the trace). QEMU
+			 * virt's generic timer runs at 62.5 MHz and the phone's at 19.2 MHz, which is enough to know.
+			 */
+			trace("ramfb: asking");
 			ramfb_phone_screen();
+			trace("ramfb: done");
+		} else {
+			trace("ramfb: not QEMU, the firmware's screen is kept");
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	trace("platform printed");
 
 	install_exception_hook();
 	wdt_arm();
+	trace("exception hook, watchdog armed");
 
 	int have_payload = parse_payload(&pi, 0);
+	trace(have_payload ? "payload parsed" : "payload NOT parsed");
 	if (have_payload && pi.usb_mode && usb_start()) {
+		trace("usb command loop");
 		flush_log();
 		usb_command_loop();
 	}
 
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
+		trace("run kernel");
 		run_kernel(0, 0);
+		trace("kernel returned to loader");
 	}
 	reboot();
 	return 0;

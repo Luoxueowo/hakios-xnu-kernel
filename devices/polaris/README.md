@@ -17,11 +17,13 @@ and [UEFI memory map](../../mu_aloha_platforms/Platforms/NapaliPkg/Device/xiaomi
 |---|---|
 | GICv3 distributor | `0x17A00000` |
 | GICv3 redistributors | `0x17A60000` |
+| EL1 virtual timer PPI (GIC INTID) | `19` (old Polaris loader profile and the device's timer DT) |
 | PSCI method | SMC |
 | CPU MPIDRs | `0x000` through `0x700`, Aff1 (8 CPUs) |
 | Generic timer frequency | `19.2 MHz` |
 
-This loader profile is integrated; an XNU boot on the phone has not yet been verified.
+This loader profile is integrated, and XNU has now booted to the system on the MIX 2S. The GICv3 virtual timer uses INTID 19,
+as specified by the old Polaris loader profile and the device's timer description.
 
 With `battery=1`, the loader reads the resident Qualcomm ChargerEx/QcomCharger protocols and shares a read-only status cache with
 XNU. The Polaris profile does not reinitialize QcomCharger, matching the old Polaris loader setting. XNU publishes the readings as
