@@ -52,6 +52,11 @@
 #define POLARIS_A630_HFI_MAX_GPU_LEVELS       16u
 #define POLARIS_A630_HFI_MAX_GMU_LEVELS       4u
 #define POLARIS_A630_HFI_PERF_TABLE_DWORDS    43u
+#define POLARIS_A630_HFI_MAX_BW_LEVELS        16u
+#define POLARIS_A630_HFI_MAX_CNOC_LEVELS      2u
+#define POLARIS_A630_HFI_MAX_CNOC_COMMANDS    6u
+#define POLARIS_A630_HFI_MAX_DDR_COMMANDS     8u
+#define POLARIS_A630_HFI_BW_TABLE_DWORDS      160u
 #define POLARIS_A630_HFI_REQUIRED_BYTES       \
 	(POLARIS_A630_HFI_QUEUE_DATA_OFFSET + POLARIS_A630_HFI_QUEUE_COUNT * POLARIS_A630_HFI_QUEUE_BYTES)
 #define POLARIS_A630_HFI_ALLOCATION_BYTES     \
@@ -94,6 +99,20 @@ struct polaris_a630_hfi_state {
 struct polaris_a630_hfi_opp {
 	uint32_t vote;
 	uint32_t frequency_khz;
+};
+
+/* A630 legacy HFI BW_VOTE_TBL from Qualcomm's kgsl_hfi.h. */
+struct polaris_a630_hfi_bw_table {
+	uint32_t header;
+	uint32_t bw_level_num;
+	uint32_t cnoc_cmds_num;
+	uint32_t ddr_cmds_num;
+	uint32_t cnoc_wait_bitmask;
+	uint32_t ddr_wait_bitmask;
+	uint32_t cnoc_cmd_addrs[POLARIS_A630_HFI_MAX_CNOC_COMMANDS];
+	uint32_t cnoc_cmd_data[POLARIS_A630_HFI_MAX_CNOC_LEVELS][POLARIS_A630_HFI_MAX_CNOC_COMMANDS];
+	uint32_t ddr_cmd_addrs[POLARIS_A630_HFI_MAX_DDR_COMMANDS];
+	uint32_t ddr_cmd_data[POLARIS_A630_HFI_MAX_BW_LEVELS][POLARIS_A630_HFI_MAX_DDR_COMMANDS];
 };
 
 enum polaris_a630_hfi_read_result {

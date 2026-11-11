@@ -8,5 +8,8 @@ driver ADRENO
 	file    iokit/Kernel/hakios.gpu.cpp iokitcpp
 	help    the Redwood Adreno 642L rendering backend (gpu=1), the shared HakiosGPU service, and Polaris Adreno 630
 	help    probes (adreno=1..6), explicit PAS ZAP staging (adreno=7), read-only RPMh discovery (adreno=8),
-	help    detached HFI memory preparation (adreno=9), and explicit reset-held GMU ITCM loading (adreno=10).
+	help    detached HFI memory preparation (adreno=9), reset-held GMU ITCM loading (adreno=10),
+	help    GMU-kernel SID5 attach (adreno=11), GMU/HFI startup (adreno=12), PERF_TBL (adreno=13),
+	help    and PERF_TBL/BW_VOTE_TBL submission (adreno=14). Do not invoke write stages on hardware
+	help    during current bring-up.
 	help    Polaris rendering is not enabled yet; both devices need their own firmware in fw-gpu/.

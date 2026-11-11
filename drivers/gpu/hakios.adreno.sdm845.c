@@ -6,10 +6,10 @@
  * adreno=1..6 performs read-only probes. Explicit adreno=7 stages and releases PAS metadata,
  * adreno=10 loads GMU ITCM while reset stays asserted, adreno=11 installs only the GMU-kernel
  * SMMUv2 context and SID route, adreno=12 boots the GMU and checks HFI firmware version, and
- * adreno=13 sends only the A630 HFI performance table. Write stages are guarded by runtime
- * preflight/readbacks and are not to be invoked on hardware during this bring-up. ZAP
- * authentication, GMU-user and 3D contexts, bandwidth tables, HFI START, command submission, and
- * rendering are still unavailable, so `ready()` remains false.
+ * adreno=13 sends the A630 HFI performance table; adreno=14 sends that table plus the reconstructed
+ * DDR/CNOC bandwidth table. Write stages are guarded by runtime preflight/readbacks and are not to
+ * be invoked on hardware during this bring-up. ZAP authentication, GMU-user and 3D contexts, HFI
+ * START, command submission, and rendering are still unavailable, so `ready()` remains false.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
  *   qcom,gpucc@5090000 (qcom,gpucc-sdm845-v2)
@@ -426,6 +426,17 @@ struct polaris_cmd_db_resource {
 	uint32_t address;
 	uint16_t levels[POLARIS_CMD_DB_MAX_LEVELS];
 	uint32_t level_count;
+};
+struct polaris_cmd_db_entry {
+	uint32_t address;
+	const uint8_t *auxiliary;
+	uint32_t auxiliary_length;
+};
+struct polaris_cmd_db_bcm {
+	uint32_t address;
+	uint32_t unit_size;
+	uint16_t width;
+	uint8_t clock_domain;
 };
 struct polaris_gpu_operating_point {
 	uint32_t frequency_hz;
@@ -2766,7 +2777,7 @@ read_le32(const uint8_t *data)
 }
 
 static bool
-polaris_cmd_db_resource_lookup(const char *name, struct polaris_cmd_db_resource *resource)
+polaris_cmd_db_entry_lookup(const char *name, struct polaris_cmd_db_entry *resource)
 {
 	char resource_id[8] = { 0 };
 	static const uint8_t magic[] = { 0xdb, 0x30, 0x03, 0x0c };
@@ -2819,29 +2830,71 @@ polaris_cmd_db_resource_lookup(const char *name, struct polaris_cmd_db_resource 
 			aux_length = read_le16(entry + 20);
 			aux_offset = read_le16(entry + 22);
 			aux_start = (uint64_t)POLARIS_CMD_DB_HEADER_SIZE + data_offset + aux_offset;
-			if (aux_length == 0 || (aux_length & 1u) != 0 || aux_length > POLARIS_CMD_DB_MAX_LEVELS * 2u ||
-			    aux_start > POLARIS_CMD_DB_SIZE || aux_length > POLARIS_CMD_DB_SIZE - aux_start) {
-				printf("adreno-sdm845: CMD_DB resource %s has invalid level metadata\n", name);
+			if (aux_length == 0 || aux_start > POLARIS_CMD_DB_SIZE ||
+			    aux_length > POLARIS_CMD_DB_SIZE - aux_start) {
+				printf("adreno-sdm845: CMD_DB resource %s has invalid auxiliary metadata\n", name);
 				return false;
 			}
 			resource->address = read_le32(entry + 16);
-			for (uint32_t level_index = 0; level_index < aux_length / 2u; level_index++) {
-				uint16_t level = read_le16(polaris_cmd_db + aux_start + level_index * 2u);
-
-				if (level_index != 0 && level == 0) {
-					break;
-				}
-				if (level == 0 || (level_index != 0 && level <= resource->levels[level_index - 1u])) {
-					printf("adreno-sdm845: CMD_DB resource %s levels are zero or not strictly ascending\n", name);
-					return false;
-				}
-				resource->levels[level_index] = level;
-				resource->level_count++;
-			}
-			return resource->address != 0 && resource->level_count != 0 && resource->levels[0] != 0;
+			resource->auxiliary = polaris_cmd_db + aux_start;
+			resource->auxiliary_length = aux_length;
+			return resource->address != 0;
 		}
 	}
 	return false;
+}
+
+static bool
+polaris_cmd_db_resource_lookup(const char *name, struct polaris_cmd_db_resource *resource)
+{
+	struct polaris_cmd_db_entry entry;
+	uint32_t level_count;
+
+	if (resource == NULL || !polaris_cmd_db_entry_lookup(name, &entry) || entry.auxiliary_length == 0 ||
+	    (entry.auxiliary_length & 1u) != 0 || entry.auxiliary_length > POLARIS_CMD_DB_MAX_LEVELS * sizeof(uint16_t)) {
+		if (name != NULL) {
+			printf("adreno-sdm845: CMD_DB ARC resource %s has invalid level metadata\n", name);
+		}
+		return false;
+	}
+	memset(resource, 0, sizeof(*resource));
+	resource->address = entry.address;
+	level_count = entry.auxiliary_length / sizeof(uint16_t);
+	for (uint32_t level_index = 0; level_index < level_count; level_index++) {
+		uint16_t level = read_le16(entry.auxiliary + level_index * sizeof(uint16_t));
+
+		if (level_index != 0 && level == 0) {
+			break;
+		}
+		if (level == 0 || (level_index != 0 && level <= resource->levels[level_index - 1u])) {
+			printf("adreno-sdm845: CMD_DB resource %s levels are zero or not strictly ascending\n", name);
+			return false;
+		}
+		resource->levels[level_index] = level;
+		resource->level_count++;
+	}
+	return resource->address != 0 && resource->level_count != 0 && resource->levels[0] != 0;
+}
+
+static bool
+polaris_cmd_db_bcm_lookup(const char *name, struct polaris_cmd_db_bcm *bcm)
+{
+	struct polaris_cmd_db_entry entry;
+
+	if (name == NULL || bcm == NULL || !polaris_cmd_db_entry_lookup(name, &entry) || entry.auxiliary_length != 8u) {
+		printf("adreno-sdm845: CMD_DB BCM %s has no 8-byte BCM auxiliary record\n", name != NULL ? name : "(null)");
+		return false;
+	}
+	bcm->address = entry.address;
+	bcm->unit_size = read_le32(entry.auxiliary);
+	bcm->width = read_le16(entry.auxiliary + 4);
+	bcm->clock_domain = entry.auxiliary[6];
+	if (bcm->address == 0 || (bcm->address & 3u) != 0 || bcm->unit_size == 0 || bcm->width == 0 ||
+	    bcm->clock_domain >= 16u || entry.auxiliary[7] != 0) {
+		printf("adreno-sdm845: CMD_DB BCM %s has invalid address, unit size, width, or clock domain\n", name);
+		return false;
+	}
+	return true;
 }
 
 /* RPMH_REGULATOR_LEVEL_* encodings from the SDM845 clock-controller binding. */
@@ -2977,6 +3030,393 @@ polaris_gmu_hfi_perf_table_build(uint16_t sequence, uint32_t message[POLARIS_A63
 	printf("adreno-sdm845: step 13 built HFI PERF_TBL: %u GPU levels (max=%u kHz), %u GMU levels (max=%u kHz); no bus votes were built\n",
 	    polaris_gpu_pwrlevel_count, gpu[polaris_gpu_pwrlevel_count - 1u].frequency_khz,
 	    polaris_gmu_pwrlevel_count, gmu[polaris_gmu_pwrlevel_count - 1u].frequency_khz);
+	return true;
+}
+
+#define POLARIS_A630_BCM_COMMIT_MASK  0x40000000u
+#define POLARIS_A630_BCM_VALID_MASK   0x20000000u
+#define POLARIS_A630_BCM_VOTE_MASK    0x3fffu
+#define POLARIS_A630_BCM_ACV_APPS     0x8u
+#define POLARIS_A630_BCM_VCD_COUNT    16u
+
+struct polaris_a630_hfi_bus_node_ref {
+	const char *path;
+	uint32_t cell_id;
+};
+
+struct polaris_a630_hfi_bcm_ref {
+	uint32_t node_index;
+	const char *path;
+	const char *name;
+};
+
+struct polaris_a630_hfi_bus_route {
+	const char *name;
+	const struct polaris_a630_hfi_bus_node_ref *nodes;
+	uint32_t node_count;
+	const struct polaris_a630_hfi_bcm_ref *bcms;
+	uint32_t bcm_count;
+};
+
+struct polaris_a630_hfi_bus_node {
+	DTEntry entry;
+	uint32_t width;
+	uint32_t aggregate_ports;
+	uint32_t phandle;
+};
+
+struct polaris_a630_hfi_bus_vote {
+	const char *name;
+	uint32_t address;
+	uint32_t unit_size;
+	uint32_t clock_domain;
+	uint16_t width;
+	uint32_t node_mask;
+	bool acv;
+};
+
+struct polaris_a630_hfi_bus_route_state {
+	uint32_t node_count;
+	struct polaris_a630_hfi_bus_node nodes[4];
+	uint32_t vote_count;
+	struct polaris_a630_hfi_bus_vote votes[POLARIS_A630_HFI_MAX_DDR_COMMANDS];
+};
+
+static const struct polaris_a630_hfi_bus_node_ref polaris_a630_ddr_bus_nodes[] = {
+	{ "/soc/ad-hoc-bus/mas-qxm-gpu", 0x001au },
+	{ "/soc/ad-hoc-bus/slv-qns-llcc", 0x0302u },
+	{ "/soc/ad-hoc-bus/mas-llcc-mc", 0x0081u },
+	{ "/soc/ad-hoc-bus/slv-ebi", 0x0200u },
+};
+
+static const struct polaris_a630_hfi_bcm_ref polaris_a630_ddr_bus_bcms[] = {
+	{ 1u, "/soc/ad-hoc-bus/bcm-sh0", "SH0" },
+	{ 3u, "/soc/ad-hoc-bus/bcm-mc0", "MC0" },
+	{ 3u, "/soc/ad-hoc-bus/bcm-acv", "ACV" },
+};
+
+static const struct polaris_a630_hfi_bus_node_ref polaris_a630_cnoc_bus_nodes[] = {
+	{ "/soc/ad-hoc-bus/mas-qxm-gpu", 0x001au },
+	{ "/soc/ad-hoc-bus/slv-qns-memnoc-snoc", 0x0308u },
+	{ "/soc/ad-hoc-bus/mas-qnm-memnoc", 0x008eu },
+	{ "/soc/ad-hoc-bus/slv-qns-cnoc", 0x2734u },
+};
+
+static const struct polaris_a630_hfi_bcm_ref polaris_a630_cnoc_bus_bcms[] = {
+	{ 1u, "/soc/ad-hoc-bus/bcm-sh2", "SH2" },
+	{ 2u, "/soc/ad-hoc-bus/bcm-sn15", "SN15" },
+	{ 3u, "/soc/ad-hoc-bus/bcm-sn3", "SN3" },
+};
+
+static bool
+polaris_dt_u32_array_contains(DTEntry node, const char *name, uint32_t value)
+{
+	const uint8_t *property;
+	unsigned int size = 0;
+
+	if (node == NULL || SecureDTGetProperty(node, name, (const void **)&property, &size) != kSuccess ||
+	    property == NULL || size == 0 || (size & (sizeof(uint32_t) - 1u)) != 0) {
+		return false;
+	}
+	for (unsigned int offset = 0; offset < size; offset += sizeof(uint32_t)) {
+		if (polaris_dt_be32(property + offset) == value) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+polaris_dt_u32_array_equals(DTEntry node, const char *name, const uint32_t *values, uint32_t count)
+{
+	const uint8_t *property = NULL;
+	unsigned int size = 0;
+	int result;
+
+	if (node == NULL || (count != 0 && values == NULL)) {
+		return false;
+	}
+	result = SecureDTGetProperty(node, name, (const void **)&property, &size);
+	if (count == 0) {
+		return result != kSuccess || size == 0;
+	}
+	if (result != kSuccess || property == NULL || size != count * sizeof(uint32_t)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (polaris_dt_be32(property + i * sizeof(uint32_t)) != values[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+polaris_a630_hfi_bus_route_load(const struct polaris_a630_hfi_bus_route *route,
+	const struct polaris_msm_bus_vector *vector, struct polaris_a630_hfi_bus_route_state *state)
+{
+	DTEntry apps_rsc = NULL;
+	uint32_t apps_rsc_phandle;
+
+	if (route == NULL || vector == NULL || state == NULL || route->nodes == NULL || route->bcms == NULL ||
+	    route->node_count < 2 || route->node_count > sizeof(state->nodes) / sizeof(state->nodes[0]) ||
+	    route->bcm_count == 0 || route->bcm_count > sizeof(state->votes) / sizeof(state->votes[0]) ||
+	    vector->source != route->nodes[0].cell_id || vector->destination != route->nodes[route->node_count - 1u].cell_id ||
+	    SecureDTLookupEntry(NULL, "/soc/ad-hoc-bus/rsc-apps", &apps_rsc) != kSuccess || apps_rsc == NULL ||
+	    !polaris_dt_get_u32(apps_rsc, "phandle", &apps_rsc_phandle)) {
+		printf("adreno-sdm845: HFI %s bus route endpoints or Apps RSC do not match the runtime DT\n",
+		    route != NULL && route->name != NULL ? route->name : "unnamed");
+		return false;
+	}
+	memset(state, 0, sizeof(*state));
+	state->node_count = route->node_count;
+
+	for (uint32_t i = 0; i < route->node_count; i++) {
+		const struct polaris_a630_hfi_bus_node_ref *reference = &route->nodes[i];
+		struct polaris_a630_hfi_bus_node *node = &state->nodes[i];
+		uint32_t cell_id;
+
+		if (SecureDTLookupEntry(NULL, reference->path, &node->entry) != kSuccess || node->entry == NULL ||
+		    !polaris_dt_get_u32(node->entry, "cell-id", &cell_id) || cell_id != reference->cell_id ||
+		    !polaris_dt_get_u32(node->entry, "qcom,buswidth", &node->width) || node->width == 0 ||
+		    !polaris_dt_get_u32(node->entry, "qcom,agg-ports", &node->aggregate_ports) ||
+		    node->aggregate_ports == 0 || node->width > UINT32_MAX / node->aggregate_ports) {
+			printf("adreno-sdm845: HFI %s route node %u is incomplete or differs from the validated Polaris bus topology\n",
+			    route->name, i);
+			return false;
+		}
+		if (i != 0 && !polaris_dt_get_u32(node->entry, "phandle", &node->phandle)) {
+			printf("adreno-sdm845: HFI %s route node %u has no phandle for its upstream connection\n",
+			    route->name, i);
+			return false;
+		}
+		if (i + 1u < route->node_count) {
+			struct polaris_a630_hfi_bus_node *next = &state->nodes[i + 1u];
+			DTEntry next_entry = NULL;
+
+			if (SecureDTLookupEntry(NULL, route->nodes[i + 1u].path, &next_entry) != kSuccess || next_entry == NULL ||
+			    !polaris_dt_get_u32(next_entry, "phandle", &next->phandle) ||
+			    !polaris_dt_u32_array_contains(node->entry, "qcom,connections", next->phandle)) {
+				printf("adreno-sdm845: HFI %s route edge %u is absent from the runtime bus graph\n", route->name, i);
+				return false;
+			}
+		}
+	}
+
+	for (uint32_t node_index = 0; node_index < route->node_count; node_index++) {
+		uint32_t expected_phandles[POLARIS_A630_HFI_MAX_DDR_COMMANDS];
+		uint32_t expected_count = 0;
+
+		for (uint32_t i = 0; i < route->bcm_count; i++) {
+			const struct polaris_a630_hfi_bcm_ref *reference = &route->bcms[i];
+			DTEntry bcm_node = NULL;
+			uint32_t phandle;
+			struct polaris_cmd_db_bcm cmd_db_bcm;
+			struct polaris_a630_hfi_bus_vote *vote = NULL;
+
+			if (reference->node_index != node_index) {
+				continue;
+			}
+			if (expected_count >= sizeof(expected_phandles) / sizeof(expected_phandles[0]) ||
+			    SecureDTLookupEntry(NULL, reference->path, &bcm_node) != kSuccess || bcm_node == NULL ||
+			    !polaris_dt_string_equals(bcm_node, "qcom,bcm-name", reference->name) ||
+			    !polaris_dt_has_empty_property(bcm_node, "qcom,bcm-dev") ||
+			    !polaris_dt_get_u32(bcm_node, "phandle", &phandle) ||
+			    !polaris_dt_u32_array_equals(bcm_node, "qcom,rscs", &apps_rsc_phandle, 1u) ||
+			    !polaris_cmd_db_bcm_lookup(reference->name, &cmd_db_bcm)) {
+				printf("adreno-sdm845: HFI %s BCM %s disagrees with the Apps RSC or AOP CMD_DB\n",
+				    route->name, reference->name);
+				return false;
+			}
+			expected_phandles[expected_count++] = phandle;
+			for (uint32_t j = 0; j < state->vote_count; j++) {
+				if (strcmp(state->votes[j].name, reference->name) == 0) {
+					vote = &state->votes[j];
+					break;
+				}
+			}
+			if (vote == NULL) {
+				if (state->vote_count >= sizeof(state->votes) / sizeof(state->votes[0])) {
+					printf("adreno-sdm845: HFI %s route exceeds the bounded BCM count\n", route->name);
+					return false;
+				}
+				vote = &state->votes[state->vote_count++];
+				vote->name = reference->name;
+				vote->address = cmd_db_bcm.address;
+				vote->unit_size = cmd_db_bcm.unit_size;
+				vote->width = cmd_db_bcm.width;
+				vote->clock_domain = cmd_db_bcm.clock_domain;
+				vote->acv = strcmp(reference->name, "ACV") == 0;
+			} else if (vote->address != cmd_db_bcm.address || vote->unit_size != cmd_db_bcm.unit_size ||
+			    vote->width != cmd_db_bcm.width || vote->clock_domain != cmd_db_bcm.clock_domain) {
+				printf("adreno-sdm845: HFI %s BCM %s has inconsistent CMD_DB entries\n", route->name, reference->name);
+				return false;
+			}
+			vote->node_mask |= 1u << node_index;
+		}
+		if (!polaris_dt_u32_array_equals(state->nodes[node_index].entry, "qcom,bcms",
+		    expected_phandles, expected_count)) {
+			printf("adreno-sdm845: HFI %s node %u BCM links differ from the route used to build the vote table\n",
+			    route->name, node_index);
+			return false;
+		}
+	}
+
+	/* msm_bus_query_gen() emits BCM TCS commands by VCD, retaining path order within each VCD. */
+	for (uint32_t i = 1; i < state->vote_count; i++) {
+		struct polaris_a630_hfi_bus_vote vote = state->votes[i];
+		uint32_t j = i;
+
+		while (j != 0 && state->votes[j - 1u].clock_domain > vote.clock_domain) {
+			state->votes[j] = state->votes[j - 1u];
+			j--;
+		}
+		state->votes[j] = vote;
+	}
+	return state->vote_count != 0;
+}
+
+static bool
+polaris_msm_bus_div64(uint64_t numerator, uint64_t denominator, uint64_t *quotient)
+{
+	if (denominator == 0 || denominator > UINT32_MAX || quotient == NULL) {
+		return false;
+	}
+	/* msm_bus_div64() rounds a nonzero sub-unit vote up to one, then truncates larger values. */
+	*quotient = numerator != 0 && numerator < denominator ? 1u : numerator / denominator;
+	return true;
+}
+
+static bool
+polaris_a630_hfi_bus_row_build(const struct polaris_a630_hfi_bus_route_state *route,
+	const struct polaris_msm_bus_vector *vector, uint32_t *row, uint32_t *addresses, uint32_t *wait_mask)
+{
+	if (route == NULL || vector == NULL || row == NULL || wait_mask == NULL || route->vote_count == 0 ||
+	    route->vote_count > POLARIS_A630_HFI_MAX_DDR_COMMANDS) {
+		return false;
+	}
+	*wait_mask = 0;
+	for (uint32_t i = 0; i < route->vote_count; i++) {
+		const struct polaris_a630_hfi_bus_vote *vote = &route->votes[i];
+		uint64_t max_ab = 0, max_ib = 0, vote_ab, vote_ib;
+		bool commit = i + 1u == route->vote_count || route->votes[i + 1u].clock_domain != vote->clock_domain;
+
+		if (addresses != NULL) {
+			addresses[i] = vote->address;
+		}
+		if (vote->acv) {
+			vote_ib = vector->average_kbps != 0 || vector->instantaneous_kbps != 0 ? POLARIS_A630_BCM_ACV_APPS : 0;
+			vote_ab = 0;
+		} else {
+			for (uint32_t node_index = 0; node_index < route->node_count; node_index++) {
+				const struct polaris_a630_hfi_bus_node *node = &route->nodes[node_index];
+				uint64_t node_ab, node_ib;
+				uint64_t ab_divisor = (uint64_t)node->width * node->aggregate_ports;
+
+				if ((vote->node_mask & (1u << node_index)) == 0) {
+					continue;
+				}
+				if (!polaris_msm_bus_div64((uint64_t)vector->average_kbps * vote->width, ab_divisor, &node_ab) ||
+				    !polaris_msm_bus_div64((uint64_t)vector->instantaneous_kbps * vote->width, node->width, &node_ib)) {
+					return false;
+				}
+				max_ab = node_ab > max_ab ? node_ab : max_ab;
+				max_ib = node_ib > max_ib ? node_ib : max_ib;
+			}
+			if (!polaris_msm_bus_div64(max_ab, vote->unit_size, &vote_ab) ||
+			    !polaris_msm_bus_div64(max_ib, vote->unit_size, &vote_ib)) {
+				return false;
+			}
+		}
+
+		if (vote_ab > POLARIS_A630_BCM_VOTE_MASK) {
+			vote_ab = POLARIS_A630_BCM_VOTE_MASK;
+		}
+		if (vote_ib > POLARIS_A630_BCM_VOTE_MASK) {
+			vote_ib = POLARIS_A630_BCM_VOTE_MASK;
+		}
+		row[i] = (commit ? POLARIS_A630_BCM_COMMIT_MASK : 0) |
+		    ((vote_ab != 0 || vote_ib != 0) ? POLARIS_A630_BCM_VALID_MASK : 0) |
+		    ((uint32_t)vote_ab << 14) | (uint32_t)vote_ib;
+		/* Match A630 KGSL build_rpmh_bw_votes(), which records BIT(usecase_index) for wait commands. */
+		if (commit) {
+			*wait_mask |= 1u;
+		} else {
+			*wait_mask &= ~1u;
+		}
+	}
+	return true;
+}
+
+static bool
+polaris_gmu_hfi_bw_table_build(uint16_t sequence, struct polaris_a630_hfi_bw_table *table)
+{
+	static const struct polaris_a630_hfi_bus_route ddr_route = {
+		.name = "GPU-to-DDR",
+		.nodes = polaris_a630_ddr_bus_nodes,
+		.node_count = sizeof(polaris_a630_ddr_bus_nodes) / sizeof(polaris_a630_ddr_bus_nodes[0]),
+		.bcms = polaris_a630_ddr_bus_bcms,
+		.bcm_count = sizeof(polaris_a630_ddr_bus_bcms) / sizeof(polaris_a630_ddr_bus_bcms[0]),
+	};
+	static const struct polaris_a630_hfi_bus_route cnoc_route = {
+		.name = "GPU-to-CNOC",
+		.nodes = polaris_a630_cnoc_bus_nodes,
+		.node_count = sizeof(polaris_a630_cnoc_bus_nodes) / sizeof(polaris_a630_cnoc_bus_nodes[0]),
+		.bcms = polaris_a630_cnoc_bus_bcms,
+		.bcm_count = sizeof(polaris_a630_cnoc_bus_bcms) / sizeof(polaris_a630_cnoc_bus_bcms[0]),
+	};
+	struct polaris_a630_hfi_bus_route_state ddr_state, cnoc_state;
+
+	if (table == NULL || sequence == 0 || sizeof(*table) / sizeof(uint32_t) != POLARIS_A630_HFI_BW_TABLE_DWORDS ||
+	    polaris_gpu_bus_level_count == 0 || polaris_gpu_bus_level_count > POLARIS_A630_HFI_MAX_BW_LEVELS ||
+	    polaris_gpu_bus_level_count != POLARIS_EXPECTED_GPU_BUS_LEVELS ||
+	    polaris_gmu_cnoc_level_count != POLARIS_A630_HFI_MAX_CNOC_LEVELS ||
+	    !polaris_a630_hfi_bus_route_load(&ddr_route, &polaris_gpu_bus_levels[0], &ddr_state) ||
+	    !polaris_a630_hfi_bus_route_load(&cnoc_route, &polaris_gmu_cnoc_levels[0], &cnoc_state) ||
+	    ddr_state.vote_count > POLARIS_A630_HFI_MAX_DDR_COMMANDS ||
+	    cnoc_state.vote_count > POLARIS_A630_HFI_MAX_CNOC_COMMANDS) {
+		printf("adreno-sdm845: step 14 cannot reconstruct bounded GPU DDR/CNOC TCS tables from Polaris DT and CMD_DB\n");
+		return false;
+	}
+
+	memset(table, 0, sizeof(*table));
+	table->bw_level_num = polaris_gpu_bus_level_count;
+	table->ddr_cmds_num = ddr_state.vote_count;
+	table->cnoc_cmds_num = cnoc_state.vote_count;
+	for (uint32_t i = 0; i < polaris_gpu_bus_level_count; i++) {
+		uint32_t *row = table->ddr_cmd_data[i];
+		uint32_t *addresses = i == 0 ? table->ddr_cmd_addrs : NULL;
+		uint32_t wait_mask;
+
+		if (!polaris_a630_hfi_bus_row_build(&ddr_state, &polaris_gpu_bus_levels[i], row, addresses, &wait_mask)) {
+			printf("adreno-sdm845: step 14 could not convert GPU bandwidth usecase %u into BCM TCS commands\n", i);
+			return false;
+		}
+		if (i == 0) {
+			table->ddr_wait_bitmask = wait_mask;
+		}
+	}
+	for (uint32_t i = 0; i < polaris_gmu_cnoc_level_count; i++) {
+		uint32_t *row = table->cnoc_cmd_data[i];
+		uint32_t *addresses = i == 0 ? table->cnoc_cmd_addrs : NULL;
+		uint32_t wait_mask;
+
+		if (!polaris_a630_hfi_bus_row_build(&cnoc_state, &polaris_gmu_cnoc_levels[i], row, addresses, &wait_mask)) {
+			printf("adreno-sdm845: step 14 could not convert GMU CNOC usecase %u into BCM TCS commands\n", i);
+			return false;
+		}
+		if (i == 0) {
+			table->cnoc_wait_bitmask = wait_mask;
+		}
+	}
+	if (!polaris_a630_hfi_make_header(POLARIS_A630_HFI_ID_BW_VOTE_TABLE,
+	    POLARIS_A630_HFI_BW_TABLE_DWORDS, POLARIS_A630_HFI_TYPE_COMMAND, sequence, &table->header)) {
+		printf("adreno-sdm845: step 14 could not encode the fixed A630 HFI v1 BW_VOTE_TBL header\n");
+		return false;
+	}
+	printf("adreno-sdm845: step 14 built HFI BW_VOTE_TBL: %u DDR levels/%u BCM commands and %u CNOC levels/%u BCM commands; wait masks=%#x/%#x\n",
+	    table->bw_level_num, table->ddr_cmds_num, polaris_gmu_cnoc_level_count,
+	    table->cnoc_cmds_num, table->ddr_wait_bitmask, table->cnoc_wait_bitmask);
 	return true;
 }
 
@@ -3366,6 +3806,40 @@ polaris_gmu_hfi_verify_firmware_version(uint32_t *version)
 	return true;
 }
 
+static bool polaris_gmu_hfi_start(void);
+static bool probe_pas_capabilities(void);
+
+static bool
+polaris_gmu_hfi_start_stage(uint32_t step)
+{
+	static bool (*const step_probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core, probe_firmware,
+	    probe_pas_capabilities };
+
+	for (uint32_t i = 0; i < sizeof(step_probes) / sizeof(step_probes[0]); i++) {
+		if (!step_probes[i]()) {
+			printf("adreno-sdm845: step %u prerequisite %u failed; GMU/HFI is not started\n", step, i + 1u);
+			return false;
+		}
+	}
+	if (!polaris_hfi_software_prepare()) {
+		printf("adreno-sdm845: step %u could not prepare GMU HFI/dump/log memory; no GMU start was attempted\n", step);
+		return false;
+	}
+	if (!polaris_gmu_firmware_load()) {
+		printf("adreno-sdm845: step %u could not load GMU ITCM; reset remains asserted\n", step);
+		return false;
+	}
+	if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid || !polaris_smmu_gmu_kernel_attach()) {
+		printf("adreno-sdm845: step %u could not attach the verified GMU-kernel SID5 context; GMU remains stopped\n", step);
+		return false;
+	}
+	if (!polaris_gmu_hfi_start()) {
+		printf("adreno-sdm845: step %u GMU/HFI startup did not complete\n", step);
+		return false;
+	}
+	return true;
+}
+
 static bool
 polaris_gmu_hfi_send_perf_table(void)
 {
@@ -3386,8 +3860,28 @@ polaris_gmu_hfi_send_perf_table(void)
 	return true;
 }
 
+static bool
+polaris_gmu_hfi_send_bw_vote_table(void)
+{
+	struct polaris_a630_hfi_bw_table table;
+	uint32_t response_dwords = 0;
+	uint32_t sequence = polaris_a630_hfi_next_sequence(&polaris_hfi_state);
+
+	if (sequence == 0 || !polaris_gmu_hfi_bw_table_build((uint16_t)sequence, &table) ||
+	    !polaris_gmu_hfi_send_command((const uint32_t *)&table,
+	    sizeof(table) / sizeof(uint32_t), NULL, 0, &response_dwords)) {
+		printf("adreno-sdm845: step 14 A630 HFI BW_VOTE_TBL was not acknowledged\n");
+		return false;
+	}
+	if (response_dwords < 3u) {
+		printf("adreno-sdm845: step 14 BW_VOTE_TBL ACK is too short (%u dwords)\n", response_dwords);
+		return false;
+	}
+	return true;
+}
+
 static void
-polaris_gmu_hfi_stop_after_perf_failure(void)
+polaris_gmu_hfi_stop_after_table_failure(uint32_t step)
 {
 	uint32_t reset = UINT32_MAX;
 
@@ -3400,8 +3894,8 @@ polaris_gmu_hfi_stop_after_perf_failure(void)
 	polaris_gmu_hfi_ready = false;
 	polaris_hfi_state.initialized = false;
 	polaris_smmu_backend_faulted = true;
-	printf("adreno-sdm845: step 13 failure cleanup requested CM3 reset (readback=%#x); GMU-kernel SID5 remains attached and backend stays faulted\n",
-	    reset);
+	printf("adreno-sdm845: step %u failure cleanup requested CM3 reset (readback=%#x); GMU-kernel SID5 remains attached and backend stays faulted\n",
+	    step, reset);
 }
 
 /* Boot only the GMU and its legacy HFI queues; GPU-user SID4, ZAP, GX and CP stay off. */
@@ -3997,39 +4491,32 @@ hakios_adreno_sdm845_init(void)
 	}
 	if (last_step == 13) {
 		printf("adreno-sdm845: step 13 explicitly boots the GMU and sends only HFI PERF_TBL; it runs steps 1..6, prepares HFI memory, loads GMU ITCM, attaches SID5, then starts HFI and submits GPU/GMU ARC performance levels\n");
-		for (uint32_t i = 0; i < 6; i++) {
-			if (!probes[i]()) {
-				printf("adreno-sdm845: step %u failed; GMU PERF_TBL is not attempted\n", i + 1);
-				return;
-			}
-		}
-		if (!polaris_hfi_software_prepare()) {
-			printf("adreno-sdm845: step 13 could not prepare GMU HFI/dump/log memory; no GMU start was attempted\n");
-			return;
-		}
-		if (!polaris_gmu_firmware_load()) {
-			printf("adreno-sdm845: step 13 could not load GMU ITCM; reset remains asserted\n");
-			return;
-		}
-		if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid ||
-		    !polaris_smmu_gmu_kernel_attach()) {
-			printf("adreno-sdm845: step 13 could not attach the verified GMU-kernel SID5 context; GMU remains stopped\n");
-			return;
-		}
-		if (!polaris_gmu_hfi_start()) {
-			printf("adreno-sdm845: step 13 GMU/HFI startup did not complete; PERF_TBL is not sent\n");
+		if (!polaris_gmu_hfi_start_stage(13u)) {
 			return;
 		}
 		if (!polaris_gmu_hfi_send_perf_table()) {
-			polaris_gmu_hfi_stop_after_perf_failure();
-		printf("adreno-sdm845: step 13 failed; BW table, H2F_MSG_START, GX core, CP, and rendering remain disabled\n");
+			polaris_gmu_hfi_stop_after_table_failure(13u);
+			printf("adreno-sdm845: step 13 failed; BW table, H2F_MSG_START, GX core, CP, and rendering remain disabled\n");
 			return;
 		}
 		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL is acknowledged, while bus votes, H2F_MSG_START, GPU-user/3D routes, ZAP authentication, CP, and rendering remain disabled\n");
 		return;
 	}
+	if (last_step == 14) {
+		printf("adreno-sdm845: step 14 explicitly boots GMU/HFI, then sends the A630 PERF_TBL and reconstructed BW_VOTE_TBL; it does not send H2F_MSG_START or render\n");
+		if (!polaris_gmu_hfi_start_stage(14u)) {
+			return;
+		}
+		if (!polaris_gmu_hfi_send_perf_table() || !polaris_gmu_hfi_send_bw_vote_table()) {
+			polaris_gmu_hfi_stop_after_table_failure(14u);
+			printf("adreno-sdm845: step 14 failed; H2F_MSG_START, GPU-user/3D routes, GX core, CP, and rendering remain disabled\n");
+			return;
+		}
+		printf("adreno-sdm845: step 14 finished; PERF_TBL and BW_VOTE_TBL are acknowledged, while H2F_MSG_START, GPU-user/3D routes, ZAP authentication, GX core, CP, and rendering remain disabled\n");
+		return;
+	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches only GMU SID5, step 12 boots GMU/HFI, and step 13 sends PERF_TBL; "
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches only GMU SID5, step 12 boots GMU/HFI, step 13 sends PERF_TBL, and step 14 sends PERF_TBL plus BW_VOTE_TBL; "
 		    "requested step %u is capped at %zu in the sequential probe path\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);
