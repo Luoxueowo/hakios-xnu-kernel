@@ -195,6 +195,16 @@ allow it. A successful firmware boot alone is not a completed driver.
   GPU accepts the packets
   ([`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c),
   [`adreno_pm4types.h`](https://android.googlesource.com/kernel/msm/%2B/android-8.1.0_r0.78/drivers/gpu/msm/adreno_pm4types.h)).
+- `adreno=16` runs read-only steps 1–6, then allocates and maps the validated SQE payload (after
+  its 4-byte file prefix), a 32 KiB CP ring containing the 12-dword `CP_ME_INIT`, and a one-page
+  RPTR scratch buffer into the detached GPU SID0 page table. The SQE and ring are GPU read-only;
+  the RPTR page is GPU writable. It cleans the CPU cache lines and commits the software page tables,
+  but does not attach SID0, write SMMU/GPU registers, start the SQE/CP, call PAS, or enable rendering.
+  Buffers remain allocated for review and are released by the backend stop path only when both the
+  3D context and core are inactive. The 32 KiB ring size follows the A630 KGSL definitions
+  ([`kgsl.h`](https://android.googlesource.com/kernel/msm.git/%2B/a11d0d49d2b949d401f8899369db331102d23cc3/drivers/gpu/msm/kgsl.h),
+  [`adreno_ringbuffer.h`](https://android.googlesource.com/kernel/msm/%2B/7a5cb50be049b0de03e13c98b65cb3770ad15481/drivers/gpu/msm/adreno_ringbuffer.h));
+  this stage has not been run under HakiOS on the phone.
 
 ## Polaris hardware facts
 
@@ -411,6 +421,12 @@ be assumed to serve the GMU stream. See the primary Qualcomm [`kgsl_hfi.h`](http
 [`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm.git/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_gmu.c) sources.
 
 The local firmware set is `a630_gmu.bin`, `a630_sqe.fw`, and `a630_zap.{mdt,b00,b01,b02,elf}`.
+I verified all seven SHA-256 hashes against the MIX 2S in Recovery: `/vendor` was mounted
+read-only from `/dev/block/sde47`, with fingerprint
+`Xiaomi/polaris/polaris:8.0.0/OPR1.170623.032/V9.5.19.0.ODGMIFA:user/release-keys` and
+incremental build `1793965292`. Every device file hash matches the corresponding local file and
+`fw-gpu/SHA256SUMS`; there was no need to replace or add firmware. `userland/build.sh` copies the
+ignored local `fw-gpu/*` set into the image's `fw/` directory when building.
 The `mdt` describes three program headers, with a single loadable segment matching `b02`; the
 signed metadata/other chunks still need to follow the exact Qualcomm MDT/PAS loading contract.
 Do not assume that copying the Redwood `mdt` plus `b02` path is sufficient. Confirm SQE format

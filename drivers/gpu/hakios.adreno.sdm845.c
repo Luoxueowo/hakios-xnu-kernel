@@ -10,7 +10,8 @@
  * adreno=14 sends that table and the reconstructed DDR/CNOC bandwidth table, closes the legacy
  * HFI message phase with HFI_TEST, requests initial DCVS, then releases the temporary host DDR vote.
  * Explicit adreno=15 only builds the A630 CP_ME_INIT and CP_SET_SECURE_MODE bootstrap packets in
- * local memory for inspection; it does not map SQE/ring buffers or write GPU registers.
+ * local memory for inspection. adreno=16 prepares the SQE, CP ring, and RPTR scratch in the
+ * detached GPU SID0 page table; it does not attach that context or write SMMU/GPU registers.
  * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
  * during this bring-up. ZAP authentication waits for the A6xx SQE/CP initialization and
  * CP_SET_SECURE_MODE transition path; GPU command submission, runtime GPU DCVS,
@@ -97,6 +98,8 @@ extern lck_mtx_t hakios_rsc_lock;
 	A630_CP_INIT_OPERATION_MODE | A630_CP_INIT_REG_INIT_LIST)
 #define A630_CP_INIT_PACKET_DWORDS      (1u + A630_CP_INIT_ORDINALS)
 #define A630_CP_SECURE_MODE_DWORDS      2u
+#define A630_CP_RING_BYTES              (32u * 1024u)
+#define A630_SQE_FILE_PREFIX_BYTES      4u
 
 /*
  * SDM845 GCC GPU clock branches share the GPU register window's prerequisites:
@@ -364,6 +367,15 @@ struct polaris_smmu_table {
 	bool dirty;
 };
 
+struct polaris_gpu_dma_buffer {
+	vm_offset_t virtual;
+	vm_size_t allocation_size;
+	uint64_t requested_size;
+	uint64_t physical;
+	uint64_t gpu_address;
+	bool gpu_read_only;
+};
+
 enum polaris_smmu_address_space_id {
 	POLARIS_SMMU_SPACE_GPU,
 	POLARIS_SMMU_SPACE_GMU_KERNEL,
@@ -555,6 +567,11 @@ static bool polaris_gpu_core_ready;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
 static bool polaris_sqe_safe;
+static const uint8_t *polaris_sqe_image;
+static uint64_t polaris_sqe_image_size;
+static struct polaris_gpu_dma_buffer polaris_gpu_sqe_buffer;
+static struct polaris_gpu_dma_buffer polaris_gpu_ring_buffer;
+static struct polaris_gpu_dma_buffer polaris_gpu_rptr_buffer;
 
 static uint32_t
 polaris_pm4_odd_parity(uint32_t value)
@@ -2190,6 +2207,143 @@ polaris_smmu_space_root_prepare(struct polaris_smmu_address_space *space)
 		printf("adreno-sdm845: cannot allocate the detached SMMUv2 root for %s\n", space->name);
 	}
 	return ready;
+}
+
+static void
+polaris_gpu_dma_buffer_release(struct polaris_gpu_dma_buffer *buffer)
+{
+	if (buffer == NULL) {
+		return;
+	}
+	if (buffer->gpu_address != 0 && buffer->allocation_size != 0) {
+		polaris_smmu_space_unmap(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], buffer->gpu_address,
+		    buffer->allocation_size);
+		sdm845_gpu_address_free(buffer->gpu_address, buffer->allocation_size);
+	}
+	if (buffer->virtual != 0 && buffer->allocation_size != 0) {
+		kmem_free(kernel_map, buffer->virtual, buffer->allocation_size);
+	}
+	bzero(buffer, sizeof(*buffer));
+}
+
+static bool
+polaris_gpu_dma_buffer_allocate(struct polaris_gpu_dma_buffer *buffer, uint64_t size,
+	bool gpu_read_only)
+{
+	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
+	vm_size_t allocation_size;
+	vm_offset_t allocation = 0;
+	uint64_t physical, gpu_address, mapped_size = 0;
+
+	if (buffer == NULL || size == 0 || size > UINT32_MAX || buffer->virtual != 0 ||
+	    buffer->gpu_address != 0 || !polaris_smmu_supports_4k || !polaris_smmu_space_root_prepare(space)) {
+		return false;
+	}
+	allocation_size = (vm_size_t)round_page((vm_size_t)size);
+	if (allocation_size < size || allocation_size == 0 ||
+	    (allocation_size & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 ||
+	    kmem_alloc_contig(kernel_map, &allocation, allocation_size, PAGE_MASK, 0, 0,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("adreno-sdm845: step 16 could not allocate a contiguous %llu-byte A630 GPU buffer\n", size);
+		return false;
+	}
+	physical = kvtophys(allocation);
+	if ((physical & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 ||
+	    !polaris_smmu_phys_valid(physical, allocation_size)) {
+		kmem_free(kernel_map, allocation, allocation_size);
+		printf("adreno-sdm845: step 16 GPU buffer is outside the SMMU output range or misaligned\n");
+		return false;
+	}
+	for (vm_size_t offset = POLARIS_SMMU_TABLE_BYTES; offset < allocation_size;
+	    offset += POLARIS_SMMU_TABLE_BYTES) {
+		if (kvtophys(allocation + offset) != physical + offset) {
+			kmem_free(kernel_map, allocation, allocation_size);
+			printf("adreno-sdm845: step 16 GPU buffer pages are not physically contiguous\n");
+			return false;
+		}
+	}
+	gpu_address = sdm845_gpu_address(allocation_size);
+	if (gpu_address == 0 || (gpu_address & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0) {
+		if (gpu_address != 0) {
+			sdm845_gpu_address_free(gpu_address, allocation_size);
+		}
+		kmem_free(kernel_map, allocation, allocation_size);
+		printf("adreno-sdm845: step 16 could not reserve a 64-KiB-aligned A630 GPU virtual range\n");
+		return false;
+	}
+	buffer->virtual = allocation;
+	buffer->allocation_size = allocation_size;
+	buffer->requested_size = size;
+	buffer->physical = physical;
+	buffer->gpu_address = gpu_address;
+	buffer->gpu_read_only = gpu_read_only;
+	for (uint64_t offset = 0; offset < allocation_size; offset += POLARIS_SMMU_TABLE_BYTES) {
+		if (!polaris_smmu_space_map_page(space, gpu_address + offset,
+		    physical + offset, gpu_read_only)) {
+			if (mapped_size != 0) {
+				polaris_smmu_space_unmap(space, gpu_address, mapped_size);
+			}
+			polaris_gpu_dma_buffer_release(buffer);
+			printf("adreno-sdm845: step 16 could not add the A630 GPU buffer to the detached SID0 page table\n");
+			return false;
+		}
+		mapped_size += POLARIS_SMMU_TABLE_BYTES;
+	}
+	return true;
+}
+
+static bool
+polaris_gpu_cp_software_prepare(void)
+{
+	uint32_t cp_init[A630_CP_INIT_PACKET_DWORDS], secure_mode[A630_CP_SECURE_MODE_DWORDS];
+	uint64_t sqe_payload_size;
+	bool all_present;
+
+	printf("adreno-sdm845: step 16: map A630 SQE, CP ring and RPTR scratch into the detached 3D SID0 page table\n");
+	if (!polaris_sqe_safe || polaris_sqe_image == NULL ||
+	    polaris_sqe_image_size <= A630_SQE_FILE_PREFIX_BYTES || !polaris_smmu_gpu_route.valid ||
+	    polaris_gpu_core_ready || polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    polaris_smmu_backend_faulted || !polaris_smmu_supports_4k ||
+	    !polaris_a630_cp_bootstrap_packets(cp_init, sizeof(cp_init) / sizeof(cp_init[0]),
+	    secure_mode, sizeof(secure_mode) / sizeof(secure_mode[0]))) {
+		printf("adreno-sdm845: step 16 requires a validated SQE, a safe SID0/CB0 candidate, and a detached healthy GPU root\n");
+		return false;
+	}
+	all_present = polaris_gpu_sqe_buffer.virtual != 0 && polaris_gpu_ring_buffer.virtual != 0 &&
+	    polaris_gpu_rptr_buffer.virtual != 0;
+	if (all_present) {
+		printf("adreno-sdm845: step 16 CP buffers are already prepared at SQE=%#llx ring=%#llx RPTR=%#llx\n",
+		    polaris_gpu_sqe_buffer.gpu_address, polaris_gpu_ring_buffer.gpu_address,
+		    polaris_gpu_rptr_buffer.gpu_address);
+		return true;
+	}
+	if (polaris_gpu_sqe_buffer.virtual != 0 || polaris_gpu_ring_buffer.virtual != 0 ||
+	    polaris_gpu_rptr_buffer.virtual != 0 ||
+	    !polaris_smmu_space_root_prepare(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU])) {
+		printf("adreno-sdm845: step 16 found partial CP-buffer state or could not prepare the detached GPU root\n");
+		return false;
+	}
+	sqe_payload_size = polaris_sqe_image_size - A630_SQE_FILE_PREFIX_BYTES;
+	if (!polaris_gpu_dma_buffer_allocate(&polaris_gpu_sqe_buffer, sqe_payload_size, true) ||
+	    !polaris_gpu_dma_buffer_allocate(&polaris_gpu_ring_buffer, A630_CP_RING_BYTES, true) ||
+	    !polaris_gpu_dma_buffer_allocate(&polaris_gpu_rptr_buffer, PAGE_SIZE, false)) {
+		polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
+		return false;
+	}
+	memcpy((void *)polaris_gpu_sqe_buffer.virtual,
+	    polaris_sqe_image + A630_SQE_FILE_PREFIX_BYTES, (size_t)sqe_payload_size);
+	memcpy((void *)polaris_gpu_ring_buffer.virtual, cp_init, sizeof(cp_init));
+	polaris_cache_lines(polaris_gpu_sqe_buffer.virtual, polaris_gpu_sqe_buffer.allocation_size);
+	polaris_cache_lines(polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
+	polaris_cache_lines(polaris_gpu_rptr_buffer.virtual, polaris_gpu_rptr_buffer.allocation_size);
+	sdm845_gpu_mapped();
+	__asm__ volatile ("dsb sy" ::: "memory");
+	printf("adreno-sdm845: step 16 prepared SQE=%llu bytes at IOVA=%#llx, CP ring=%u bytes at IOVA=%#llx, RPTR scratch at IOVA=%#llx; SQE/ring are GPU read-only, RPTR scratch is GPU writable; no SMMU registers or CP were touched\n",
+	    sqe_payload_size, polaris_gpu_sqe_buffer.gpu_address, A630_CP_RING_BYTES,
+	    polaris_gpu_ring_buffer.gpu_address, polaris_gpu_rptr_buffer.gpu_address);
+	return true;
 }
 
 /* Prepare the HFI buffers and all detached GPU/GMU roots without enabling the SMMU. */
@@ -4135,6 +4289,8 @@ probe_firmware(void)
 	bool sqe_safe = false, valid = true;
 
 	polaris_sqe_safe = false;
+	polaris_sqe_image = NULL;
+	polaris_sqe_image_size = 0;
 	printf("adreno-sdm845: step 5: inspect staged A630 firmware and validate the runtime PAS memory region\n");
 	if (!polaris_runtime_pas_validate()) {
 		return false;
@@ -4168,6 +4324,10 @@ probe_firmware(void)
 		printf("adreno-sdm845: A630 SQE file prefix=%#x payload version word=%#x patch word=%#x; upstream safety floor %s\n",
 		    read_le32(sqe_firmware), sqe_word0, sqe_word2,
 		    sqe_safe ? "passes" : "FAILS (need version >= 0x190 or the patched marker)");
+		if (sqe_safe) {
+			polaris_sqe_image = sqe_firmware;
+			polaris_sqe_image_size = sqe_size;
+		}
 	}
 	if (!probe_zap_mdt(zap_header, zap_size)) {
 		valid = false;
@@ -5057,11 +5217,25 @@ stage_zap_shader(void)
 static void
 sdm845_gpu_stop(void)
 {
+	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
+	bool cp_buffers_present = polaris_gpu_sqe_buffer.virtual != 0 || polaris_gpu_ring_buffer.virtual != 0 ||
+	    polaris_gpu_rptr_buffer.virtual != 0;
+
 	if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
 		printf("adreno-sdm845: GPU stop could not confirm release of the temporary Apps RSC DDR vote\n");
 	}
 	if (polaris_pas_image_active && !polaris_pas_shutdown()) {
 		printf("adreno-sdm845: GPU stop could not shut down PAS image 13; metadata remains allocated\n");
+	}
+	if (cp_buffers_present) {
+		if (space->context_active || polaris_gpu_core_ready) {
+			printf("adreno-sdm845: GPU stop retains SQE/CP buffers while the 3D context or core is active\n");
+		} else {
+			polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
+			polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
+			polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
+			printf("adreno-sdm845: GPU stop released detached SQE/CP buffers with the 3D context and core inactive\n");
+		}
 	}
 }
 
@@ -5236,8 +5410,23 @@ hakios_adreno_sdm845_init(void)
 		printf("adreno-sdm845: step 15 finished; command payloads are prepared for review, but SQE/CP are stopped and rendering remains disabled\n");
 		return;
 	}
+	if (last_step == 16) {
+		printf("adreno-sdm845: step 16 runs read-only probes 1..6, then prepares SQE, a 32-KiB CP ring, and RPTR scratch in the detached GPU SID0 page table\n");
+		for (uint32_t i = 0; i < 6; i++) {
+			if (!probes[i]()) {
+				printf("adreno-sdm845: step %u failed; detached CP buffers were not prepared\n", i + 1);
+				return;
+			}
+		}
+		if (!polaris_gpu_cp_software_prepare()) {
+			printf("adreno-sdm845: step 16 failed; SMMU context, GPU registers, and CP remain untouched\n");
+			return;
+		}
+		printf("adreno-sdm845: step 16 finished; detached buffer mappings are ready for review, but SID0 is not attached, the SQE/CP remain stopped, and rendering remains disabled\n");
+		return;
+	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches GMU SID5/SID4, step 12 boots GMU/HFI with the initial rail vote, step 13 sends PERF_TBL, step 14 sends both HFI tables/HFI_TEST/DCVS, and step 15 builds CP packets without hardware writes; "
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches GMU SID5/SID4, step 12 boots GMU/HFI with the initial rail vote, step 13 sends PERF_TBL, step 14 sends both HFI tables/HFI_TEST/DCVS, step 15 builds CP packets without hardware writes, and step 16 prepares detached CP buffers without hardware writes; "
 		    "requested step %u is capped at %zu in the sequential probe path\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);
