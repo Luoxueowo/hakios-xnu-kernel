@@ -94,6 +94,9 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_CMD_DB_MAX_LEVELS         16u
 #define POLARIS_MAX_GPU_PWRLEVELS         16u
 #define POLARIS_MAX_GMU_PWRLEVELS         16u
+#define POLARIS_MAX_GPU_BUS_LEVELS        16u
+#define POLARIS_EXPECTED_GPU_BUS_LEVELS   13u
+#define POLARIS_EXPECTED_GMU_BUS_LEVELS   2u
 #define POLARIS_MAX_CLOCK_RATE_HZ         1000000000u
 
 /* SDM845 Apps RSC DRV2; resource windows and TCS counts come from the live DT. */
@@ -429,6 +432,12 @@ struct polaris_gpu_operating_point {
 	uint32_t bus_minimum;
 	uint32_t bus_maximum;
 };
+struct polaris_msm_bus_vector {
+	uint32_t source;
+	uint32_t destination;
+	uint32_t average_kbps;
+	uint32_t instantaneous_kbps;
+};
 static struct polaris_zap_segment polaris_zap_segments[A630_MDT_MAX_SEGMENTS];
 static uint32_t polaris_zap_segment_count;
 static const uint8_t *polaris_zap_mdt;
@@ -460,6 +469,10 @@ static uint32_t polaris_rpmh_total_tcs;
 static const uint8_t *polaris_cmd_db;
 static struct polaris_gpu_operating_point polaris_gpu_pwrlevels[POLARIS_MAX_GPU_PWRLEVELS];
 static uint32_t polaris_gpu_pwrlevel_count;
+static struct polaris_msm_bus_vector polaris_gpu_bus_levels[POLARIS_MAX_GPU_BUS_LEVELS];
+static uint32_t polaris_gpu_bus_level_count;
+static struct polaris_msm_bus_vector polaris_gmu_cnoc_levels[POLARIS_EXPECTED_GMU_BUS_LEVELS];
+static uint32_t polaris_gmu_cnoc_level_count;
 static uint32_t polaris_gmu_pwrlevels[POLARIS_MAX_GMU_PWRLEVELS];
 static uint32_t polaris_gmu_pwrlevel_count;
 static struct polaris_a630_hfi_state polaris_hfi_state;
@@ -888,6 +901,75 @@ polaris_runtime_pwrlevels_validate(void)
 }
 
 static bool
+polaris_dt_bus_vectors_read(DTEntry node, const char *expected_name, uint32_t expected_cases,
+	struct polaris_msm_bus_vector *vectors)
+{
+	const uint8_t *property;
+	unsigned int size = 0;
+	uint32_t cases, paths;
+
+	if (node == NULL || expected_name == NULL || vectors == NULL || expected_cases == 0 ||
+	    !polaris_dt_string_equals(node, "qcom,msm-bus,name", expected_name) ||
+	    !polaris_dt_get_u32(node, "qcom,msm-bus,num-cases", &cases) || cases != expected_cases ||
+	    !polaris_dt_get_u32(node, "qcom,msm-bus,num-paths", &paths) || paths != 1 ||
+	    SecureDTGetProperty(node, "qcom,msm-bus,vectors-KBps", (const void **)&property, &size) != kSuccess ||
+	    property == NULL || size != expected_cases * 4u * sizeof(uint32_t)) {
+		printf("adreno-sdm845: runtime %s bus table is missing, malformed, or has an unexpected usecase layout\n",
+		    expected_name != NULL ? expected_name : "unnamed");
+		return false;
+	}
+
+	for (uint32_t i = 0; i < expected_cases; i++) {
+		struct polaris_msm_bus_vector *vector = &vectors[i];
+		const uint8_t *cells = property + i * 4u * sizeof(uint32_t);
+
+		vector->source = polaris_dt_be32(cells);
+		vector->destination = polaris_dt_be32(cells + sizeof(uint32_t));
+		vector->average_kbps = polaris_dt_be32(cells + 2u * sizeof(uint32_t));
+		vector->instantaneous_kbps = polaris_dt_be32(cells + 3u * sizeof(uint32_t));
+		if (vector->source == 0 || vector->destination == 0 ||
+		    (i == 0 && (vector->average_kbps != 0 || vector->instantaneous_kbps != 0)) ||
+		    (i != 0 && (vector->source != vectors[0].source || vector->destination != vectors[0].destination ||
+		    vector->average_kbps < vectors[i - 1].average_kbps ||
+		    vector->instantaneous_kbps < vectors[i - 1].instantaneous_kbps))) {
+			printf("adreno-sdm845: runtime %s bus usecase %u has invalid path IDs or bandwidth ordering\n",
+			    expected_name, i);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+polaris_runtime_bus_tables_validate(void)
+{
+	DTEntry gpu_node = NULL, gmu_node = NULL;
+
+	if (SecureDTLookupEntry(NULL, POLARIS_GPU_DT_PATH, &gpu_node) != kSuccess || gpu_node == NULL ||
+	    SecureDTLookupEntry(NULL, POLARIS_GMU_DT_PATH, &gmu_node) != kSuccess || gmu_node == NULL ||
+	    !polaris_dt_bus_vectors_read(gpu_node, "grp3d", POLARIS_EXPECTED_GPU_BUS_LEVELS,
+	    polaris_gpu_bus_levels) ||
+	    !polaris_dt_bus_vectors_read(gmu_node, "cnoc", POLARIS_EXPECTED_GMU_BUS_LEVELS,
+	    polaris_gmu_cnoc_levels)) {
+		return false;
+	}
+	polaris_gpu_bus_level_count = POLARIS_EXPECTED_GPU_BUS_LEVELS;
+	polaris_gmu_cnoc_level_count = POLARIS_EXPECTED_GMU_BUS_LEVELS;
+
+	for (uint32_t i = 0; i < polaris_gpu_pwrlevel_count; i++) {
+		const struct polaris_gpu_operating_point *level = &polaris_gpu_pwrlevels[i];
+
+		if (level->bus_frequency >= polaris_gpu_bus_level_count || level->bus_minimum >= polaris_gpu_bus_level_count ||
+		    level->bus_maximum >= polaris_gpu_bus_level_count) {
+			printf("adreno-sdm845: GPU powerlevel %u references bus usecase outside the %u-entry grp3d table\n",
+			    i, polaris_gpu_bus_level_count);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
 polaris_dt_has_reg64(DTEntry node, uint64_t address, uint64_t length)
 {
 	const uint8_t *reg;
@@ -1286,10 +1368,10 @@ polaris_runtime_power_validate(DTEntry gpu_node, DTEntry gmu_node)
 	if (!polaris_runtime_rpmh_validate()) {
 		return false;
 	}
-	if (!polaris_runtime_pwrlevels_validate()) {
+	if (!polaris_runtime_pwrlevels_validate() || !polaris_runtime_bus_tables_validate()) {
 		return false;
 	}
-	printf("adreno-sdm845: runtime DT matches the SDM845 GPU/GFXCC clock tree, GPU/GMU supply domains, and CX/MX/GFX rails\n");
+	printf("adreno-sdm845: runtime DT matches the SDM845 GPU/GFXCC clock tree, GPU/GMU supply domains, CX/MX/GFX rails, and GPU/CNOC bus tables\n");
 	return true;
 }
 
@@ -3440,6 +3522,16 @@ probe_rpmh(void)
 	printf("; GMU pwrlevels (Hz):");
 	for (uint32_t i = 0; i < polaris_gmu_pwrlevel_count; i++) {
 		printf(" %u:%u", i, polaris_gmu_pwrlevels[i]);
+	}
+	printf("; grp3d bus usecases (index:AB/IB KB/s):");
+	for (uint32_t i = 0; i < polaris_gpu_bus_level_count; i++) {
+		printf(" %u:%u/%u", i, polaris_gpu_bus_levels[i].average_kbps,
+		    polaris_gpu_bus_levels[i].instantaneous_kbps);
+	}
+	printf("; GMU CNOC usecases (index:AB/IB KB/s):");
+	for (uint32_t i = 0; i < polaris_gmu_cnoc_level_count; i++) {
+		printf(" %u:%u/%u", i, polaris_gmu_cnoc_levels[i].average_kbps,
+		    polaris_gmu_cnoc_levels[i].instantaneous_kbps);
 	}
 	printf("\n");
 	printf("adreno-sdm845: RPMh discovery complete; no TCS registers or rail votes were written\n");

@@ -83,8 +83,11 @@ allow it. A successful firmware boot alone is not a completed driver.
 - The same preflight now validates the Polaris Apps RPMh DRV2 node, its separate DRV/TCS windows,
   its active/sleep/wake/control TCS counts, and the `cx.lvl`/`gfx.lvl` regulator mailbox links.
   `adreno=8` runs the existing read-only steps 1–6, skips PAS staging step 7, then reads DRV2
-  revision/configuration/status and the AOP CMD_DB CX/GFX level tables. It accepts only the
-  register layouts documented for RPMh RSC v2.7 and v3.0, and sends no request or TCS write.
+  revision/configuration/status, the AOP CMD_DB CX/GFX level tables, and GPU/GMU bus vectors from
+  runtime DT. It accepts only the register layouts documented for RPMh RSC v2.7 and v3.0, verifies
+  all 13 `grp3d` and 2 `cnoc` usecases plus every GPU powerlevel's bus indices, and sends no RPMh
+  request or TCS write. This validates source data only; it does not generate the per-usecase TCS
+  commands required by the GMU HFI bandwidth table.
   `adreno=9` runs steps 1–6, skips PAS staging, and prepares the detached HFI allocation and GMU
   kernel software page tables. This allocates kernel memory but does not write SMMU/GMU registers,
   send an HFI message, or start firmware. Neither diagnostic has run under HakiOS on the phone.
@@ -240,7 +243,15 @@ The same probe now validates and reports the runtime GPU and GMU operating-point
 live tree has eight GPU entries (710, 675, 596, 520, 414, 342, 257, and 0 MHz) with per-entry bus
 frequency/minimum/maximum indices, and three GMU entries (0, 200, and 500 MHz). These values are
 read from DT; the driver does not assume that the checked-in or upstream frequency table matches
-the live tree.
+the live tree. The GPU client `grp3d` exposes 13 one-path `qcom,msm-bus,vectors-KBps` usecases and
+the GMU client `cnoc` exposes 2. Preflight checks stable source/destination IDs, zero bandwidth in
+the first case, monotonically nondecreasing AB/IB values, and that each GPU powerlevel's
+`qcom,bus-freq`, `qcom,bus-min`, and `qcom,bus-max` indices fit the 13-case table. The read-only
+step logs each case in KB/s. Qualcomm's KGSL asks the bus framework for a TCS command set for every
+case and copies its command addresses, wait mask, and data into `H2F_MSG_BW_VOTE_TBL`; bus vectors
+alone are not interchangeable with those commands
+([`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/kgsl_gmu.c),
+[`adreno-gmu.txt`](https://android.googlesource.com/kernel/msm/%2B/refs/heads/android-msm-coral-4.14-android10-qpr1/Documentation/devicetree/bindings/gpu/adreno-gmu.txt)).
 
 The Qualcomm A6xx KGSL flow uses the `gfx.lvl`/`cx.lvl` ARC tables to build GMU voltage votes from
 GPU/GMU operating points, then sends performance and bandwidth indices through the GMU DCVS/HFI
@@ -252,8 +263,10 @@ A630 legacy queue/message contract, not assumptions taken from newer HFI variant
 [`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm.git/+/7bbb67403d95f83d95e0ea464f972f247475d0d4/drivers/gpu/msm/adreno-gpulist.h),
 [`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/+/541919e72ee1156c0054952dd11d5066372095a8/drivers/gpu/msm/kgsl_hfi.c),
 [`sdm845-v2.dtsi`](https://android.googlesource.com/kernel/msm/+/5f65a2ac2505d5e0c122d5e54a58194c873b426c/arch/arm64/boot/dts/qcom/sdm845-v2.dtsi)).
-The current step 8 remains read-only: it discovers the tables and TCS state but sends neither an
-HFI message nor an RPMh request.
+The current step 8 remains read-only: it validates ARC and bus-vector inputs and reports active TCS
+status, but does not reconstruct RPMh command payloads, send an HFI message, or issue an RPMh
+request. The TCS command reconstruction and GPU/GMU voltage dependency tables remain prerequisites
+for a complete DCVS setup.
 
 The A630 legacy HFI v1 wire format is now isolated in `drivers/gpu/hakios.adreno.hfi.h`. It
 provides bounded shared-table initialization, command queue writes, response queue reads,
