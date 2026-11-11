@@ -102,6 +102,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   the aligned image span with `PAS_MEM_SETUP`, copies `.b02`, then shuts PAS down. It deliberately
   defers `PAS_AUTH_AND_RESET` until the secure GPU SMMU route is verified. This write stage has not
   been invoked on the device; `ready()` remains false.
+- `adreno=11` is an explicit SMMUv2 write stage. It runs steps 1–6, prepares the detached HFI
+  allocation/page tables, then performs a fresh read-only SMMU scan. It proceeds only when the
+  runtime DT allows dynamic non-static routes, the SMMU client interface is enabled, the GMU is
+  clocked with CM3 held in reset, the 3D core is off, and the selected GMU-kernel context and
+  SID5 route still match the blank/untranslated snapshot. It installs only the GMU-kernel
+  stage-1 context and SID5 route, verifies register readbacks, and attempts rollback on failure.
+  It does not attach SID4 or SID0, authenticate ZAP, start the GMU/HFI, or enable rendering. This
+  stage has not been run on the phone because SMMU write ownership under the active hypervisor is
+  still unverified; `ready()` remains false.
 
 ## Polaris hardware facts
 
@@ -305,8 +314,14 @@ The operations table includes software map, commit, unmap, cache-maintenance and
 invalidation callbacks; ASID invalidation is reachable only after a later bring-up stage marks a
 verified context active. The detached HFI preparation now forms the stage-1 register image with
 the measured output-address encoding, AArch64 ASID tags in TTBR0/TTBR1, 39-bit input size and
-walk-coherency attributes; it still does not install that image. The runtime SMMU probe now reads
-its stream IDs from the validated DT tuples instead of relying on a duplicate hardcoded list.
+walk-coherency attributes. Explicit `adreno=11` now installs that image only for the GMU-kernel
+bank, writes the S2CR before enabling a new SMR, and keeps `SCTLR.M` last in context setup. It
+rechecks the selected context and route, verifies readback, and rolls back the route/context if a
+write is rejected. The register order follows upstream Linux's SMMUv2 context-bank setup
+([`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c)).
+The runtime SMMU probe now reads its stream IDs from the validated DT tuples instead of relying on
+a duplicate hardcoded list. Only source-level build evidence exists for this write stage; it has
+not been executed on Polaris, and hypervisor write access remains an unresolved requirement.
 
 The backend boundary must carry at least: SoC/GPU identity, firmware file set, MMIO resources,
 GMEM and frequency capabilities, SMMU implementation and stream/context assignments, startup and
@@ -348,11 +363,13 @@ bring-up and a bounded test submission.
    The local firmware probe validates the ZAP MDT layout and applies the upstream SQE check to the
    payload after its 4-byte file prefix; the extracted SQE passes the version floor. The read-only
    SMMUv2 probe scans stream routes and context registers and produces conditional CB/SMR
-   candidates; step 9 now also builds, but does not install, the GMU-kernel stage-1 context image.
-   Run the diagnostics under HakiOS before treating any assignment or image as live. Then verify
-   HYP ownership, install independent 3D/GMU contexts with verified attributes, validate A630 CP
-   register protection, bring up GMU and core mappings, ring and fences, and exercise the mapper
-   on-device. Keep the backend disabled until those pieces are verified.
+   candidates; step 9 builds a detached GMU-kernel context image and step 11 can install just that
+   context/SID route with readback and rollback. Neither step 11 nor any SMMU write stage has been
+   run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
+   a controlled HakiOS boot. Then verify the GMU-kernel attach and extend it to the GMU-user and
+   3D contexts with verified attributes, validate A630 CP register protection, bring up GMU and
+   core mappings, ring and fences, and exercise the mapper on-device. Keep the backend disabled
+   until those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
    command buffers; bounded test commands complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno
