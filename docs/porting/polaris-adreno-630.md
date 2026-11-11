@@ -579,6 +579,18 @@ GPU OOB/core setup, authenticated PAS/ZAP, initialized CP in unsecured mode, and
 step 21 fence smoke test. The separate backend-enabled flag still has no writer, so `ready()` stays
 false. No callback falls through into Redwood's SMMUv500 or register state.
 
+Per-client isolation should use a stage-1 SMMU root and ASID per `HakiosGPUUserClient`, with client
+BOs mapped only in that root. The A6xx submit path already switches the active SID0 context from
+the trusted ring using `CP_SMMU_TABLE_UPDATE` (TTBR0, ASID, ContextIDR and context-bank number)
+before dispatching the client's IBs, then invalidates GPU caches
+([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
+[`adreno_iommu.c`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_iommu.c)).
+The HakiOS backend needs an opaque address-space handle through map, unmap and submit; each root
+must also map the kernel SQE, ring and fence pages at the same private IOVAs so the single hardware
+ring can continue across a context switch. Keep the public-client gate closed until it is confirmed
+that user IBs cannot issue their own table switches or reach those private mappings, and make
+client teardown retain any root and BOs still referenced by unfinished fences.
+
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
 software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use the private range
 `[0x00010000, 0x40000000)`; the shared service receives client allocations only from
@@ -716,9 +728,10 @@ bounded hardware submission checks.
   Kernel-owned SQE, ring and scratch pages now have privileged-only SMMU descriptors, and
   `CP_RB_CNTL_NO_UPDATE` disables CP writes to the RPTR shadow. These controls do not isolate
   client buffers: all current client BOs still share the SID0 page table, so clients can address
-  one another's mapped BOs. Establish and validate per-client address spaces or a kernel-validated
-  submission model before enabling public submissions; hardware enforcement of the privileged
-  SMMU mappings also remains unverified on the phone.
+  one another's mapped BOs. Implement the per-client root/ASID switch through the trusted ring,
+  map the private CP pages into each client root, and verify that user IBs cannot issue table-switch
+  packets or access those pages. Hardware enforcement of the privileged SMMU mappings also remains
+  unverified on the phone.
 - A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence
   stage and is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
   legacy-HFI slumber; it then checks GMU/CX/GX state, asserts CM3 reset, shuts down PAS, detaches
