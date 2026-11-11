@@ -342,7 +342,8 @@ allow it. A successful firmware boot alone is not a completed driver.
   clears the context bank and restores its original S2CR before releasing private queue buffers.
   Any failed check retains the possibly referenced memory. This path accepts successful idle
   startup boundaries from step 17 onward, including CP initialization before the fence smoke test;
-  failed mid-stage and earlier partial-start cleanup remain unavailable. Its register
+  failures in a verified SMMU-only state through step 11 can also be detached before GMU startup.
+  Later mid-stage cleanup remains conservative. Its register
   sequence is based on Qualcomm's A630 legacy-HFI slumber path and
   no-GBIF bus drain in [`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/b6410c3f75259c0ca2df45a01838d2e46272723e/drivers/gpu/msm/adreno_a6xx_gmu.c) and
   [`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/63407d3081a6b406d94bd7d96ff2ca38fa7df236/drivers/gpu/drm/msm/adreno/a6xx_gpu.c). This implementation has not been run on hardware.
@@ -358,9 +359,13 @@ allow it. A successful firmware boot alone is not a completed driver.
   memory if CP idle, VBIF drain, GMU slumber, power-off, reset, PAS shutdown, or SMMU detach cannot
   be confirmed. Panic/loader-return `quiesce` uses bounded MMIO/SMC
   operations; if it cannot prove the DMA routes are isolated, it fail-stops rather than returning
-  control while the loader may reuse memory. Partial orderly-start cleanup is not implemented.
-  Neither shutdown path has been run on-device; do not run write stages on-device until they are
-  validated.
+  control while the loader may reuse memory. A pre-GMU-start partial-stop boundary now handles
+  SMMU-only startup through step 11: it requires a healthy backend, active CX/GMU clock, CM3 reset,
+  and GX/GFX3D off when SID0 is attached, then detaches SID4/SID5/SID0 with ASID synchronization and
+  route/context readbacks. If any prerequisite or detach check fails, it retains page tables and
+  mappings. Failures after GMU firmware release, ARC/DCVS or boot-rail votes, PAS activity, core
+  configuration, or CP startup still use conservative retention unless they reach the verified
+  healthy stop boundary. Neither shutdown path has been run on-device.
 
 ## Polaris hardware facts
 
@@ -621,10 +626,11 @@ Keep the existing MSM/HakiosGPU client contract where it is genuinely hardware i
 shared service and lifecycle hooks through the selected backend. Redwood keeps its existing
 implementation behind that boundary. Polaris selects its own profile and a not-ready operations
 table. Its software map, commit, unmap and cache-maintenance callbacks are implemented; GMU
-firmware/HFI startup and initial ARC/DCVS requests are staged, while complete CX/GX sequencing,
-hardware validation of GMU-user/3D SMMU attachment, hardware-validated orderly stop and quiesce,
-recovery and thermal hooks are still missing. The orderly stop path handles the fully initialized
-kernel-owned fence stage, but has not been run on a phone.
+firmware/HFI startup, initial ARC/DCVS requests, GX OOB bring-up, A630 core/CP initialization and
+the client-root IB path are implemented behind explicit stages. Hardware validation of those
+stages, GMU-user/3D SMMU attachment, orderly stop and quiesce is still missing, as are hang
+recovery and thermal hooks. The orderly stop path handles the fully initialized kernel-owned fence
+stage, but has not been run on a phone.
 The A630 backend has `submit`, `done`, `last`, and `report` callbacks. Without APRIV, the client
 callback switches SID0 from the CPU only at a full CP/RBBM idle boundary. It scrubs the shared ring,
 switches to the client root, submits only client IB addresses, waits for complete GPU idle, then
@@ -748,9 +754,10 @@ command isolation review, and bounded hardware submission checks.
    scheduler. Step 23 exercises one CP memory-write IB through this path. Validate register
    protection, root switching, ring scrubbing, fence visibility,
    orderly stop and loader-return quiesce before accepting submissions. The `gpu=1` startup path
-   now requests bounded orderly stop after a failed guarded bring-up; validate each partial-start
-   boundary on the phone and add cleanup for states the stop path currently retains. The stop path
-   does not yet remove all inherited CX/GMU parent-domain and clock votes.
+   now requests bounded orderly stop after a failed guarded bring-up. The stop path can roll back a
+   verified SMMU-only state through step 11; add and validate cleanup for later partial-start
+   boundaries on the phone. It does not yet remove all inherited CX/GMU parent-domain and clock
+   votes.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; client workloads and orderly stop/loader-return quiesce are validated on the phone.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache

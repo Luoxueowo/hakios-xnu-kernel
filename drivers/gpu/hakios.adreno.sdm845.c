@@ -6299,6 +6299,7 @@ sdm845_gpu_stop(void)
 	bool smmu_contexts_active = polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active;
+	bool pre_gmu_start_state;
 	bool gx_off = false;
 	bool cp_idle_state = !polaris_gpu_cp_started && !polaris_gpu_cp_initialized;
 
@@ -6316,10 +6317,46 @@ sdm845_gpu_stop(void)
 	polaris_gpu_client_submission_enabled = false;
 	polaris_smmu_backend_enabled = false;
 	polaris_gpu_ring_submit_ready = false;
-	if (!polaris_gmu_firmware_started && !polaris_gmu_hfi_ready && !polaris_gmu_boot_rail_active &&
+	pre_gmu_start_state = !polaris_gmu_firmware_started && !polaris_gmu_hfi_ready &&
+	    !polaris_gmu_boot_rail_active &&
 	    !polaris_gmu_temp_bus_vote_active && !polaris_gpu_oob_active && !polaris_gpu_core_ready &&
 	    !polaris_gpu_core_configured && !polaris_gpu_cp_started && !polaris_gpu_cp_initialized &&
-	    !polaris_pas_image_active && !smmu_contexts_active) {
+	    !polaris_gpu_sptprac_enabled_by_driver && !polaris_pas_image_active &&
+	    !polaris_smmu_backend_faulted && polaris_gpu_context_probe_client.smmu.root == NULL &&
+	    !polaris_gpu_context_probe_client.quarantined &&
+	    (polaris_gpu_active_space == NULL ||
+	    polaris_gpu_active_space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU]);
+	if (pre_gmu_start_state && smmu_contexts_active) {
+		uint32_t cx, gmu_clock, gx, gfx3d_clock;
+
+		/* Step 11 may have installed the SMMU routes before GMU firmware starts.
+		 * Only detach that boundary while CX/GMU MMIO is live and CM3 is reset. */
+		if (!polaris_gmu_domain_ready || !probe_gpucc_bus("pre-start stop") ||
+		    !map_block(&gpucc) || !map_block(&gmu) || !map_block(&smmu)) {
+			printf("adreno-sdm845: GPU stop retained pre-start SMMU contexts because CX/GMU/GPUCC/SMMU access could not be confirmed\n");
+			return;
+		}
+		cx = probe_read(&gpucc, GPUCC_CX_GDSCR);
+		gmu_clock = probe_read(&gpucc, GPUCC_CX_GMU_CBCR);
+		gx = probe_read(&gpucc, GPUCC_GX_GDSCR);
+		gfx3d_clock = probe_read(&gpucc, GPUCC_GX_GFX3D_CBCR);
+		if ((cx & GDSC_POWER_ON) == 0 ||
+		    (gmu_clock & (CBCR_ENABLE | CBCR_OFF)) != CBCR_ENABLE ||
+		    (probe_read(&gmu, GMU_CM3_SYSRESET) & 1u) == 0 ||
+		    (polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active &&
+		    ((gx & GDSC_POWER_ON) != 0 ||
+		    (gfx3d_clock & (CBCR_ENABLE | CBCR_OFF)) != CBCR_OFF))) {
+			printf("adreno-sdm845: GPU stop retained pre-start SMMU contexts because GMU reset or GX/GFX3D-off readback failed\n");
+			return;
+		}
+		if (!polaris_smmu_gmu_contexts_detach() || !polaris_smmu_gpu_context_detach()) {
+			printf("adreno-sdm845: GPU stop retained pre-start page tables after SMMU context detach could not be verified\n");
+			return;
+		}
+		smmu_contexts_active = false;
+		printf("adreno-sdm845: GPU stop detached pre-GMU-start SID0/SID4/SID5 contexts after verified CM3 reset and GX/GFX3D-off state\n");
+	}
+	if (pre_gmu_start_state && !smmu_contexts_active) {
 		if (cp_buffers_present) {
 			polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
 			polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
