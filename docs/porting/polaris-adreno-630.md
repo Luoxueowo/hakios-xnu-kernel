@@ -274,17 +274,18 @@ allow it. A successful firmware boot alone is not a completed driver.
   This write stage has not been run on the phone.
 - The A630 backend keeps public-client submission disabled. Step 21 only submits one
   kernel-owned fence, and `ready()` requires a separate client-enable latch that bring-up never
-  raises. Orderly stop handles that fully initialized diagnostic state, and loader-return
-  quiesce now has a bounded reset/route-fault path. Both remain unvalidated on the phone, so clients
-  stay disabled.
+  raises. Orderly stop accepts the successful idle GPU stages from GX startup through the kernel
+  fence smoke test; loader-return quiesce uses a bounded reset/route-fault path. Neither has been
+  validated on the phone, so clients stay disabled.
 - `sdm845_gpu_stop()` first confirms the kernel fence and CP are idle, drains all four Polaris
   VBIF XINs, releases the GPU/boot OOB holds, and requests the A630 legacy-HFI slumber state using
   the DT-selected initial performance and bandwidth indices. It checks GMU slumber, CX busy and
   AHB-fence state, waits for GPUCC to report GX/GFX3D off, then asserts and verifies CM3 reset.
   After PAS shutdown it faults and detaches GMU SID4/SID5 and GPU SID0, synchronizes each ASID,
   clears the context bank and restores its original S2CR before releasing private queue buffers.
-  Any failed check retains the possibly referenced memory. This path accepts only the complete
-  kernel-owned fence stage; partial orderly-start cleanup remains unavailable. Its register
+  Any failed check retains the possibly referenced memory. This path accepts successful idle
+  startup boundaries from step 17 onward, including CP initialization before the fence smoke test;
+  failed mid-stage and earlier partial-start cleanup remain unavailable. Its register
   sequence is based on Qualcomm's A630 legacy-HFI slumber path and
   no-GBIF bus drain in [`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/b6410c3f75259c0ca2df45a01838d2e46272723e/drivers/gpu/msm/adreno_a6xx_gmu.c) and
   [`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/63407d3081a6b406d94bd7d96ff2ca38fa7df236/drivers/gpu/drm/msm/adreno/a6xx_gpu.c). This implementation has not been run on hardware.
@@ -295,9 +296,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   the SMMUv2 stream-routing rules in Linux [`arm-smmu.c`](https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/%2B/77a1c68a96f4e018860033f3827602014a4f1663/drivers/iommu/arm-smmu.c).
 - The orderly stop entry dispatches backend `stop()` even while `ready()` is false. If HakiosGPU
   has not created its client lock yet, the stop path dispatches directly because no clients can
-  exist. The A630 stop hook handles only the completed kernel-owned fence stage and retains all
-  hardware-referenced memory if CP idle, VBIF drain, GMU slumber, power-off, reset, PAS shutdown,
-  or SMMU detach cannot be confirmed. Panic/loader-return `quiesce` uses bounded MMIO/SMC
+  exist. The A630 stop hook accepts successful idle GX/CP startup boundaries from step 17 onward,
+  including the initialized secure-mode stages before step 21, and retains all hardware-referenced
+  memory if CP idle, VBIF drain, GMU slumber, power-off, reset, PAS shutdown, or SMMU detach cannot
+  be confirmed. Panic/loader-return `quiesce` uses bounded MMIO/SMC
   operations; if it cannot prove the DMA routes are isolated, it fail-stops rather than returning
   control while the loader may reuse memory. Partial orderly-start cleanup is not implemented.
   Neither shutdown path has been run on-device; do not run write stages on-device until they are
@@ -709,8 +711,8 @@ bounded hardware submission checks.
 - Do not assume CP APRIV can separate kernel and client mappings on this device: Qualcomm's KGSL
   `a630v2` catalog entry does not advertise `ADRENO_APRIV`, unlike the deprecated A630v1 profile
   ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)). The current IOVA ranges are disjoint but share the same SID0 page table; a safe command-stream/private-memory isolation design remains a readiness blocker.
-- A630 stop after SQE startup is implemented only for the completed kernel-owned fence stage and
-  is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
+- A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence
+  stage and is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
   legacy-HFI slumber; it then checks GMU/CX/GX state, asserts CM3 reset, shuts down PAS, detaches
   SID4/SID5/SID0 and releases private CP buffers. `gmu_domain_ready` remains only an initial
   availability observation. A failed check leaves the affected resources attached. The normal

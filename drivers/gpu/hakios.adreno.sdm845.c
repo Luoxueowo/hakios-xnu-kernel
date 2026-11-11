@@ -5935,6 +5935,7 @@ sdm845_gpu_stop(void)
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active;
 	bool gx_off = false;
 	bool client_submission_was_enabled = polaris_gpu_client_submission_enabled;
+	bool cp_idle_state = !polaris_gpu_cp_started && !polaris_gpu_cp_initialized;
 
 	/* Keep both client gates closed before touching any hardware state. */
 	polaris_gpu_client_submission_enabled = false;
@@ -5957,27 +5958,32 @@ sdm845_gpu_stop(void)
 		polaris_gmu_cm3_reset_confirmed = false;
 		return;
 	}
+	if (polaris_gpu_cp_started || polaris_gpu_cp_initialized) {
+		cp_idle_state = polaris_gpu_cp_started && polaris_gpu_cp_initialized && map_block(&gpu) &&
+		    polaris_a630_cp_idle_for_stop();
+	}
 	if (!polaris_gmu_slumber_confirmed &&
 	    (!polaris_gmu_firmware_started || !polaris_gmu_hfi_ready || !polaris_gmu_hfi_sealed ||
 	    !polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready ||
-	    !polaris_gpu_core_ready || !polaris_gpu_core_configured ||
-	    !polaris_gpu_cp_started || !polaris_gpu_cp_initialized || !polaris_gpu_unsecured_mode ||
-	    !polaris_gpu_fence_smoke_test_done || client_submission_was_enabled ||
+	    !polaris_gpu_core_ready || !polaris_gpu_oob_active ||
+	    ((polaris_gpu_cp_started || polaris_gpu_cp_initialized) && !cp_idle_state) ||
+	    polaris_smmu_backend_faulted || client_submission_was_enabled ||
 	    polaris_gmu_temp_bus_vote_active || !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active)) {
-		printf("adreno-sdm845: GPU stop retained partial startup state; orderly stop only accepts the fully idle kernel-owned A630 fence stage\n");
+		printf("adreno-sdm845: GPU stop retained partial or faulted startup state; the A630 stop path requires healthy HFI/GX state and an idle CP boundary\n");
 		return;
 	}
-	if (polaris_gpu_cp_started && !polaris_gmu_slumber_confirmed) {
+	if ((polaris_gpu_core_ready || polaris_gpu_core_configured || polaris_gpu_cp_started) &&
+	    !polaris_gmu_slumber_confirmed) {
 		if (gpucc.virtual == 0 ||
 		    (probe_read(&gpucc, GPUCC_GX_GDSCR) & GDSC_POWER_ON) == 0 ||
 		    (probe_read(&gpucc, GPUCC_GX_GFX3D_CBCR) & (CBCR_ENABLE | CBCR_OFF)) != CBCR_ENABLE) {
-			printf("adreno-sdm845: GPU stop retained state because GX/GFX3D is not confirmed on for CP idle checks\n");
+			printf("adreno-sdm845: GPU stop retained state because GX/GFX3D is not confirmed on for quiesce checks\n");
 			return;
 		}
-		if (!polaris_a630_cp_idle_for_stop()) {
-			printf("adreno-sdm845: GPU stop retained CP/SMMU/DMA state because RPTR/WPTR, CP status, or the smoke-test fence is not idle\n");
+		if (polaris_gpu_cp_started && !cp_idle_state) {
+			printf("adreno-sdm845: GPU stop retained CP/SMMU/DMA state because RPTR/WPTR, CP status, or its fence word is not idle\n");
 			return;
 		}
 		if (!polaris_a630_vbif_drain_for_stop()) {
@@ -6507,6 +6513,8 @@ polaris_a630_cp_ring_start(void)
 		}
 		if (ring_rptr == A630_CP_INIT_PACKET_DWORDS &&
 		    (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0) {
+			polaris_gpu_ring_write_pointer = ring_wptr;
+			polaris_gpu_last_fence = 0;
 			polaris_gpu_cp_initialized = true;
 			printf("adreno-sdm845: step 19 CP_ME_INIT retired: RPTR=%u CP idle; ZAP is authenticated, secure mode remains enabled, and user submissions remain disabled\n",
 			    ring_rptr);
@@ -6585,6 +6593,7 @@ polaris_a630_cp_set_unsecured_mode(void)
 			goto fault;
 		}
 		if (ring_rptr == target_rptr && (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0) {
+			polaris_gpu_ring_write_pointer = target_rptr;
 			polaris_gpu_unsecured_mode = true;
 			printf("adreno-sdm845: step 20 CP_SET_SECURE_MODE(0) retired: RPTR=%u CP idle; user submissions remain disabled\n",
 			    ring_rptr);
