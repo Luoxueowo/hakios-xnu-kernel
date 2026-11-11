@@ -106,17 +106,20 @@ bool hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphra
 
 /*
  * The GPU kept on (boot-arg adreno_keep=1), for drivers/gpu/hakios.gpu.cpp: see "the GPU kept on"
- * in drivers/gpu/hakios.adreno.c. One caller at a time.
+ * in drivers/gpu/hakios.adreno.c. Userclient operations are serialized; mappings take an opaque
+ * backend-specific address-space handle.
  */
 bool hakios_gpu_ready(void);
 bool hakios_gpu_parameter(uint32_t which, uint64_t *value);
+bool hakios_gpu_client_space_create(void **space);
+void hakios_gpu_client_space_destroy(void *space, bool safe_to_free);
 uint64_t hakios_gpu_address(uint64_t size);
 void hakios_gpu_address_free(uint64_t address, uint64_t size);
-bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
-void hakios_gpu_mapped(void);
-void hakios_gpu_unmap(uint64_t address, uint64_t size);
+bool hakios_gpu_map(void *space, uint64_t address, uint64_t phys, bool read_only);
+void hakios_gpu_mapped(void *space);
+void hakios_gpu_unmap(void *space, uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void *start, uint64_t size);
-uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+uint32_t hakios_gpu_submit(void *space, const uint64_t *addresses, const uint32_t *words, uint32_t count);
 bool hakios_gpu_done(uint32_t fence);
 uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);

@@ -92,6 +92,8 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_WAIT_MEM_WRITES         0x12u
 #define A630_CP_INDIRECT_BUFFER_PFE    0x3fu
 #define A630_CP_EVENT_WRITE             0x46u
+#define A630_CP_SMMU_TABLE_UPDATE       0x53u
+#define A630_CP_CACHE_INVALIDATE        0x31u
 #define A630_CP_CCU_INVALIDATE_DEPTH    0x18u
 #define A630_CP_CCU_INVALIDATE_COLOR    0x19u
 #define A630_CP_CACHE_FLUSH_TS          0x04u
@@ -114,7 +116,7 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_RING_BYTES              (32u * 1024u)
 #define A630_CP_RING_DWORDS             (A630_CP_RING_BYTES / sizeof(uint32_t))
 #define A630_CP_SUBMIT_MAX_IBS           128u
-#define A630_CP_SUBMIT_FIXED_DWORDS      9u
+#define A630_CP_SUBMIT_FIXED_DWORDS      16u
 #define A630_CP_SUBMIT_MAX_DWORDS        (A630_CP_SUBMIT_FIXED_DWORDS + 4u * A630_CP_SUBMIT_MAX_IBS)
 #define A630_CP_RB_CNTL_DEFAULT         0x0000020cu
 #define A630_CP_RB_CNTL_NO_UPDATE       0x08000000u
@@ -435,12 +437,15 @@ static const struct polaris_a630_protected_reg polaris_a630_protected_regs[A630_
 #define POLARIS_GPU_VA_GRANULES          ((POLARIS_GPU_VA_END - POLARIS_GPU_VA_START) / POLARIS_GPU_VA_ALIGN)
 #define POLARIS_GPU_VA_MAX_RANGES        ((POLARIS_GPU_VA_GRANULES + 1) / 2)
 #define POLARIS_GPU_VA_MAX_ALLOCS        POLARIS_GPU_VA_GRANULES
+#define POLARIS_GPU_MAX_CLIENT_SPACES    64u
+#define POLARIS_GPU_CLIENT_ASID_FIRST    4u
 #define POLARIS_SMMU_MAX_STREAM_IDS      8u
 #define POLARIS_SMMU_MAX_CONTEXT_BANKS   256u
 #define POLARIS_SMMU_TABLE_BYTES         4096u
 #define POLARIS_SMMU_ADDRESS_SPACE_COUNT 3u
 #define POLARIS_SMMU_TABLES_PER_SPACE    2053u /* one L1, four L2, 2048 L3 tables cover 4 GiB */
-#define POLARIS_SMMU_MAX_TABLES          (POLARIS_SMMU_ADDRESS_SPACE_COUNT * POLARIS_SMMU_TABLES_PER_SPACE)
+#define POLARIS_SMMU_MAX_TABLES          ((POLARIS_SMMU_ADDRESS_SPACE_COUNT + POLARIS_GPU_MAX_CLIENT_SPACES) * \
+						POLARIS_SMMU_TABLES_PER_SPACE)
 #define POLARIS_SMMU_CACHE_INDEX_NONE    UINT32_MAX
 #define POLARIS_SMMU_PTE_TABLE           3ull
 #define POLARIS_SMMU_PTE_PAGE            3ull
@@ -476,6 +481,7 @@ struct polaris_smmu_table {
 	uint64_t *entries;
 	uint64_t phys;
 	bool dirty;
+	bool allocated;
 };
 
 struct polaris_gpu_dma_buffer {
@@ -504,7 +510,15 @@ struct polaris_smmu_address_space {
 	uint32_t cached_l2_index;
 	uint32_t context_bank;
 	uint32_t asid;
+	uint64_t mapped_pages;
 	bool context_active;
+};
+
+struct polaris_gpu_client_space {
+	struct polaris_smmu_address_space smmu;
+	uint32_t private_mapped_pages;
+	bool allocated;
+	bool quarantined;
 };
 
 struct polaris_smmu_context_image {
@@ -560,6 +574,9 @@ static struct polaris_smmu_address_space polaris_smmu_spaces[POLARIS_SMMU_ADDRES
 		.asid = 3,
 	},
 };
+static LCK_GRP_DECLARE(polaris_gpu_client_lck_grp, "polaris-gpu-client-space");
+static LCK_MTX_DECLARE(polaris_gpu_client_lck, &polaris_gpu_client_lck_grp);
+static struct polaris_gpu_client_space polaris_gpu_client_spaces[POLARIS_GPU_MAX_CLIENT_SPACES];
 static uint32_t polaris_smmu_oas_bits;
 static uint32_t polaris_smmu_oas_encoding;
 static bool polaris_smmu_supports_4k;
@@ -968,11 +985,13 @@ static struct probe_block gcc_gpu_clocks = { "gcc-gpu-clocks", POLARIS_GCC_GPU_C
 	POLARIS_GCC_GPU_CLOCKS_SIZE, 0 };
 static struct probe_block polaris_rpmh_drv = { "apps-rpmh-drv2", 0, 0, 0 };
 
-static bool sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only);
-static void sdm845_gpu_mapped(void);
-static void sdm845_gpu_unmap(uint64_t address, uint64_t size);
+static bool sdm845_gpu_client_space_create(void **space);
+static void sdm845_gpu_client_space_destroy(void *space, bool safe_to_free);
+static bool sdm845_gpu_map(void *space, uint64_t address, uint64_t phys, bool read_only);
+static void sdm845_gpu_mapped(void *space);
+static void sdm845_gpu_unmap(void *space, uint64_t address, uint64_t size);
 static void sdm845_gpu_to_memory(void *start, uint64_t size);
-static uint32_t sdm845_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+static uint32_t sdm845_gpu_submit(void *space, const uint64_t *addresses, const uint32_t *words, uint32_t count);
 static bool sdm845_gpu_done(uint32_t fence);
 static uint32_t sdm845_gpu_last(void);
 static void sdm845_gpu_report(const char *why);
@@ -983,6 +1002,8 @@ static bool polaris_a630_vbif_drain_for_stop(void);
 static bool polaris_a630_gmu_request_slumber(void);
 static bool polaris_smmu_gmu_contexts_detach(void);
 static bool polaris_smmu_gpu_context_detach(void);
+static bool polaris_smmu_space_root_prepare(struct polaris_smmu_address_space *space);
+static bool polaris_smmu_space_destroy(struct polaris_smmu_address_space *space);
 static uint32_t smmu_id_size_to_bits(uint32_t encoding);
 
 static bool
@@ -1001,6 +1022,8 @@ const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
 	.ready = sdm845_gpu_ready,
 	.parameter = hakios_gpu_profile_parameter,
 	.quiesce = sdm845_gpu_quiesce,
+	.client_space_create = sdm845_gpu_client_space_create,
+	.client_space_destroy = sdm845_gpu_client_space_destroy,
 	.address = sdm845_gpu_address,
 	.address_free = sdm845_gpu_address_free,
 	.map = sdm845_gpu_map,
@@ -1829,6 +1852,15 @@ polaris_smmu_table_new(void)
 	uint32_t slots_per_page;
 	struct polaris_smmu_table *table;
 
+	for (uint32_t i = 0; i < polaris_smmu_table_count; i++) {
+		if (!polaris_smmu_tables[i].allocated) {
+			table = &polaris_smmu_tables[i];
+			bzero(table->entries, POLARIS_SMMU_TABLE_BYTES);
+			table->dirty = false;
+			table->allocated = true;
+			return table;
+		}
+	}
 	if (polaris_smmu_table_count == POLARIS_SMMU_MAX_TABLES || PAGE_SIZE < POLARIS_SMMU_TABLE_BYTES ||
 	    PAGE_SIZE % POLARIS_SMMU_TABLE_BYTES != 0) {
 		return NULL;
@@ -1854,6 +1886,7 @@ polaris_smmu_table_new(void)
 	table->entries = (uint64_t *)address;
 	table->phys = phys;
 	table->dirty = false;
+	table->allocated = true;
 	return table;
 }
 
@@ -1862,7 +1895,7 @@ polaris_smmu_table_from_phys(uint64_t phys)
 {
 	phys &= POLARIS_SMMU_PTE_ADDRESS;
 	for (uint32_t i = 0; i < polaris_smmu_table_count; i++) {
-		if (polaris_smmu_tables[i].phys == phys) {
+		if (polaris_smmu_tables[i].allocated && polaris_smmu_tables[i].phys == phys) {
 			return &polaris_smmu_tables[i];
 		}
 	}
@@ -1890,6 +1923,29 @@ polaris_smmu_table_child(struct polaris_smmu_table *parent, uint32_t index, bool
 }
 
 static void
+polaris_smmu_table_tree_free_locked(struct polaris_smmu_table *table, uint32_t level)
+{
+	if (table == NULL || !table->allocated) {
+		return;
+	}
+	if (level < 3u) {
+		for (uint32_t i = 0; i < 512u; i++) {
+			uint64_t descriptor = table->entries[i];
+			struct polaris_smmu_table *child;
+
+			if ((descriptor & 3u) != POLARIS_SMMU_PTE_TABLE) {
+				continue;
+			}
+			child = polaris_smmu_table_from_phys(descriptor);
+			polaris_smmu_table_tree_free_locked(child, level + 1u);
+		}
+	}
+	bzero(table->entries, POLARIS_SMMU_TABLE_BYTES);
+	table->dirty = false;
+	table->allocated = false;
+}
+
+static void
 polaris_cache_lines(vm_offset_t start, uint64_t size)
 {
 	uint64_t end = (uint64_t)start + size;
@@ -1913,7 +1969,7 @@ polaris_smmu_commit_locked(void)
 {
 	/* Flush child tables before the parent descriptors that make them reachable. */
 	for (uint32_t i = polaris_smmu_table_count; i-- > 0;) {
-		if (polaris_smmu_tables[i].dirty) {
+		if (polaris_smmu_tables[i].allocated && polaris_smmu_tables[i].dirty) {
 			polaris_cache_lines((vm_offset_t)polaris_smmu_tables[i].entries, POLARIS_SMMU_TABLE_BYTES);
 			polaris_smmu_tables[i].dirty = false;
 		}
@@ -2006,6 +2062,7 @@ polaris_smmu_map_page_locked(struct polaris_smmu_address_space *space, uint64_t 
 	}
 	l3->entries[l3_index] = descriptor;
 	l3->dirty = true;
+	space->mapped_pages++;
 	return true;
 }
 
@@ -2464,8 +2521,17 @@ polaris_smmu_gmu_contexts_detach(void)
 static bool
 polaris_smmu_gpu_context_detach(void)
 {
-	return polaris_smmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
+	bool detached = polaris_smmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
 	    &polaris_smmu_gpu_route, 0u, "GPU");
+
+	if (detached) {
+		lck_mtx_lock(&polaris_gpu_client_lck);
+		for (uint32_t i = 0; i < POLARIS_GPU_MAX_CLIENT_SPACES; i++) {
+			polaris_gpu_client_spaces[i].smmu.context_active = false;
+		}
+		lck_mtx_unlock(&polaris_gpu_client_lck);
+	}
+	return detached;
 }
 
 /* Panic/loader-return path: no printf, allocation, or sleeping; leave the stream faulted. */
@@ -2553,8 +2619,20 @@ polaris_smmu_quiesce_route(struct polaris_smmu_address_space *space,
 static bool
 polaris_smmu_gpu_attach(void)
 {
-	return polaris_smmu_context_attach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
-	    &polaris_smmu_gpu_route);
+	if (!polaris_smmu_context_attach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
+	    &polaris_smmu_gpu_route)) {
+		return false;
+	}
+	lck_mtx_lock(&polaris_gpu_client_lck);
+	for (uint32_t i = 0; i < POLARIS_GPU_MAX_CLIENT_SPACES; i++) {
+		if (polaris_gpu_client_spaces[i].allocated && !polaris_gpu_client_spaces[i].quarantined) {
+			polaris_gpu_client_spaces[i].smmu.context_bank =
+			    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_bank;
+			polaris_gpu_client_spaces[i].smmu.context_active = true;
+		}
+	}
+	lck_mtx_unlock(&polaris_gpu_client_lck);
+	return true;
 }
 
 static bool
@@ -2609,6 +2687,9 @@ polaris_smmu_unmap_locked(struct polaris_smmu_address_space *space, uint64_t add
 		if (l3 != NULL && l3->entries[l3_index] != 0) {
 			l3->entries[l3_index] = 0;
 			l3->dirty = true;
+			if (space->mapped_pages != 0) {
+				space->mapped_pages--;
+			}
 		}
 	}
 }
@@ -2632,24 +2713,213 @@ polaris_smmu_space_unmap(struct polaris_smmu_address_space *space, uint64_t addr
 	lck_mtx_unlock(&polaris_smmu_pt_lock);
 }
 
-static bool
-sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+static struct polaris_gpu_client_space *
+polaris_gpu_client_space_lookup(void *handle)
 {
-	return polaris_smmu_space_map_page(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], address, phys, read_only);
+	struct polaris_gpu_client_space *found = NULL;
+
+	if (handle == NULL) {
+		return NULL;
+	}
+	lck_mtx_lock(&polaris_gpu_client_lck);
+	for (uint32_t i = 0; i < POLARIS_GPU_MAX_CLIENT_SPACES; i++) {
+		if (handle == &polaris_gpu_client_spaces[i] && polaris_gpu_client_spaces[i].allocated) {
+			found = &polaris_gpu_client_spaces[i];
+			break;
+		}
+	}
+	lck_mtx_unlock(&polaris_gpu_client_lck);
+	return found;
+}
+
+static bool
+polaris_gpu_client_space_map_private(struct polaris_gpu_client_space *client)
+{
+	struct polaris_gpu_dma_buffer *buffers[] = {
+		&polaris_gpu_sqe_buffer, &polaris_gpu_ring_buffer, &polaris_gpu_rptr_buffer,
+	};
+	uint64_t mapped_pages = 0;
+
+	if (client == NULL || client->smmu.root != NULL ||
+	    !polaris_smmu_space_root_prepare(&client->smmu)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
+		struct polaris_gpu_dma_buffer *buffer = buffers[i];
+
+		if (buffer->virtual == 0 || buffer->allocation_size == 0 || buffer->gpu_address == 0 ||
+		    !buffer->gpu_privileged || (i < 2 ? !buffer->gpu_read_only : buffer->gpu_read_only)) {
+			goto fail;
+		}
+		for (uint64_t offset = 0; offset < buffer->allocation_size; offset += POLARIS_SMMU_TABLE_BYTES) {
+			if (!polaris_smmu_space_map_page_privileged(&client->smmu,
+			    buffer->gpu_address + offset, buffer->physical + offset, buffer->gpu_read_only)) {
+				goto fail;
+			}
+			mapped_pages++;
+		}
+	}
+	client->private_mapped_pages = (uint32_t)mapped_pages;
+	lck_mtx_lock(&polaris_smmu_pt_lock);
+	polaris_smmu_commit_locked();
+	lck_mtx_unlock(&polaris_smmu_pt_lock);
+	return true;
+
+fail:
+	for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
+		if (buffers[i]->gpu_address != 0 && buffers[i]->allocation_size != 0) {
+			polaris_smmu_space_unmap(&client->smmu, buffers[i]->gpu_address, buffers[i]->allocation_size);
+		}
+	}
+	return false;
+}
+
+static bool
+sdm845_gpu_client_space_create(void **handle)
+{
+	struct polaris_gpu_client_space *client = NULL;
+	struct polaris_smmu_address_space *gpu_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
+
+	if (handle == NULL) {
+		return false;
+	}
+	*handle = NULL;
+	if (!sdm845_gpu_ready() || !gpu_space->context_active || polaris_smmu_backend_faulted) {
+		return false;
+	}
+	lck_mtx_lock(&polaris_gpu_client_lck);
+	for (uint32_t i = 0; i < POLARIS_GPU_MAX_CLIENT_SPACES; i++) {
+		if (!polaris_gpu_client_spaces[i].allocated) {
+			client = &polaris_gpu_client_spaces[i];
+			bzero(client, sizeof(*client));
+			client->allocated = true;
+			client->smmu.name = "3D client";
+			client->smmu.pte_attributes = gpu_space->pte_attributes;
+			client->smmu.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+			client->smmu.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+			client->smmu.context_bank = gpu_space->context_bank;
+			client->smmu.asid = POLARIS_GPU_CLIENT_ASID_FIRST + i;
+			client->smmu.context_active = true;
+			break;
+		}
+	}
+	lck_mtx_unlock(&polaris_gpu_client_lck);
+	if (client == NULL) {
+		printf("adreno-sdm845: no free A630 client SMMU address-space slots remain\n");
+		return false;
+	}
+	if (!polaris_gpu_client_space_map_private(client)) {
+		if (!polaris_smmu_space_destroy(&client->smmu)) {
+			client->quarantined = true;
+			printf("adreno-sdm845: failed A630 client root could not be safely reclaimed; slot quarantined\n");
+		} else {
+			lck_mtx_lock(&polaris_gpu_client_lck);
+			bzero(client, sizeof(*client));
+			lck_mtx_unlock(&polaris_gpu_client_lck);
+		}
+		return false;
+	}
+	*handle = client;
+	return true;
+}
+
+static bool
+sdm845_gpu_map(void *handle, uint64_t address, uint64_t phys, bool read_only)
+{
+	struct polaris_gpu_client_space *client;
+
+	if (handle == NULL) {
+		return polaris_smmu_space_map_page(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
+		    address, phys, read_only);
+	}
+	client = polaris_gpu_client_space_lookup(handle);
+	return client != NULL && !client->quarantined && client->smmu.context_active &&
+	    address >= POLARIS_GPU_VA_START &&
+	    polaris_smmu_space_map_page(&client->smmu, address, phys, read_only);
 }
 
 static void
-sdm845_gpu_mapped(void)
+sdm845_gpu_mapped(void *handle)
 {
+	struct polaris_gpu_client_space *client = handle == NULL ? NULL : polaris_gpu_client_space_lookup(handle);
+
+	if (handle != NULL && (client == NULL || client->quarantined)) {
+		return;
+	}
 	lck_mtx_lock(&polaris_smmu_pt_lock);
 	polaris_smmu_commit_locked();
 	lck_mtx_unlock(&polaris_smmu_pt_lock);
 }
 
 static void
-sdm845_gpu_unmap(uint64_t address, uint64_t size)
+sdm845_gpu_unmap(void *handle, uint64_t address, uint64_t size)
 {
-	polaris_smmu_space_unmap(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], address, size);
+	struct polaris_gpu_client_space *client;
+
+	if (handle == NULL) {
+		polaris_smmu_space_unmap(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], address, size);
+		return;
+	}
+	client = polaris_gpu_client_space_lookup(handle);
+	if (client != NULL && !client->quarantined && address >= POLARIS_GPU_VA_START) {
+		polaris_smmu_space_unmap(&client->smmu, address, size);
+	}
+}
+
+static void
+sdm845_gpu_client_space_destroy(void *handle, bool safe_to_free)
+{
+	struct polaris_gpu_client_space *client = polaris_gpu_client_space_lookup(handle);
+	uint32_t switch_fence;
+	uint32_t private_mapped_pages = 0;
+	struct polaris_gpu_dma_buffer *buffers[] = {
+		&polaris_gpu_sqe_buffer, &polaris_gpu_ring_buffer, &polaris_gpu_rptr_buffer,
+	};
+
+	if (client == NULL) {
+		return;
+	}
+	private_mapped_pages = client->private_mapped_pages;
+	if (!safe_to_free || !sdm845_gpu_ready()) {
+		client->quarantined = true;
+		return;
+	}
+	/* Fence a trusted switch after every queued client, even if the last submitted client differs. */
+	switch_fence = sdm845_gpu_submit(NULL, NULL, NULL, 0);
+	if (switch_fence == 0) {
+		goto quarantine;
+	}
+	bool completed = false;
+	for (uint32_t elapsed = 0; elapsed < A630_CP_INIT_TIMEOUT_US; elapsed += A630_CP_INIT_POLL_US) {
+		if (sdm845_gpu_done(switch_fence)) {
+			completed = true;
+			break;
+		}
+		delay_for_interval(A630_CP_INIT_POLL_US, NSEC_PER_USEC);
+	}
+	if (!completed) {
+		goto quarantine;
+	}
+	if (client->smmu.mapped_pages != client->private_mapped_pages) {
+		goto quarantine;
+	}
+	for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
+		polaris_smmu_space_unmap(&client->smmu, buffers[i]->gpu_address, buffers[i]->allocation_size);
+	}
+	if (client->smmu.mapped_pages != 0 || !polaris_smmu_space_destroy(&client->smmu)) {
+		goto quarantine;
+	}
+	lck_mtx_lock(&polaris_gpu_client_lck);
+	bzero(client, sizeof(*client));
+	lck_mtx_unlock(&polaris_gpu_client_lck);
+	return;
+
+quarantine:
+	client->quarantined = true;
+	polaris_smmu_backend_faulted = true;
+	polaris_gpu_ring_submit_ready = false;
+	printf("adreno-sdm845: A630 client SMMU space %u retained after unsafe teardown (mapped pages=%llu private=%u); backend submissions disabled\n",
+	    client->smmu.asid, client->smmu.mapped_pages, private_mapped_pages);
 }
 
 static void
@@ -2683,6 +2953,28 @@ polaris_smmu_space_root_prepare(struct polaris_smmu_address_space *space)
 		printf("adreno-sdm845: cannot allocate the detached SMMUv2 root for %s\n", space->name);
 	}
 	return ready;
+}
+
+static bool
+polaris_smmu_space_destroy(struct polaris_smmu_address_space *space)
+{
+	if (space == NULL) {
+		return false;
+	}
+	lck_mtx_lock(&polaris_smmu_pt_lock);
+	if (space->mapped_pages != 0 || (space->context_active && !polaris_smmu_tlbi(space))) {
+		lck_mtx_unlock(&polaris_smmu_pt_lock);
+		return false;
+	}
+	polaris_smmu_table_tree_free_locked(space->root, 1u);
+	space->root = NULL;
+	space->cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+	space->cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+	space->cached_l2 = NULL;
+	space->cached_l3 = NULL;
+	space->context_active = false;
+	lck_mtx_unlock(&polaris_smmu_pt_lock);
+	return true;
 }
 
 static void
@@ -2821,7 +3113,7 @@ polaris_gpu_cp_software_prepare(void)
 	polaris_cache_lines(polaris_gpu_sqe_buffer.virtual, polaris_gpu_sqe_buffer.allocation_size);
 	polaris_cache_lines(polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
 	polaris_cache_lines(polaris_gpu_rptr_buffer.virtual, polaris_gpu_rptr_buffer.allocation_size);
-	sdm845_gpu_mapped();
+	sdm845_gpu_mapped(NULL);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	printf("adreno-sdm845: step 16 prepared SQE=%llu bytes at IOVA=%#llx, CP ring=%u bytes at IOVA=%#llx, RPTR/fence scratch at IOVA=%#llx; all CP pages are privileged-only, SQE/ring are read-only, and scratch is GPU writable; no SMMU registers or CP were touched\n",
 	    sqe_payload_size, polaris_gpu_sqe_buffer.gpu_address, A630_CP_RING_BYTES,
@@ -2925,7 +3217,7 @@ polaris_hfi_software_prepare(void)
 				mapped[region] += POLARIS_SMMU_TABLE_BYTES;
 			}
 		}
-		sdm845_gpu_mapped();
+		sdm845_gpu_mapped(NULL);
 		polaris_hfi_space_mapped = true;
 	}
 	if (!polaris_smmu_context_image_build(gpu_space, &gpu_context_image) ||
@@ -6756,13 +7048,16 @@ fault:
 }
 
 /*
- * A630's production A6xx submit stream invalidates both CCU caches, chains each client IB through
- * CP_INDIRECT_BUFFER_PFE, then writes the sequence number through CACHE_FLUSH_TS. The ring is
- * private backend memory; client IOVAs are accepted only from the separate client aperture.
+ * A630's production A6xx submit stream switches TTBR0/ASID in the trusted ring, invalidates GPU
+ * and CCU caches, chains each client IB through CP_INDIRECT_BUFFER_PFE, then writes the sequence
+ * number through CACHE_FLUSH_TS. Kernel private pages are present at fixed IOVAs in every root.
  */
 static uint32_t
-sdm845_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
+	struct polaris_gpu_client_space *client = handle == NULL ? NULL : polaris_gpu_client_space_lookup(handle);
+	struct polaris_smmu_address_space *target_space = client != NULL ? &client->smmu :
+	    &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
 	uint32_t packet[A630_CP_SUBMIT_MAX_DWORDS];
 	uint32_t packet_dwords = 0, wanted, ring_rptr = 0, ring_wptr, room = 0;
 	uint32_t next_wptr, fence;
@@ -6770,10 +7065,15 @@ sdm845_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	vm_offset_t fence_virtual;
 	volatile uint32_t *fence_word;
 
-	if (!sdm845_gpu_ready() || !polaris_gpu_ring_submit_ready ||
+	if ((handle != NULL && (client == NULL || client->quarantined)) ||
+	    !sdm845_gpu_ready() || !polaris_gpu_ring_submit_ready ||
 	    !polaris_gpu_cp_started || !polaris_gpu_cp_initialized || !polaris_gpu_unsecured_mode ||
 	    !polaris_gpu_fence_smoke_test_done || !polaris_zap_authenticated ||
-	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active || polaris_smmu_backend_faulted ||
+	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    target_space->root == NULL || !target_space->context_active || target_space->context_bank != 0 ||
+	    target_space->asid == 0 || target_space->asid > UINT16_MAX ||
+	    !polaris_smmu_phys_valid(target_space->root->phys, POLARIS_SMMU_TABLE_BYTES) ||
+	    polaris_smmu_backend_faulted ||
 	    count > A630_CP_SUBMIT_MAX_IBS || (count != 0 && (addresses == NULL || words == NULL)) ||
 	    polaris_gpu_sqe_buffer.virtual == 0 || polaris_gpu_ring_buffer.virtual == 0 ||
 	    polaris_gpu_rptr_buffer.virtual == 0 ||
@@ -6832,6 +7132,14 @@ sdm845_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	}
 	fence_word = (volatile uint32_t *)fence_virtual;
 
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_SMMU_TABLE_UPDATE, 4u);
+	packet[packet_dwords++] = (uint32_t)target_space->root->phys;
+	packet[packet_dwords++] = (uint32_t)(target_space->root->phys >> 32) |
+	    (target_space->asid << 16);
+	packet[packet_dwords++] = 0u; /* ContextIDR */
+	packet[packet_dwords++] = target_space->context_bank;
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
+	packet[packet_dwords++] = A630_CP_CACHE_INVALIDATE;
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
 	packet[packet_dwords++] = A630_CP_CCU_INVALIDATE_DEPTH;
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);

@@ -3396,20 +3396,25 @@ redwood_gpu_address_free(uint64_t address, uint64_t size)
 
 /* One 4K page of ours at an address of the 3D core's; after the last of a buffer's, hakios_gpu_mapped(). */
 static bool
-redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+redwood_gpu_map(void *space, uint64_t address, uint64_t phys, bool read_only)
 {
-	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
+	return space == NULL && space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
 }
 
 static void
-redwood_gpu_mapped(void)
+redwood_gpu_mapped(void *space)
 {
-	space_commit(&core_space);
+	if (space == NULL) {
+		space_commit(&core_space);
+	}
 }
 
 static void
-redwood_gpu_unmap(uint64_t address, uint64_t size)
+redwood_gpu_unmap(void *space, uint64_t address, uint64_t size)
 {
+	if (space != NULL) {
+		return;
+	}
 	uint32_t context = smmu_context(&core_space);
 
 	for (uint64_t offset = 0; offset < size; offset += 4096) {
@@ -3512,9 +3517,12 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
  * full and the core is not reading it.
  */
 static uint32_t
-redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+redwood_gpu_submit(void *space, const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	uint32_t wanted = 26 + 4 * count, room = 0;
+	if (space != NULL) {
+		return 0;
+	}
 
 	for (int i = 0; i < 20000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
@@ -3553,6 +3561,23 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
 	ring(gpu_fence);
 	ring_send();
 	return gpu_fence;
+}
+
+static bool
+redwood_gpu_client_space_create(void **space)
+{
+	if (space == NULL) {
+		return false;
+	}
+	*space = NULL;
+	return true;
+}
+
+static void
+redwood_gpu_client_space_destroy(void *space, bool safe_to_free)
+{
+	(void)space;
+	(void)safe_to_free;
 }
 
 /* A submission does not come back: what the 3D core and its SMMU context say. */
@@ -3629,6 +3654,8 @@ const struct hakios_gpu_backend_ops hakios_gpu_redwood_backend_ops = {
 	.parameter = hakios_gpu_profile_parameter,
 	.quiesce = redwood_adreno_quiesce,
 	.minute = redwood_adreno_minute,
+	.client_space_create = redwood_gpu_client_space_create,
+	.client_space_destroy = redwood_gpu_client_space_destroy,
 	.address = redwood_gpu_address,
 	.address_free = redwood_gpu_address_free,
 	.map = redwood_gpu_map,
@@ -3672,6 +3699,21 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 	    gpu_backend_ops->parameter(which, value);
 }
 
+bool
+hakios_gpu_client_space_create(void **space)
+{
+	return gpu_backend_ops != NULL && gpu_backend_ops->client_space_create != NULL &&
+	    gpu_backend_ops->client_space_create(space);
+}
+
+void
+hakios_gpu_client_space_destroy(void *space, bool safe_to_free)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->client_space_destroy != NULL) {
+		gpu_backend_ops->client_space_destroy(space, safe_to_free);
+	}
+}
+
 uint64_t
 hakios_gpu_address(uint64_t size)
 {
@@ -3688,25 +3730,25 @@ hakios_gpu_address_free(uint64_t address, uint64_t size)
 }
 
 bool
-hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+hakios_gpu_map(void *space, uint64_t address, uint64_t phys, bool read_only)
 {
 	return gpu_backend_ops != NULL && gpu_backend_ops->map != NULL &&
-	    gpu_backend_ops->map(address, phys, read_only);
+	    gpu_backend_ops->map(space, address, phys, read_only);
 }
 
 void
-hakios_gpu_mapped(void)
+hakios_gpu_mapped(void *space)
 {
 	if (gpu_backend_ops != NULL && gpu_backend_ops->mapped != NULL) {
-		gpu_backend_ops->mapped();
+		gpu_backend_ops->mapped(space);
 	}
 }
 
 void
-hakios_gpu_unmap(uint64_t address, uint64_t size)
+hakios_gpu_unmap(void *space, uint64_t address, uint64_t size)
 {
 	if (gpu_backend_ops != NULL && gpu_backend_ops->unmap != NULL) {
-		gpu_backend_ops->unmap(address, size);
+		gpu_backend_ops->unmap(space, address, size);
 	}
 }
 
@@ -3719,10 +3761,10 @@ hakios_gpu_to_memory(void *start, uint64_t size)
 }
 
 uint32_t
-hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+hakios_gpu_submit(void *space, const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	return gpu_backend_ops != NULL && gpu_backend_ops->submit != NULL ?
-	    gpu_backend_ops->submit(addresses, words, count) : 0;
+	    gpu_backend_ops->submit(space, addresses, words, count) : 0;
 }
 
 bool

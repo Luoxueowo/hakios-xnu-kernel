@@ -21,10 +21,12 @@
  * them. Linux hands such memory around as file descriptors; here it has a name already. That
  * memory is ordinary, cached memory, which everybody else reads and writes as such.
  *
- * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
- * program's worth of care (every client's buffers are in the one address space; a client that
- * goes takes its own away), recovery of a GPU that has stopped answering (it is reported, see
- * hakios_gpu_report(), and stays stopped), fences and buffers as file descriptors.
+ * Each userclient has its own GPU address-space handle; the A630 backend supplies a distinct
+ * SMMU root and ASID, while Redwood keeps its hardware-wide address space. Client teardown keeps
+ * mappings whose fences have not retired. A630 public submissions remain gated until command
+ * packet isolation and hardware behavior are validated. Not here yet: interrupts (waiting is
+ * asking again five times a millisecond), recovery of a GPU that has stopped answering (it is
+ * reported, see hakios_gpu_report(), and stays stopped), fences and buffers as file descriptors.
  */
 
 #include <IOKit/IOLib.h>
@@ -49,13 +51,15 @@ extern "C" {
 /* drivers/gpu/hakios.adreno.c ("the GPU kept on"; declared in bsd/sys/hakios.input.h, which is not seen from here) */
 bool hakios_gpu_ready(void);
 bool hakios_gpu_parameter(uint32_t which, uint64_t * value);
+bool hakios_gpu_client_space_create(void ** space);
+void hakios_gpu_client_space_destroy(void * space, bool safe_to_free);
 uint64_t hakios_gpu_address(uint64_t size);
 void hakios_gpu_address_free(uint64_t address, uint64_t size);
-bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
-void hakios_gpu_mapped(void);
-void hakios_gpu_unmap(uint64_t address, uint64_t size);
+bool hakios_gpu_map(void * space, uint64_t address, uint64_t phys, bool read_only);
+void hakios_gpu_mapped(void * space);
+void hakios_gpu_unmap(void * space, uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void * start, uint64_t size);
-uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+uint32_t hakios_gpu_submit(void * space, const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
 uint32_t hakios_gpu_last(void);
@@ -423,6 +427,7 @@ class HakiosGPUUserClient : public IOUserClient
 	OSDeclareDefaultStructors(HakiosGPUUserClient);
 
 	task_t                  fTask;
+	void *                  fGpuSpace;              /* NULL for a backend with one hardware-wide address space */
 	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
 	uint32_t                fNextQueue;
 	uint32_t                fNextBuffer;            /* where the search for a free handle starts: one given back is not the next given */
@@ -467,6 +472,8 @@ HakiosGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 t
 		return false;
 	}
 	fTask = owningTask;
+	fGpuSpace = NULL;
+	fBuffers = NULL;
 	return true;
 }
 
@@ -477,7 +484,15 @@ HakiosGPUUserClient::start(IOService * provider)
 		return false;
 	}
 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
-	return fBuffers != NULL;
+	if (fBuffers == NULL) {
+		return false;
+	}
+	if (!hakios_gpu_client_space_create(&fGpuSpace)) {
+		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
+		fBuffers = NULL;
+		return false;
+	}
+	return true;
 }
 
 /*
@@ -532,7 +547,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 		    keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
 			b->memory = NULL;               /* (now the kept one's) */
 		} else if (hakios_gpu_ready()) {
-			hakios_gpu_unmap(b->address, b->size);
+			hakios_gpu_unmap(fGpuSpace, b->address, b->size);
 			hakios_gpu_address_free(b->address, b->size);
 		}
 		if (b->memory != NULL) {
@@ -559,7 +574,7 @@ HakiosGPUUserClient::reap(void)
 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
 			left->memory = NULL;
 		} else if (hakios_gpu_ready()) {
-			hakios_gpu_unmap(left->address, left->size);
+			hakios_gpu_unmap(fGpuSpace, left->address, left->size);
 			hakios_gpu_address_free(left->address, left->size);
 		}
 		if (left->memory != NULL) {
@@ -590,6 +605,8 @@ HakiosGPUUserClient::clientClose(void)
 		for (uint32_t i = 0; i < GPU_KEPT; i++) {
 			dropKept(&fKept[i]);
 		}
+		hakios_gpu_client_space_destroy(fGpuSpace, fLeftCount == 0 && hakios_gpu_ready());
+		fGpuSpace = NULL;
 		if (fLeftCount != 0) {
 			IOLog("HakiosGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
 		}
@@ -604,6 +621,11 @@ HakiosGPUUserClient::clientClose(void)
 void
 HakiosGPUUserClient::free(void)
 {
+	if (fGpuSpace != NULL) {
+		/* Orderly close did not prove that the last GPU use had retired. */
+		hakios_gpu_client_space_destroy(fGpuSpace, false);
+		fGpuSpace = NULL;
+	}
 	if (fBuffers != NULL) {
 		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
 		fBuffers = NULL;
@@ -652,11 +674,12 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 		IOByteCount length = 0;
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
 
-		mapped = phys != 0 && hakios_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
+		mapped = phys != 0 && hakios_gpu_map(fGpuSpace, b->address + offset, phys,
+		    flags & MSM_BO_GPU_READONLY);
 	}
-	hakios_gpu_mapped();
+	hakios_gpu_mapped(fGpuSpace);
 	if (!mapped) {
-		hakios_gpu_unmap(b->address, size);
+		hakios_gpu_unmap(fGpuSpace, b->address, size);
 		hakios_gpu_address_free(b->address, size);
 		IOLog("HakiosGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
 		return NULL;
@@ -682,7 +705,7 @@ HakiosGPUUserClient::dropKept(struct gpu_kept * k)
 		return;
 	}
 	if (hakios_gpu_ready()) {
-		hakios_gpu_unmap(k->address, k->size);
+		hakios_gpu_unmap(fGpuSpace, k->address, k->size);
 		hakios_gpu_address_free(k->address, k->size);
 	}
 	k->memory->release();
@@ -1069,7 +1092,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		addresses[count] = b->address + cmds[i].submit_offset;
 		words[count++] = cmds[i].size / 4;
 	}
-	request->fence = hakios_gpu_submit(addresses, words, count);
+	request->fence = hakios_gpu_submit(fGpuSpace, addresses, words, count);
 	if (gpu_log && request->fence != 0) {
 		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
 		uint32_t big = 0, all_words = 0;

@@ -579,25 +579,27 @@ GPU OOB/core setup, authenticated PAS/ZAP, initialized CP in unsecured mode, and
 step 21 fence smoke test. The separate backend-enabled flag still has no writer, so `ready()` stays
 false. No callback falls through into Redwood's SMMUv500 or register state.
 
-Per-client isolation should use a stage-1 SMMU root and ASID per `HakiosGPUUserClient`, with client
-BOs mapped only in that root. The A6xx submit path already switches the active SID0 context from
-the trusted ring using `CP_SMMU_TABLE_UPDATE` (TTBR0, ASID, ContextIDR and context-bank number)
-before dispatching the client's IBs, then invalidates GPU caches
+The shared service now passes an opaque address-space handle through client create/destroy,
+map/commit/unmap and submit. Polaris allocates up to 64 client roots with ASIDs 4–67; client BOs
+are mapped only in that client's root, while each root maps the kernel SQE, ring and fence pages
+at the same privileged-only IOVAs. The A6xx submit packet switches SID0 from the trusted ring
+using `CP_SMMU_TABLE_UPDATE` (TTBR0, ASID, ContextIDR and context-bank number) before dispatching
+the client's IBs, then invalidates GPU caches
 ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
 [`adreno_iommu.c`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_iommu.c)).
-The HakiOS backend needs an opaque address-space handle through map, unmap and submit; each root
-must also map the kernel SQE, ring and fence pages at the same private IOVAs so the single hardware
-ring can continue across a context switch. Keep the public-client gate closed until it is confirmed
-that user IBs cannot issue their own table switches or reach those private mappings, and make
-client teardown retain any root and BOs still referenced by unfinished fences.
+Client close queues and waits for a trusted switch back to the kernel root before reclaiming the
+client root. If client BO fences or that switch cannot be proven complete, the mappings and root
+are retained. Keep the public-client gate closed until it is confirmed that user IBs cannot issue
+their own table switches or reach private mappings; this command-stream security property and all
+runtime behavior remain unverified on the phone.
 
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
 software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use the private range
 `[0x00010000, 0x40000000)`; the shared service receives client allocations only from
 `[0x40000000, 0x100000000)`. Both allocators round to 64-KiB extents and accept exact frees. This
-address partition does not isolate command streams: the 3D SID0 context still uses one page table
-for backend and client mappings. The new 4K LPAE stage-1 tables can describe both ranges, but no
-context bank or stream is programmed until a guarded bring-up step, and rendering remains disabled.
+address partition complements per-client stage-1 roots: each root contains the backend mappings
+and only one client's BOs. The implementation builds on the 4K LPAE tables and active SID0 context,
+but user submissions remain disabled pending command-stream security review and device validation.
 
 The table descriptor format follows the existing project mapper and the ARM LPAE definitions in
 upstream Linux [`io-pgtable-arm.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c).
@@ -621,8 +623,8 @@ GMEM and frequency capabilities, SMMU implementation and stream/context assignme
 stop operations, and the GPU address/map/submit/fence operations consumed by `hakios.gpu.cpp`.
 The shared `HakiosGPUUserClient::submit()` rejects zero-byte command buffers before forming an IB
 entry, in addition to its existing alignment, relocation and bounds checks. The A630 backend accepts
-at most 128 IBs and only client IOVAs in `[0x40000000, 0x100000000)`; this does not validate IB
-contents or isolate command streams on the shared SID0 page table. The public `HakiosGPU` service
+at most 128 IBs and only client IOVAs in `[0x40000000, 0x100000000)`; per-client roots isolate BO
+mappings, but IB contents and table-switch packet access are not yet validated. The public `HakiosGPU` service
 must only start after its selected backend has completed CP bring-up, command isolation review, and
 bounded hardware submission checks.
 
@@ -726,12 +728,11 @@ bounded hardware submission checks.
   `a630v2` catalog entry does not advertise `ADRENO_APRIV`, unlike the deprecated A630v1 profile
   ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)).
   Kernel-owned SQE, ring and scratch pages now have privileged-only SMMU descriptors, and
-  `CP_RB_CNTL_NO_UPDATE` disables CP writes to the RPTR shadow. These controls do not isolate
-  client buffers: all current client BOs still share the SID0 page table, so clients can address
-  one another's mapped BOs. Implement the per-client root/ASID switch through the trusted ring,
-  map the private CP pages into each client root, and verify that user IBs cannot issue table-switch
-  packets or access those pages. Hardware enforcement of the privileged SMMU mappings also remains
-  unverified on the phone.
+  `CP_RB_CNTL_NO_UPDATE` disables CP writes to the RPTR shadow. Per-client roots now map each
+  client's BOs separately, and the trusted ring switches TTBR0/ASID before its IBs. The userclient
+  gate remains closed until the A630 is checked for user IBs that could issue their own table-switch
+  packets or reach kernel private pages. Hardware enforcement of the privileged SMMU mappings and
+  the new switch/teardown path also remain unverified on the phone.
 - A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence
   stage and is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
   legacy-HFI slumber; it then checks GMU/CX/GX state, asserts CM3 reset, shuts down PAS, detaches
