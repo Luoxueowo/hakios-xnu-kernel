@@ -34,6 +34,17 @@ allow it. A successful firmware boot alone is not a completed driver.
   `MiniIOSurface.cpo`, and the shared IOKit GPU service, including the new resource caps. The build
   emitted `hakios-kernel`, then exited 2 on the known XNU kext symbol-set import-list failures;
   this is compile evidence only, not a device boot or GPU runtime result.
+- The Polaris loader builds the XNU-facing `/arm-io/gic` node from its SDM845 platform profile:
+  the GICv3 distributor/redistributor addresses and virtual-timer PPI match the device profile,
+  while the `arm-io` `ranges` property supplies the nonzero SoC base expected by XNU. This is
+  separate from the Android/Recovery tree, which names the controller under `/soc`. A read-only
+  Recovery inspection on 2026-11-12 found the KGSL interrupt tuple `<0 0x12c 0>`. The KGSL node
+  inherits root interrupt-parent phandle `1` (`qcom,pdc-sdm845-v2`), whose parent is the GICv3
+  node at `0x17a00000` (phandle `0xa2`). The existing generic XNU GICv3 path has an SPI attach
+  API, but the GPU backend does not attach its interrupt yet: completion waits still poll every
+  200 microseconds. The Recovery parent chain and loader profile establish the interrupt
+  description only; PDC-to-GIC routing, delivery, source acknowledgement, and fence behavior
+  remain to be validated on the running HakiOS kernel.
 - The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
   A completion wait of at least one second that expires blocks later GEM submissions before cache
   maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory
@@ -882,8 +893,10 @@ command isolation review, and bounded hardware submission checks.
   `gfx.lvl`/`cx.lvl`/`mx.lvl` tables pair correctly with the live GPU/GMU operating points. The
   `adreno=12`/`adreno=13`/`adreno=14` write stages have not been invoked on the phone; the direct
   Apps RSC active-TCS path remains unverified on hardware.
-- Cache coherency, interrupt availability, A630 hardware hang recovery/restart, DVFS/thermal policy, and full
-  client-memory isolation on the actual phone.
+- Cache coherency, GPU interrupt delivery/acknowledgement, A630 hardware hang recovery/restart,
+  DVFS/thermal policy, and full client-memory isolation on the actual phone. The Recovery-tree
+  KGSL tuple and XNU-facing loader GIC description are known; the A630 backend still uses polled
+  completion waits until the interrupt path is integrated and exercised on hardware.
 - `hakios-metal` has an A630 build profile (`GPU_PROFILE=a630`) covering the Polaris chip ID, 1 MiB GMEM, Mesa A630
   compiler/device data, and the A630 CP_BLIT register switch. It has compile/source evidence only: no MIX 2S command stream,
   Metal compositor, window-server session, hang recovery or sustained workload has been validated. Keep the MIX 2S UI on the
