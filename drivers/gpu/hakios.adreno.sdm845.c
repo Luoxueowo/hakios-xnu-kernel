@@ -178,10 +178,14 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define SMMU_CBAR_TYPE_S1_S2_BYPASS      1u
 #define SMMU_CBA2R_RW64                  (1u << 0)
 #define SMMU_CB_SCTLR                   0x0000u
+#define SMMU_CB_ACTLR                   0x0004u
 #define SMMU_CB_TCR2                    0x0010u
 #define SMMU_CB_TTBR0                   0x0020u
+#define SMMU_CB_TTBR1                   0x0028u
 #define SMMU_CB_TCR                     0x0030u
+#define SMMU_CB_CONTEXTIDR              0x0034u
 #define SMMU_CB_MAIR0                   0x0038u
+#define SMMU_CB_MAIR1                   0x003cu
 #define SMMU_CB_FSR                     0x0058u
 #define SMMU_CB_TLBIASID                0x0610u
 #define SMMU_CB_TLBSYNC                 0x07f0u
@@ -217,6 +221,7 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_GPU_VA_MAX_RANGES        ((POLARIS_GPU_VA_GRANULES + 1) / 2)
 #define POLARIS_GPU_VA_MAX_ALLOCS        POLARIS_GPU_VA_GRANULES
 #define POLARIS_SMMU_MAX_STREAM_IDS      8u
+#define POLARIS_SMMU_MAX_CONTEXT_BANKS   256u
 #define POLARIS_SMMU_TABLE_BYTES         4096u
 #define POLARIS_SMMU_ADDRESS_SPACE_COUNT 3u
 #define POLARIS_SMMU_TABLES_PER_SPACE    2053u /* one L1, four L2, 2048 L3 tables cover 4 GiB */
@@ -309,11 +314,19 @@ static bool polaris_smmu_supports_4k;
 static uint32_t polaris_smmu_context_page_size;
 static uint32_t polaris_smmu_context_base;
 static uint32_t polaris_smmu_context_bank_count;
+static bool polaris_smmu_context_snapshot_valid;
+static bool polaris_smmu_route_scan_complete;
+static bool polaris_smmu_dynamic_routes_safe;
+static bool polaris_smmu_context_blank[POLARIS_SMMU_MAX_CONTEXT_BANKS];
+static bool polaris_smmu_context_routed[POLARIS_SMMU_MAX_CONTEXT_BANKS];
+static uint32_t polaris_smmu_free_smr_slots[POLARIS_SMMU_MAX_CONTEXT_BANKS];
+static uint32_t polaris_smmu_free_smr_count;
 static uint32_t polaris_smmu_stream_ids[POLARIS_SMMU_MAX_STREAM_IDS];
 static uint32_t polaris_smmu_stream_count;
 struct polaris_smmu_stream_route {
 	uint32_t stream_id;
 	uint32_t slot;
+	uint32_t smr;
 	uint32_t s2cr;
 	uint32_t matches;
 };
@@ -877,6 +890,15 @@ polaris_dt_has_empty_property(DTEntry node, const char *name)
 }
 
 static bool
+polaris_dt_has_property(DTEntry node, const char *name)
+{
+	const void *property = NULL;
+	unsigned int size = 0;
+
+	return SecureDTGetProperty(node, name, &property, &size) == kSuccess;
+}
+
+static bool
 polaris_runtime_rpmh_validate(void)
 {
 	static const uint32_t expected_types[] = {
@@ -1003,12 +1025,24 @@ polaris_runtime_iommu_validate(DTEntry smmu_node, uint32_t smmu_phandle)
 	static const uint32_t gmu_kernel_ids[] = { 5 };
 	static const uint32_t gmu_user_ids[] = { 4 };
 	DTEntry kgsl_iommu_node = NULL, gfx3d_user_node = NULL;
+	const uint8_t *protect;
+	unsigned int protect_size = 0;
 	uint32_t gpu_offset;
 
+	polaris_smmu_dynamic_routes_safe = false;
+	if (polaris_dt_has_property(smmu_node, "qcom,enable-static-cb")) {
+		printf("adreno-sdm845: runtime DT enables TrustZone-owned static SMMU routes; route planning and writes are refused\n");
+		return false;
+	}
 	if (!polaris_dt_has_empty_property(smmu_node, "qcom,dynamic") ||
 	    !polaris_dt_has_empty_property(smmu_node, "qcom,use-3-lvl-tables") ||
+	    !polaris_dt_has_empty_property(smmu_node, "qcom,disable-atos") ||
 	    SecureDTLookupEntry(NULL, "/soc/qcom,kgsl-iommu", &kgsl_iommu_node) != kSuccess || kgsl_iommu_node == NULL ||
 	    !polaris_dt_has_compatible(kgsl_iommu_node, "qcom,kgsl-smmu-v2") ||
+	    SecureDTGetProperty(kgsl_iommu_node, "qcom,protect", (const void **)&protect, &protect_size) != kSuccess ||
+	    protect == NULL || protect_size != 8u || polaris_dt_be32(protect) != 0x40000u ||
+	    polaris_dt_be32(protect + 4u) != 0xc000u ||
+	    !polaris_dt_has_empty_property(kgsl_iommu_node, "qcom,hyp_secure_alloc") ||
 	    SecureDTLookupEntry(NULL, "/soc/qcom,kgsl-iommu/gfx3d_user", &gfx3d_user_node) != kSuccess ||
 	    gfx3d_user_node == NULL || !polaris_dt_get_u32(gfx3d_user_node, "qcom,gpu-offset", &gpu_offset) ||
 	    gpu_offset != 0x48000u ||
@@ -1023,6 +1057,7 @@ polaris_runtime_iommu_validate(DTEntry smmu_node, uint32_t smmu_phandle)
 		printf("adreno-sdm845: runtime SMMUv2 stream/context description is incomplete or differs from Polaris; probe refused\n");
 		return false;
 	}
+	polaris_smmu_dynamic_routes_safe = true;
 	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
 		for (uint32_t j = i + 1; j < polaris_smmu_stream_count; j++) {
 			if (polaris_smmu_stream_ids[j] < polaris_smmu_stream_ids[i]) {
@@ -1036,7 +1071,8 @@ polaris_runtime_iommu_validate(DTEntry smmu_node, uint32_t smmu_phandle)
 	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
 		printf(" %u", polaris_smmu_stream_ids[i]);
 	}
-	printf("; gfx3d_user GPU offset=%#x; three-level SMMU tables required\n", gpu_offset);
+	printf("; gfx3d_user GPU offset=%#x; three-level SMMU tables required; protect=<0x40000 0xc000>, HYP secure allocation and ATOS-disabled policy present, static-CB policy absent\n",
+	    gpu_offset);
 	return true;
 }
 
@@ -1690,13 +1726,22 @@ polaris_smmu_routes_reset(void)
 	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
 		polaris_smmu_stream_routes[i].stream_id = polaris_smmu_stream_ids[i];
 		polaris_smmu_stream_routes[i].slot = UINT32_MAX;
+		polaris_smmu_stream_routes[i].smr = 0;
 		polaris_smmu_stream_routes[i].s2cr = 0;
 		polaris_smmu_stream_routes[i].matches = 0;
 	}
+	memset(polaris_smmu_context_routed, 0, sizeof(polaris_smmu_context_routed));
+	memset(polaris_smmu_context_blank, 0, sizeof(polaris_smmu_context_blank));
+	polaris_smmu_context_snapshot_valid = false;
+	polaris_smmu_route_scan_complete = false;
+	polaris_smmu_context_page_size = 0;
+	polaris_smmu_context_base = 0;
+	polaris_smmu_context_bank_count = 0;
+	polaris_smmu_free_smr_count = 0;
 }
 
 static void
-polaris_smmu_route_record(uint32_t stream_id, uint32_t slot, uint32_t s2cr)
+polaris_smmu_route_record(uint32_t stream_id, uint32_t slot, uint32_t smr, uint32_t s2cr)
 {
 	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
 		struct polaris_smmu_stream_route *route = &polaris_smmu_stream_routes[i];
@@ -1706,9 +1751,21 @@ polaris_smmu_route_record(uint32_t stream_id, uint32_t slot, uint32_t s2cr)
 		}
 		if (route->matches == 0) {
 			route->slot = slot;
+			route->smr = smr;
 			route->s2cr = s2cr;
 		}
 		route->matches++;
+	}
+}
+
+static void
+polaris_smmu_note_translation_route(uint32_t s2cr)
+{
+	uint32_t type = (s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK;
+	uint32_t context_bank = s2cr & SMMU_S2CR_CBNDX_MASK;
+
+	if (type == SMMU_S2CR_TYPE_TRANS && context_bank < POLARIS_SMMU_MAX_CONTEXT_BANKS) {
+		polaris_smmu_context_routed[context_bank] = true;
 	}
 }
 
@@ -1800,30 +1857,181 @@ probe_smmu_contexts(uint32_t idr1)
 	polaris_smmu_context_page_size = page_size;
 	polaris_smmu_context_base = (uint32_t)context_base;
 	polaris_smmu_context_bank_count = context_banks;
+	polaris_smmu_context_snapshot_valid = context_banks <= POLARIS_SMMU_MAX_CONTEXT_BANKS;
 
 	for (uint32_t i = 0; i < context_banks; i++) {
 		uint32_t cbar = probe_read(&smmu, SMMU_CBAR(i));
 		uint32_t cba2r = probe_read(&smmu, SMMU_CBA2R(i));
 		uint32_t base = (uint32_t)context_base + page_size * i;
 		uint32_t sctlr = probe_read(&smmu, base + SMMU_CB_SCTLR);
+		uint32_t actlr = probe_read(&smmu, base + SMMU_CB_ACTLR);
 		uint32_t ttbr0_lo = probe_read(&smmu, base + SMMU_CB_TTBR0);
 		uint32_t ttbr0_hi = probe_read(&smmu, base + SMMU_CB_TTBR0 + 4u);
+		uint32_t ttbr1_lo = probe_read(&smmu, base + SMMU_CB_TTBR1);
+		uint32_t ttbr1_hi = probe_read(&smmu, base + SMMU_CB_TTBR1 + 4u);
 		uint32_t tcr = probe_read(&smmu, base + SMMU_CB_TCR);
 		uint32_t tcr2 = probe_read(&smmu, base + SMMU_CB_TCR2);
+		uint32_t contextidr = probe_read(&smmu, base + SMMU_CB_CONTEXTIDR);
 		uint32_t mair0 = probe_read(&smmu, base + SMMU_CB_MAIR0);
+		uint32_t mair1 = probe_read(&smmu, base + SMMU_CB_MAIR1);
 		uint32_t fsr = probe_read(&smmu, base + SMMU_CB_FSR);
 
-		if (cbar == 0 && cba2r == 0 && sctlr == 0 && ttbr0_lo == 0 && ttbr0_hi == 0 && tcr == 0 &&
-		    tcr2 == 0 && mair0 == 0 && fsr == 0) {
+		if (cbar == 0 && cba2r == 0 && sctlr == 0 && actlr == 0 && ttbr0_lo == 0 && ttbr0_hi == 0 &&
+		    ttbr1_lo == 0 && ttbr1_hi == 0 && tcr == 0 && tcr2 == 0 && contextidr == 0 && mair0 == 0 &&
+		    mair1 == 0 && fsr == 0) {
+			if (i < POLARIS_SMMU_MAX_CONTEXT_BANKS) {
+				polaris_smmu_context_blank[i] = true;
+			}
 			continue;
 		}
 		active++;
-		printf("adreno-sdm845: SMMU CB%u: CBAR=%#x CBA2R=%#x SCTLR=%#x%s TTBR0=%#x%08x TCR=%#x "
-		    "TCR2=%#x MAIR0=%#x FSR=%#x\n", i, cbar, cba2r, sctlr,
-		    (sctlr & SMMU_SCTLR_M) ? " (translation on)" : "", ttbr0_hi, ttbr0_lo, tcr, tcr2, mair0, fsr);
+		printf("adreno-sdm845: SMMU CB%u: CBAR=%#x CBA2R=%#x SCTLR=%#x%s ACTLR=%#x "
+		    "TTBR0=%#x%08x TTBR1=%#x%08x TCR=%#x TCR2=%#x CONTEXTIDR=%#x MAIR=%#x/%#x FSR=%#x\n",
+		    i, cbar, cba2r, sctlr, (sctlr & SMMU_SCTLR_M) ? " (translation on)" : "", actlr,
+		    ttbr0_hi, ttbr0_lo, ttbr1_hi, ttbr1_lo, tcr, tcr2, contextidr, mair0, mair1, fsr);
 	}
 	printf("adreno-sdm845: SMMU context-bank window: page=%u bytes, base=%#llx, %u banks, %u nonzero\n",
 	    page_size, context_base, context_banks, active);
+}
+
+static struct polaris_smmu_stream_route *
+polaris_smmu_find_route(uint32_t stream_id)
+{
+	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
+		if (polaris_smmu_stream_routes[i].stream_id == stream_id) {
+			return &polaris_smmu_stream_routes[i];
+		}
+	}
+	return NULL;
+}
+
+static bool
+polaris_smmu_plan_route_slot(uint32_t stream_id, bool stream_matching, uint32_t sid_bits,
+	const uint32_t *claimed_slots, uint32_t claimed_count, uint32_t *slot_out)
+{
+	struct polaris_smmu_stream_route *route = polaris_smmu_find_route(stream_id);
+	uint32_t slot = UINT32_MAX;
+
+	if (route == NULL || slot_out == NULL || route->matches > 1) {
+		printf("adreno-sdm845: attach plan SID %u: route is unavailable or ambiguous\n", stream_id);
+		return false;
+	}
+	if (route->matches == 1) {
+		uint32_t type = (route->s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK;
+
+		if (type == SMMU_S2CR_TYPE_TRANS) {
+			printf("adreno-sdm845: attach plan SID %u: an existing translation route must not be replaced\n",
+			    stream_id);
+			return false;
+		}
+		if (stream_matching && (((route->smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK) != 0 ||
+		    (route->smr & SMMU_SMR_ID_MASK) != stream_id)) {
+			printf("adreno-sdm845: attach plan SID %u: existing SMR is broader than this stream; slot is not reused\n",
+			    stream_id);
+			return false;
+		}
+		slot = route->slot;
+	} else if (stream_matching) {
+		for (uint32_t i = 0; i < polaris_smmu_free_smr_count; i++) {
+			bool claimed = false;
+
+			for (uint32_t j = 0; j < claimed_count; j++) {
+				if (claimed_slots[j] == polaris_smmu_free_smr_slots[i]) {
+					claimed = true;
+					break;
+				}
+			}
+			if (!claimed) {
+				slot = polaris_smmu_free_smr_slots[i];
+				break;
+			}
+		}
+		if (slot == UINT32_MAX) {
+			printf("adreno-sdm845: attach plan SID %u: no invalid SMR slot is available\n", stream_id);
+			return false;
+		}
+	} else {
+		uint32_t sid_limit = sid_bits >= 16 ? 0x10000u : (1u << sid_bits);
+
+		if (stream_id >= sid_limit || SMMU_S2CR(stream_id) + sizeof(uint32_t) > smmu.size) {
+			printf("adreno-sdm845: attach plan SID %u: SID-indexed S2CR is outside the decoded register range\n",
+			    stream_id);
+			return false;
+		}
+		slot = stream_id;
+	}
+	for (uint32_t i = 0; i < claimed_count; i++) {
+		if (claimed_slots[i] == slot) {
+			printf("adreno-sdm845: attach plan SID %u: route slot %u is already assigned in this plan\n",
+			    stream_id, slot);
+			return false;
+		}
+	}
+	*slot_out = slot;
+	return true;
+}
+
+static void
+polaris_smmu_plan_attach(bool stream_matching, uint32_t sid_bits)
+{
+	static const uint32_t plan_streams[] = { 0, 5, 4 };
+	static const char *const plan_names[] = { "3D user", "GMU kernel", "GMU user" };
+	uint32_t route_slots[sizeof(plan_streams) / sizeof(plan_streams[0])];
+	uint32_t gmu_banks[2], gmu_bank_count = 0, route_count = 0;
+	bool route_ok[sizeof(plan_streams) / sizeof(plan_streams[0])] = { false, false, false };
+	bool gpu_cb0_candidate;
+
+	printf("adreno-sdm845: read-only SMMUv2 attach planner: GPU SID0 reserves Qualcomm CB0; secure GPU SIDs1/2 are excluded; HYP-protected CB5-7 are excluded\n");
+	if (!polaris_smmu_dynamic_routes_safe) {
+		printf("adreno-sdm845: attach plan unavailable: runtime DT has not authorized dynamic, non-static route planning\n");
+		return;
+	}
+	if (!polaris_smmu_context_snapshot_valid || !polaris_smmu_route_scan_complete) {
+		printf("adreno-sdm845: attach plan unavailable: context snapshot or complete stream-route scan is missing\n");
+		return;
+	}
+	if (polaris_smmu_context_bank_count <= 1u) {
+		printf("adreno-sdm845: attach plan unavailable: SMMU exposes no CB in the permitted GMU range CB1-4\n");
+		return;
+	}
+	gpu_cb0_candidate = polaris_smmu_context_blank[0] && !polaris_smmu_context_routed[0];
+	if (gpu_cb0_candidate) {
+		printf("adreno-sdm845: attach plan: fixed GPU CB0 is clear in the sampled context registers and has no current translation route\n");
+	} else {
+		printf("adreno-sdm845: attach plan: fixed GPU CB0 is occupied or already routed; it is reserved and will not be reused by GMU\n");
+	}
+	for (uint32_t bank = 1; bank <= 4u && bank < polaris_smmu_context_bank_count; bank++) {
+		if (polaris_smmu_context_blank[bank] && !polaris_smmu_context_routed[bank]) {
+			if (gmu_bank_count < sizeof(gmu_banks) / sizeof(gmu_banks[0])) {
+				gmu_banks[gmu_bank_count++] = bank;
+			}
+		}
+	}
+	if (gmu_bank_count == 2) {
+		printf("adreno-sdm845: attach plan: GMU kernel/user candidate CBs are CB%u/CB%u (both sampled clear and unused by translation routes)\n",
+		    gmu_banks[0], gmu_banks[1]);
+	} else {
+		printf("adreno-sdm845: attach plan: only %u clear, unrouted GMU context bank(s) found in CB1-4; two independent contexts are required\n",
+		    gmu_bank_count);
+	}
+	for (uint32_t i = 0; i < sizeof(plan_streams) / sizeof(plan_streams[0]); i++) {
+		uint32_t candidate_slot;
+
+		route_ok[i] = polaris_smmu_plan_route_slot(plan_streams[i], stream_matching, sid_bits,
+		    route_slots, route_count, &candidate_slot);
+		if (route_ok[i]) {
+			route_slots[route_count] = candidate_slot;
+			printf("adreno-sdm845: attach plan: %s SID%u may use %s slot %u\n", plan_names[i], plan_streams[i],
+			    stream_matching ? "SMR/S2CR" : "SID-indexed S2CR", candidate_slot);
+			route_count++;
+		}
+	}
+	if (gpu_cb0_candidate && gmu_bank_count == 2 && route_ok[0] && route_ok[1] && route_ok[2]) {
+		printf("adreno-sdm845: candidate only: GPU SID0->CB0; GMU kernel SID5->CB%u; GMU user SID4->CB%u; route changes and context writes remain disabled pending live ownership/secure-route verification\n",
+		    gmu_banks[0], gmu_banks[1]);
+	} else {
+		printf("adreno-sdm845: no complete attach plan; no SMMU register was written\n");
+	}
 }
 
 static uint32_t
@@ -1846,6 +2054,7 @@ probe_smmu(void)
 	uint32_t stream_groups, context_banks, s2_context_banks, sid_bits, sid_mask;
 	uint32_t page_shift, major, minor;
 
+	polaris_smmu_routes_reset();
 	if (!probe_gpucc_bus("step 2") || !map_block(&gpucc)) {
 		return false;
 	}
@@ -1894,13 +2103,12 @@ probe_smmu(void)
 	    (unsigned)!!(idr2 & SMMU_IDR2_PTFS_16K), (unsigned)!!(idr2 & SMMU_IDR2_PTFS_64K));
 	polaris_smmu_oas_bits = smmu_id_size_to_bits((idr2 >> SMMU_IDR2_OAS_SHIFT) & SMMU_IDR2_SIZE_MASK);
 	polaris_smmu_supports_4k = (idr0 & SMMU_IDR0_S1TS) != 0 && (idr2 & SMMU_IDR2_PTFS_4K) != 0;
-	polaris_smmu_routes_reset();
 	printf("adreno-sdm845: SMMU stage-1 table prerequisites: 4K=%s, OAS=%u bits\n",
 	    polaris_smmu_supports_4k ? "supported" : "unavailable", polaris_smmu_oas_bits);
 	if (idr0 & SMMU_IDR0_SMS) {
 		if (stream_groups == 0) {
 			printf("adreno-sdm845: SMMU advertises stream matching but reports no SMR groups\n");
-		} else if (stream_groups > (POLARIS_SMMU_SIZE - SMMU_S2CR(0)) / sizeof(uint32_t)) {
+		} else if (stream_groups > (smmu.size - SMMU_S2CR(0)) / sizeof(uint32_t)) {
 			printf("adreno-sdm845: SMMU stream-match count %#x exceeds the mapped register window; entries are not read\n",
 			    stream_groups);
 		} else {
@@ -1909,9 +2117,11 @@ probe_smmu(void)
 				uint32_t s2cr, stream_id_field, stream_mask;
 
 				if (!(smr & SMMU_SMR_VALID)) {
+					polaris_smmu_free_smr_slots[polaris_smmu_free_smr_count++] = i;
 					continue;
 				}
 				s2cr = probe_read(&smmu, SMMU_S2CR(i));
+				polaris_smmu_note_translation_route(s2cr);
 				stream_id_field = smr & SMMU_SMR_ID_MASK;
 				stream_mask = (smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK;
 				printf("adreno-sdm845: SMMU SMR[%u]=%#x S2CR=%#x type=%u context-bank=%u\n", i, smr, s2cr,
@@ -1921,29 +2131,41 @@ probe_smmu(void)
 					uint32_t stream_id = polaris_smmu_stream_ids[j];
 
 					if (((stream_id ^ stream_id_field) & sid_mask & ~stream_mask) == 0) {
-						polaris_smmu_route_record(stream_id, i, s2cr);
+						polaris_smmu_route_record(stream_id, i, smr, s2cr);
 					}
 				}
 			}
+			polaris_smmu_route_scan_complete = true;
+			printf("adreno-sdm845: SMMU stream-match scan complete: %u invalid SMR slot(s) available\n",
+			    polaris_smmu_free_smr_count);
 		}
 	} else if (sid_bits <= 16) {
-		uint32_t sid_limit = 1u << sid_bits;
+		uint32_t sid_limit = sid_bits >= 16u ? 0x10000u : (1u << sid_bits);
+		uint32_t s2cr_slots = (smmu.size - SMMU_S2CR(0)) / sizeof(uint32_t);
+		uint32_t scan_count = sid_limit < s2cr_slots ? sid_limit : s2cr_slots;
 
-		for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
-			uint32_t sid = polaris_smmu_stream_ids[i];
-			uint32_t s2cr;
+		if (sid_limit > s2cr_slots) {
+			printf("adreno-sdm845: SID-indexed S2CR table has %u entries but IDR0 describes %u SIDs; complete route scan is unavailable\n",
+			    s2cr_slots, sid_limit);
+		} else {
+			polaris_smmu_route_scan_complete = true;
+		}
+		for (uint32_t sid = 0; sid < scan_count; sid++) {
+			uint32_t s2cr = probe_read(&smmu, SMMU_S2CR(sid));
 
-			if (sid >= sid_limit) {
-				continue;
+			polaris_smmu_note_translation_route(s2cr);
+			for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
+				if (polaris_smmu_stream_ids[i] == sid) {
+					printf("adreno-sdm845: SMMU SID %u S2CR=%#x type=%u context-bank=%u\n", sid, s2cr,
+					    (s2cr >> SMMU_S2CR_TYPE_SHIFT) & 3u, s2cr & SMMU_S2CR_CBNDX_MASK);
+					polaris_smmu_route_record(sid, sid, 0, s2cr);
+				}
 			}
-			s2cr = probe_read(&smmu, SMMU_S2CR(sid));
-			printf("adreno-sdm845: SMMU SID %u S2CR=%#x type=%u context-bank=%u\n", sid, s2cr,
-			    (s2cr >> SMMU_S2CR_TYPE_SHIFT) & 3u, s2cr & SMMU_S2CR_CBNDX_MASK);
-			polaris_smmu_route_record(sid, sid, s2cr);
 		}
 	}
 	probe_smmu_contexts(idr1);
 	polaris_smmu_routes_report();
+	polaris_smmu_plan_attach((idr0 & SMMU_IDR0_SMS) != 0, sid_bits);
 	return true;
 }
 

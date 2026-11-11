@@ -73,9 +73,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   live device tree's Polaris GPU compatible/chip ID, the exact GPU/GPUCC/GFXCC/GMU/SMMUv2 `reg`
   windows, GPU and GMU clock names/specifiers/provider phandles, shared GPU/GMU supply domains,
   GPUCC CX/MX and GFXCC GFX regulator links, SMMU phandle and 3-level-table flags, `gfx3d_user`
-  GPU offset, and the user/secure/GMU stream tuples. Missing or mismatched entries abort the
-  request before GPU MMIO access. The SMMU probe uses the validated runtime stream IDs when
-  hardware reports indexed stream routing.
+  GPU offset, the exact KGSL protect aperture, HYP secure-allocation and ATOS policy, static-CB
+  absence, and the user/secure/GMU stream tuples. Missing or mismatched entries abort the request
+  before GPU MMIO access. The SMMU probe uses the validated runtime stream IDs when hardware
+  reports indexed stream routing.
 - The same preflight now validates the Polaris Apps RPMh DRV2 node, its separate DRV/TCS windows,
   its active/sleep/wake/control TCS counts, and the `cx.lvl`/`gfx.lvl` regulator mailbox links.
   `adreno=8` runs the existing read-only steps 1–6, skips PAS staging step 7, then reads DRV2
@@ -133,11 +134,22 @@ The device-tree `iommus` tuples resolve through phandle `0x204` to `arm,smmu-kgs
 | GMU kernel | `5` | `qcom,gmu/gmu_kernel` |
 | GMU user | `4` | `qcom,gmu/gmu_user` |
 
-The SMMU node is marked `qcom,dynamic` and `qcom,use-3-lvl-tables`; the KGSL node also has
-`qcom,protect = <0x40000 0xc000>`. These facts identify the stream assignments and table mode,
-but they do not establish context-bank numbers, SMR masks, secure-context ownership, or whether
-the active hypervisor lets this kernel program those streams. Those still need validation against
-the matching Qualcomm KGSL/SMMU implementation and the live device before SMMU writes.
+The runtime DT carries `qcom,dynamic`, `qcom,use-3-lvl-tables`, and `qcom,disable-atos` on the
+SMMU node. The KGSL node has `qcom,protect = <0x40000 0xc000>` and
+`qcom,hyp_secure_alloc`; `qcom,enable-static-cb` is absent. Runtime validation now checks those
+exact Polaris properties before the diagnostic reads registers. Qualcomm defines static-CB mode
+as TrustZone-programmed SMR/S2CR state that the OS must not alter ([binding](https://android.googlesource.com/kernel/msm/+/975cca6a674717743cd614b8728cf27efb0b9215/Documentation/devicetree/bindings/iommu/arm%2Csmmu.txt));
+the backend refuses its presence. ATOS remains disabled and is never probed.
+
+The Qualcomm SDM845 GPU DT source comments that CB5 (ATOS) and CB5/6/7 are HYP-protected
+([SDM845 GPU DT](https://android.googlesource.com/kernel/msm/+/refs/heads/android-msm-baiji-4.9-pie-wear-dr/arch/arm64/boot/dts/qcom/sdm845-gpu.dtsi)).
+Qualcomm's Adreno SMMU code assigns CB0 to the GPU device
+([Adreno SMMU context-bank allocator](https://android.googlesource.com/kernel/common/+/748bf810c00543177d454aa7370ea1ddfe08dd06/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c)).
+The `qcom,protect` numeric pair describes a protected GPU register aperture; its values are not
+context-bank indices. HakiOS therefore treats CB0 as GPU-reserved and excludes CB5-7 from GMU
+candidates based on the Qualcomm target source, while keeping the secure GPU SIDs 1/2 untouched.
+These source rules do not establish the phone's live stream-to-context assignment or prove that
+the active hypervisor permits HakiOS to program any of these routes.
 The child node's `qcom,gpu-offset = <0x48000>` is an offset into the GPU register view for
 GPU-side access to that context bank; it is not a context-bank number or an offset to add to the
 SMMU physical base. KGSL's device-tree binding describes this property and notes that some
@@ -151,6 +163,24 @@ and SCTLR translation state. Multiple matching SMRs are reported as ambiguous. T
 read-only snapshot; it does not claim that a route is safe to adopt or program. The probe calculates
 the context-bank aperture as `2^(NUMPAGENDXB+1) * register-page-size` and checks it against the
 device-tree `reg` extent before reading context registers.
+Step 2 now also prints a read-only attach plan. It reserves Qualcomm's CB0 for GPU SID0, never
+plans secure GPU SIDs1/2, and considers only CB1-4 for separate GMU-kernel and GMU-user contexts.
+Candidate GMU banks must have zero in the sampled CBAR/CBA2R and architected stage-1 context
+registers (SCTLR, ACTLR, TTBR0/1, TCR/TCR2, CONTEXTIDR, MAIR0/1 and FSR), and no translation
+route may target them. With stream matching, the planner records invalid SMR slots; without it,
+it scans every SID-indexed S2CR entry that fits the mapped register window and refuses an
+incomplete scan. Existing translation routes, ambiguous matches, masked SMRs that could cover
+on the target streams, ambiguous matches, masked SMRs that could cover other clients, incomplete
+snapshots, and static-CB policy all prevent a complete plan. The result is only a candidate: it
+does not attach a context or write any SMMU register, and live ownership and HYP access still need
+confirmation before a write path can be enabled.
+
+A read-only check from Recovery found KGSL `active_cnt=0` and an empty KGSL context list. The
+available IOMMU debugfs page-table view exposed only its `pages` counter, not the stream-to-CB
+assignment. The same Recovery DT snapshot had the Polaris `qcom,protect` pair, HYP secure
+allocation and disabled-ATOS properties, with no `qcom,enable-static-cb`. This corroborates the
+runtime-DT policy checks but does not identify live context-bank ownership; no HakiOS `adreno=`
+stage was invoked and no Recovery MMIO/SMMU writes were made.
 The v2 SMMU at `0x05040000` is not interchangeable with the Redwood driver's SMMUv500 at
 `0x03da0000`.
 
@@ -312,11 +342,12 @@ bring-up and a bounded test submission.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
    maintenance are implemented, with OAS and PTFS_4K checks taken from the read-only ID registers.
    The local firmware probe validates the ZAP MDT layout and applies the upstream SQE check to the
-   payload after its 4-byte file prefix; the extracted SQE passes the version floor. Still discover
-   and validate the v2 stream-match/context-bank assignments, program independent 3D/GMU contexts
-   with verified attributes, validate A630 CP register protection, then bring up GMU and core
-   mappings, ring and fences and exercise the mapper on-device. Keep the backend disabled until
-   those pieces are verified.
+   payload after its 4-byte file prefix; the extracted SQE passes the version floor. The read-only
+   SMMUv2 probe now scans stream routes and context registers and produces conditional CB/SMR
+   candidates; run that diagnostic under HakiOS before treating any assignment as live. Then
+   verify HYP ownership, program independent 3D/GMU contexts with verified attributes, validate
+   A630 CP register protection, bring up GMU and core mappings, ring and fences, and exercise the
+   mapper on-device. Keep the backend disabled until those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
    command buffers; bounded test commands complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno
