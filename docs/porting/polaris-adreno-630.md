@@ -31,9 +31,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   SMMU output-address size, and kept for the backend lifetime. The diagnostic's IDR2 read supplies
   the OAS and 4-KiB table capability. Shared `map/mapped/unmap` uses the 3D root. Leaf permissions
   are per address space: 3D and `gmu_user` use unprivileged mappings, while `gmu_kernel` keeps
-  privileged mappings for HFI memory. `adreno=9` also allocates contiguous HFI memory, creates a
-  write-combined CPU alias, initializes its legacy HFI table, and maps its five 4-KiB pages into the
-  detached `gmu_kernel` software root at `0x60000000`. It also builds a detached AArch64 SMMUv2
+  privileged mappings for GMU shared memory. `adreno=9` allocates one contiguous 40 KiB region and
+  creates a write-combined CPU alias. It initializes the legacy HFI table at GMU VA `0x60000000`,
+  places the 16 KiB crash-dump area at `0x60100000` and the 4 KiB GMU log at `0x60200000`, then maps
+  all 10 pages into the detached `gmu_kernel` software root. It also builds a detached AArch64 SMMUv2
   context-register image from the root PA, ASID, decoded OAS and IDR0 coherent-walk capability.
   Noncoherent walks use noncacheable outer-shareable TCR attributes while the mapper cleans table
   pages. No context bank, stream route, SMMU register, GMU interrupt, or firmware state is changed;
@@ -111,6 +112,18 @@ allow it. A successful firmware boot alone is not a completed driver.
   It does not attach SID4 or SID0, authenticate ZAP, start the GMU/HFI, or enable rendering. This
   stage has not been run on the phone because SMMU write ownership under the active hypervisor is
   still unverified; `ready()` remains false.
+- `adreno=12` is a separate explicit GMU/HFI bring-up stage. It runs steps 1–6, prepares and maps
+  HFI, 16 KiB dump, and 4 KiB log buffers, loads and verifies the raw A630 GMU image, refreshes the
+  SMMU snapshot, then installs the GMU-kernel SID5 context. It programs the A6xx TCM-boot, HFI
+  table, log, SFR chip-ID, cache, power-collapse baseline, and AHB-fence registers; releases CM3;
+  polls the firmware-ready and HFI-queue status; sends the legacy five-dword `GMU_INIT`; and polls
+  the message queue for its matching ACK. It leaves SID4 and GPU SID0 unattached and does not load
+  or authenticate ZAP, submit RPMh tables/votes, start the 3D core, or enable rendering. On timeout
+  after CM3 release, it reasserts reset and marks the backend faulted while leaving SID5 attached.
+  This stage has not been invoked on the phone. The sequence follows Qualcomm's A6xx GMU TCM boot
+  and HFI queue setup plus its A630 legacy `GMU_INIT` path
+  ([`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/815ef3fd67546132532651279885563ff35a4605/drivers/gpu/msm/adreno_a6xx_gmu.c),
+  [`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/%2B/541919e72ee1156c0054952dd11d5066372095a8/drivers/gpu/msm/kgsl_hfi.c)).
 
 ## Polaris hardware facts
 
@@ -243,11 +256,12 @@ The A630 legacy HFI v1 wire format is now isolated in `drivers/gpu/hakios.adreno
 provides bounded shared-table initialization, command queue writes, response queue reads,
 sequence-number generation, the GMU init command, and v1 ACK matching. The queue header is 12
 dwords, the queue table is 54 dwords, and each queue contains 1024 dwords. A630's legacy queue IDs
-are 0/4/5/1 for command/message/debug/dispatch; the dispatch queue remains disabled. The host
-allocation is page-rounded to 20 KiB and its GMU virtual address belongs to the noncached kernel
-range beginning at `0x60000000`. `adreno=3` checks and reports this protocol layout. The HFI
-helpers manage the wire format only; step 9 supplies the detached software mapping, while context
-attachment, register programming, cache-policy setup, interrupts, and HFI startup remain pending.
+are 0/4/5/1 for command/message/debug/dispatch; the dispatch queue remains disabled. The HFI
+table/queue allocation is page-rounded to 20 KiB and its GMU virtual address belongs to the
+noncached kernel range beginning at `0x60000000`. `adreno=3` checks and reports this protocol
+layout. Step 9 prepares detached HFI/dump/log mappings, step 11 attaches the GMU-kernel context,
+and step 12 starts the GMU and sends the first `GMU_INIT` request. Further HFI command handling,
+performance/bandwidth tables, user and 3D contexts, and CP startup remain pending.
 The queue-table header still reports four active slots with dispatch disabled in its queue header,
 matching Qualcomm's A630 `hfi_init` (`num_active_q = HFI_QUEUE_MAX`); HakiOS preserves that v1
 contract ([`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_hfi.c)).
