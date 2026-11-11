@@ -92,11 +92,12 @@ tools/hakios-device.py check mydevice
 
 ## Metal and the panel
 
-The window server's Metal path is built for one GPU and one display controller so far, and it says so instead of guessing:
+The window server's Metal path has explicit GPU build profiles and a SoC-specific display measurement path:
 
-- **The GPU.** `hakios-metal/` has the tables of the Adreno of chip ID `0x06030500` (`include/hakios-metal/a6xx.hpp`). Another's is
-  refused by `hakios_metal_open()`, the reason goes to the log and the window server stays on OpenGL ES. A port of another
-  Adreno starts there, with Mesa's `freedreno_devices.py`.
+- **The GPU.** `hakios-metal/` defaults to the POCO X5 Pro A635 profile (`0x06030500`) and has a compile-time Polaris A630
+  profile (`GPU_PROFILE=a630`, `0x06030001`), using device data from Mesa's `freedreno_devices.py`. The open path refuses a
+  chip ID that does not match the build profile, logs the reason and leaves the window server on OpenGL ES. A630 has source
+  and build evidence only; it has not been validated on the MIX 2S.
 - **The scan.** `fb_beam` (frames written behind the panel's scan) and `fb_measure` read the display interface's registers.
   They are known for `sc7280`; on another SoC nothing is read and frames go on their beat. `fb_intf=PHYSICAL` names them,
   from Linux's catalogue for your SoC. `fb_beam` checks that they count like a line counter before it trusts them.

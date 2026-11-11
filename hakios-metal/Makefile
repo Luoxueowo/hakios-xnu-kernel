@@ -8,6 +8,7 @@
 #                        hakios-metal, and with it (plugin/tests/metal-plugin-test.sh; macOS only)
 #   make ios             the library and the probe for iOS 16.5 on the phone (needs the iPhoneOS 16.5 SDK; THEOS
 #                        or SDK= says where), into out/ios/ (make darwin: the same)
+#   make ios MESA=1 GPU_PROFILE=a630    build the MIX 2S / Polaris profile; the default is the Redwood A635 profile
 #   make clean
 
 CXX       ?= c++
@@ -19,7 +20,19 @@ SAN       ?=
 ifneq ($(SAN),)
 override CXXFLAGS += -fsanitize=$(SAN) -fno-omit-frame-pointer
 endif
-HOSTOUT   = out/host$(if $(SAN),-$(SAN))
+# One library is built for one Adreno profile. DEVICE=polaris selects the MIX 2S A630; an explicit
+# GPU_PROFILE overrides it for a cross-build. The default retains the existing A635 target.
+GPU_PROFILE ?= $(if $(filter polaris,$(DEVICE)),a630,a635)
+ifeq ($(filter $(GPU_PROFILE),a630 a635),)
+$(error GPU_PROFILE must be a630 or a635, got '$(GPU_PROFILE)')
+endif
+ifneq ($(words $(GPU_PROFILE)),1)
+$(error GPU_PROFILE must be a630 or a635, got '$(GPU_PROFILE)')
+endif
+GPU_PROFILE_FLAGS = $(if $(filter a630,$(GPU_PROFILE)),-DHAKIOS_METAL_PROFILE_A630,)
+override CXXFLAGS += $(GPU_PROFILE_FLAGS)
+HOST_PROFILE_SUFFIX = $(if $(filter a630,$(GPU_PROFILE)),-a630,)
+HOSTOUT   = out/host$(if $(SAN),-$(SAN))$(HOST_PROFILE_SUFFIX)
 .DEFAULT_GOAL := test
 
 # The host tools that make shader kernels into fixtures (tools/kernels.mk), and the link of Mesa's compiler libraries
@@ -36,7 +49,7 @@ HAKIOS    ?= $(if $(wildcard ../xnu/apply.sh),..,../workspace)
 ifneq ($(strip $(MESA)),)
 override CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_MESA_CXXFLAGS)
 HOSTLIBS  += $(HAKIOS_METAL_MESA_LIBS)
-HOSTOUT   = out/host-mesa$(if $(SAN),-$(SAN))
+HOSTOUT   = out/host-mesa$(if $(SAN),-$(SAN))$(HOST_PROFILE_SUFFIX)
 endif
 # the SDK as hakios lays it out: theos, or on macOS xnu-deps/theos-mac
 SDK       ?= $(abspath $(firstword $(wildcard $(THEOS)/sdks/iPhoneOS16.5.sdk $(HAKIOS)/xnu-deps/theos-mac/sdks/iPhoneOS16.5.sdk $(HOME)/theos/sdks/iPhoneOS16.5.sdk)))
@@ -91,6 +104,17 @@ ios: out/ios/libhakios-metal.a $(if $(wildcard $(IR3_CMDLINE_C)),out/ios/hakios-
 
 darwin: ios
 
+# Keep the active profile beside the single library path userland/build.sh links. Switching profiles
+# updates this prerequisite and forces all iOS objects to be rebuilt for the new target.
+.PHONY: force-ios-profile
+force-ios-profile:
+
+out/ios/.gpu-profile: force-ios-profile
+	@mkdir -p $(dir $@)
+	@if [ ! -f $@ ] || [ "$$(cat $@)" != "$(GPU_PROFILE)" ]; then \
+		printf '%s\n' '$(GPU_PROFILE)' > $@.tmp && mv $@.tmp $@; \
+	fi
+
 # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
 IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
 IOS_LIBS     =
@@ -100,23 +124,23 @@ IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)
 # the compiled-stage cache's key (src/compiler.cpp: kCacheBuild): what the compiler is made of -- its source, the
 # driver's headers and the Mesa archives linked in -- and not when it was built, so that a cache kept on the phone
 # across boots (var_store) outlives a rebuild of the plug-in that changed nothing of the compiler
-IOS_CACHE_BUILD := $(shell cat src/compiler.cpp include/hakios-metal/*.hpp $(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))) 2>/dev/null \
+IOS_CACHE_BUILD := $(shell printf '%s\n' '$(GPU_PROFILE)' | cat - src/compiler.cpp include/hakios-metal/*.hpp $(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))) 2>/dev/null \
 	| (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-24)
 ifneq ($(strip $(IOS_CACHE_BUILD)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_CACHE_BUILD='"$(IOS_CACHE_BUILD)"'
 endif
 endif
 
-out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
+out/ios/libhakios-metal.a: out/ios/.gpu-profile $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
 	@mkdir -p out/ios/obj
 	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
-		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
+		$(IOS_CXX) $(IOS_CXXFLAGS) $(GPU_PROFILE_FLAGS) -I../../../include -c ../../../$$f || exit 1; done
 	rm -f $@ && $(IOS_AR) $@ out/ios/obj/*.o
 
 # (and the front end's archive, as the host tests: a probe linked before the front end changed tests the old one)
 out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
 		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
-	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
+	$(IOS_CXX) $(IOS_CXXFLAGS) $(GPU_PROFILE_FLAGS) -Iinclude -o $@ tools/probe.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
 		-framework IOKit -framework CoreFoundation -framework IOSurface
 
 

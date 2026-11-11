@@ -1,5 +1,5 @@
-// The Adreno command processor's packets (PM4), as the A6xx family reads them (here the Adreno 7c+ Gen 3 of the
-// SM7325, chip id 0x06030500, an A635-family part to Mesa).
+// The Adreno command processor's packets (PM4), as the A6xx family reads them (the A630 Polaris and A635 Redwood
+// profiles supported by this backend).
 //
 // Two kinds are written here, the same two freedreno writes on these GPUs:
 //   type 4   "write COUNT registers from REG on":  0x4 << 28 | count | parity(count) << 7 | reg << 8 | parity(reg) << 27

@@ -916,7 +916,16 @@ void fillStream(pm4::Stream& stream, const Texture& target, const ClearWords& c,
     regs(stream, REG_A6XX_RB_2D_SRC_SOLID_C0, {c.value[0], c.value[1], c.value[2], c.value[3]});
     regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), tile, f.swap, f.srgb), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
     regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
+    if constexpr (a6xx::kMagicRbDbgEcoCntlBlit != a6xx::kMagicRbDbgEcoCntl) {
+        // Mesa's tu_clear_blit.cc r2d_run switches this non-context register around CP_BLIT on the A630.
+        stream.waitForIdle();
+        reg(stream, REG_A6XX_RB_DBG_ECO_CNTL, a6xx::kMagicRbDbgEcoCntlBlit);
+    }
     command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
+    if constexpr (a6xx::kMagicRbDbgEcoCntlBlit != a6xx::kMagicRbDbgEcoCntl) {
+        stream.waitForIdle();
+        reg(stream, REG_A6XX_RB_DBG_ECO_CNTL, a6xx::kMagicRbDbgEcoCntl);
+    }
 }
 
 void clearStream(pm4::Stream& stream, const Texture& target, const ClearWords& c, uint64_t ts, uint32_t level = 0, uint32_t slice = 0) {
@@ -1725,7 +1734,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // VS's MERGEDREGS is bit 20 and it has no THREADSIZE; the FS's has THREADSIZE, VARYING, UNK24 always, MERGEDREGS bit
     // 31), INSTRLEN, the 7-register OBJ_START block with the private memory's address and layout (zeros for a stage with
     // none), HW_STACK_OFFSET the per-SP size as turnip writes it (tu_shader.cc:1328-1338), the ST6_SHADER
-    // preload of min(instrlen, 127) units from the 128-byte aligned program, the immediates as compute uploads them
+    // preload of min(instrlen, a6xx::kInstrCacheSize) units from the 128-byte aligned program, the immediates as compute uploads them
     // (ST6_CONSTANTS, direct, at immediatesOffsetVec4)
     // ... then the pushed constant ranges, indirect, as compute uploads them (fd6_emit_user_consts / tu6_emit_xs's ranges,
     // tu_shader.cc:1397-1421) into the stage's own block

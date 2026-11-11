@@ -5,7 +5,7 @@
 //
 // What it proves and what it does not. A test that passes here has written packets that are well formed and name only
 // memory the GPU was given, and a compute dispatch whose state holds together: the program preloaded from where
-// SP_CS_OBJ_START points and no longer than the instruction cache (128 units hang this GPU; 127 is the limit), every
+// SP_CS_OBJ_START points and no longer than the selected profile's instruction cache, every
 // constant load within the program's constlen, the IBO descriptors loaded from where SP_CS_IBO points, each a buffer
 // view or a 2D image inside a buffer the GPU was given (a zero descriptor is a fault: an unaddressed slot gets a hole
 // descriptor), the two copies of the id registers equal, the thread size the same in both places that state it, the
@@ -25,7 +25,7 @@
 // the sysmem pass begun (the RM6_DIRECT_RENDER marker, both BIN_CONTROLs BUFFERS_IN_SYSMEM with no bins); the vertex
 // and fragment stages enabled in both HLSQ_xS_CNTL and SP_xS_CONFIG and the geometry stages off; each program 128-byte
 // aligned, instrlen * 128 bytes inside a buffer, preloaded from exactly there by the stage's opcode with at most
-// instrlen (and 127) units, every constant load within the stage's decoded CONSTLEN; the FS thread size equal in
+// instrlen (and a6xx::kInstrCacheSize) units, every constant load within the stage's decoded CONSTLEN; the FS thread size equal in
 // SP_FS_CTRL_REG0 and HLSQ_FS_CNTL_0; RB_MRT[0] a linear target of a known format whose pitch holds the window's rows and
 // whose rows (counted to 4) lie inside a buffer at a 64-aligned base, SP_FS_MRT_REG[0] and GRAS_LRZ_MRT_BUF_INFO_0 the
 // same format, BASE_GMEM 0; one MRT in both FS_OUTPUT_CNTL1 copies, a colour register in SP_FS_OUTPUT_REG[0], all four
@@ -50,8 +50,8 @@
 // the CCU holds, like a draw. The packing is this model's reading of the registers; whether the GPU packs the same
 // way is again the phone's to say.
 //
-// What it answers is what hakios's kernel driver answers (bsd/dev/hakios.adreno.c, hakios_gpu_parameter): GPU_ID 0,
-// the chip id 0x06030500 with a speed bin above it, 512 KiB of GMEM, 550 MHz. And it fails as that kernel fails. A
+// What it answers is the selected profile's MSM parameter set: A630's GPU ID 630 and 1 MiB GMEM, or Redwood A635's
+// GPU_ID 0 and 512 KiB GMEM. And it fails as that kernel fails. A
 // submission the GPU never finishes is a hang there, found by the wait's timeout alone (the GPU raises no fault for
 // it, and none of the measured hangs set a fault register); then either the kernel resets the GPU and gives up what it
 // had (boot-arg gpu_recover=1: the fence word is set to the last submission's number, so every wait ends, and FAULTS
@@ -186,12 +186,25 @@ public:
     void pause();
     void resume();
 
-    // what the kernel says about this GPU, for the fake to say the same and for a test to check it does
-    static constexpr uint64_t kChipId = 0x06030500;      // dt qcom,chipid: an A635-family part, "Adreno 7c+ Gen 3" to Mesa
-    static constexpr uint64_t kSpeedBin = 0x75;          // the phone's fuse value above the chip id, as the probe read it
-                                                         // (0x7506030500 on 28 October); Mesa's named row for this part
+    // What the selected kernel target profile reports. The A630 fuse value is not read by this fake.
+    static constexpr uint64_t kChipId = a6xx::kChipId;
+#if defined(HAKIOS_METAL_PROFILE_A630)
+    static constexpr uint64_t kGpuId = 630;
+    static constexpr uint64_t kSpeedBin = 0;
+    static constexpr uint64_t kGmemBase = 0x00100000;
+    static constexpr uint64_t kGmemBytes = 1024 * 1024;
+    static constexpr uint64_t kMaxFrequencyHz = 710000000;
+    static constexpr uint64_t kHighestBankBit = 15;
+    static constexpr uint64_t kMacrotileMode = 0;
+#else
+    static constexpr uint64_t kGpuId = 0;
+    static constexpr uint64_t kSpeedBin = 0x75;           // Redwood probe value (0x7506030500 on 28 October)
+    static constexpr uint64_t kGmemBase = 0;
     static constexpr uint64_t kGmemBytes = 512 * 1024;
     static constexpr uint64_t kMaxFrequencyHz = 550000000;
+    static constexpr uint64_t kHighestBankBit = 14;
+    static constexpr uint64_t kMacrotileMode = 1;
+#endif
 
 private:
     struct UboDescriptor {

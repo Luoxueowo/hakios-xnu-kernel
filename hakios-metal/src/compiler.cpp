@@ -51,7 +51,7 @@ namespace {
 
 std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
 
-// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row
+// one compiler for the selected target profile, as the kernel names it: Mesa resolves its chip ID through GPUId.
 ir3_compiler* theCompiler() {
     static ir3_compiler* compiler = [] {
         fd_dev_id id{};
@@ -73,6 +73,12 @@ ir3_compiler* theCompiler() {
 bool refuse(std::string* why, const std::string& text) {
     *why = text;
     return false;
+}
+
+std::string missingCompiler() {
+    char text[80];
+    std::snprintf(text, sizeof(text), "ir3 has no compiler for chip %#x", a6xx::kChipId);
+    return text;
 }
 
 // KernelTextureDim from the NIR's sampler dimension; false, with the dimension's name, for the ones no Texture can be
@@ -1070,7 +1076,7 @@ bool hasCompiler() { return theCompiler() != nullptr; }
 std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
     std::lock_guard<std::mutex> g(gCompilerLock);
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, missingCompiler());
         return nullptr;
     }
     Translation t;
@@ -1279,7 +1285,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
                                            const KnownBuffer* known) {
     std::lock_guard<std::mutex> g(gCompilerLock);
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, missingCompiler());
         return nullptr;
     }
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);

@@ -2,9 +2,10 @@
 
 This is part of the kernel's tree: `make ios` here, and `userland/build.sh` links what it builds.
 
-The Metal driver of [hakios](https://github.com/oosexgang/hakios-xnu-kernel), in C++: Metal's command model on the phone's
-Adreno GPU (an Adreno 7c+ Gen 3, chip id 0x06030500), through the kernel's own GPU driver (HakiosGPU), without Mesa
-in between.
+The Metal driver of [hakios](https://github.com/oosexgang/hakios-xnu-kernel), in C++: Metal's command model through the
+kernel's own GPU driver (HakiosGPU), without Mesa in between. The default build profile is the POCO X5 Pro's Adreno 7c+ Gen 3
+(chip id `0x06030500`). `GPU_PROFILE=a630` selects a source/build profile for the MIX 2S Polaris (chip id `0x06030001`);
+that profile has not been run on the phone and is not evidence of working device support.
 
 What there is today, and what each part is checked by:
 
@@ -241,6 +242,7 @@ make ios      # out/ios/libhakios-metal.a, for iOS 16.5 (the SDK as hakios lays 
 make check    # the tests, then the Metal plug-in (plugin/) on this Mac, without and with hakios-metal
 make test MESA=1   # with the compiler linked in, against a Mesa host build carrying hakios's AIR front end
 make ios MESA=1    # ... and on the phone, against hakios's iOS build of the same libraries (tools/compiler.mk)
+make ios MESA=1 GPU_PROFILE=a630  # the MIX 2S / Polaris profile; no runtime validation yet
 ```
 
 On Linux `make ios` takes hakios's cross compiler from `../workspace/xnu-deps/host/bin` (HAKIOS= another tree) and

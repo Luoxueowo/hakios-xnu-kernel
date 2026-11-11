@@ -558,7 +558,7 @@ bool gmemClearWords(const FormatInfo& f, const double rgba[4], uint32_t out[4]);
 // fbRead, dualSrcBlend, readsPrimid, numSamplerPrefetch != 0, a VS attribute the vertex descriptor does not describe or
 // describes in a format, step or layout not served or whose fetch runs past its bound buffer, instanceCount != 1, a primitive
 // other than triangles and strips, vertexCount 0, a viewport or scissor outside the target, a Clear colour with a
-// non-finite channel (or a fractional or out-of-range one into an integer target), store other than kStore, instrlen > 127, pvtmem, the two stages' constlen over 512 vec4 together, and whatever link() refuses.
+// non-finite channel (or a fractional or out-of-range one into an integer target), store other than kStore, instrlen > a6xx::kInstrCacheSize, pvtmem, the two stages' constlen over 512 vec4 together, and whatever link() refuses.
 bool encode(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw,
             const Bindings& vsBindings, const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram,
             uint64_t table, uint8_t* tableCpu, std::string* why, const Options& options = Options{});

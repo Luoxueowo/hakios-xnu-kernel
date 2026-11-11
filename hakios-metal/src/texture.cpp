@@ -1242,7 +1242,10 @@ bool makeSampler(const SamplerDesc& d, Sampler* out, std::string* why) {
     if (d.minFilter > 2 || d.magFilter > 2) {
         return refuse(why, "sampler filters min " + n(d.minFilter) + " mag " + n(d.magFilter) + ": Nearest (0), Linear (1) or bicubic (2)");
     }
-    // bicubic is the TP's own cubic filter, which this chip has (freedreno_devices.py a6xx_gen4 has_tex_filter_cubic;
+    if ((d.minFilter == 2 || d.magFilter == 2) && !a6xx::kHasCubicFilter) {
+        return refuse(why, "bicubic sampling is unavailable in the selected Adreno A6xx profile");
+    }
+    // bicubic is the TP's own cubic filter (freedreno_devices.py's A635 a6xx_gen4 has_tex_filter_cubic;
     // turnip's VK_FILTER_CUBIC_EXT, tu6_tex_filter)
     auto filter = [](uint32_t m) { return m == 2 ? A6XX_TEX_CUBIC : m == 1 ? A6XX_TEX_LINEAR : A6XX_TEX_NEAREST; };
     f.min = filter(d.minFilter);

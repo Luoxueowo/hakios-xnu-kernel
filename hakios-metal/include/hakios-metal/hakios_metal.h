@@ -70,7 +70,7 @@ bool hakios_metal_chip_known(uint32_t chip);
 /* (for the tests: a device on the fake GPU, which runs the packets in this process) */
 hakios_metal_device *hakios_metal_open_fake(void);
 void hakios_metal_close(hakios_metal_device *device);
-/* the chip id (0x06030500 on the phone: the kernel's GPU_ID is 0, the chip id is what names the GPU) */
+/* the selected target profile's chip id: the kernel's GPU_ID and chip ID are read from HakiosGPU */
 uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
 /* whether kernels can be compiled in this build (MESA=1); without it hakios_metal_kernel_compile* refuse by name */
 int hakios_metal_has_compiler(void);

@@ -5,7 +5,7 @@
 //
 // What one dispatch is made of:
 //   - the program: the kernel's words in a buffer of their own, named by SP_CS_OBJ_START and preloaded with
-//     CP_LOAD_STATE6_FRAG (ST6_SHADER), at most 127 units of it: 128 hangs this generation (instr_cache_size);
+//     CP_LOAD_STATE6_FRAG (ST6_SHADER), at most a6xx::kInstrCacheSize units (Mesa's per-profile instr_cache_size);
 //   - the constants: the kernel's immediates (direct), the driver params (direct), the pushed UBO ranges (indirect,
 //     straight out of the bound buffer), each a CP_LOAD_STATE6_FRAG (ST6_CONSTANTS) into the constant file, every one
 //     within the kernel's constlen or the dispatch is refused;
@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/kernel.hpp"
 #include "hakios-metal/pm4.hpp"
 
@@ -69,7 +70,7 @@ struct Bindings {
 namespace compute {
 
 constexpr uint32_t kMaxLocalThreads = 1024;     // the hardware's threadgroup limit, and the NDRANGE fields' (10 bits)
-constexpr uint32_t kMaxSharedBytes = 32 * 1024; // threadgroup memory a group can have (freedreno_devices.py: the A635's cs_shared_mem_size)
+constexpr uint32_t kMaxSharedBytes = a6xx::kCsSharedMemSize; // per-group thread memory from the selected Mesa device profile
 // What a dispatch owns in GPU memory besides the program, one 16 KiB page on the phone whatever the size (gpu.cpp rounds
 // to it): the IBO descriptors (64 bytes each; NIBO is 7 bits and SSBO slots go up to Metal's 31 buffers plus 16 images),
 // the texture table (TEX_CONST, 64 bytes each, 64-aligned: SP_CS_TEX_CONST's alignment), the sampler table (TEX_SAMP,
@@ -126,7 +127,7 @@ struct Options {
     // colour base registers pointing at the table's zero entry, in the prelude. Gallium writes all three at every batch
     // start (fd6_emit.cc:977-981, 1035-1038); nothing wrote a TP register here before textures.
     bool tpState = true;
-    // A cap below a6xx::kInstrCacheSize (Mesa's instr_cache_size for this chip) on the program units CP_LOAD_STATE6
+    // A cap below a6xx::kInstrCacheSize (Mesa's instr_cache_size for the selected chip profile) on the program units CP_LOAD_STATE6
     // preloads; 0 is none. For a probe that has the GPU fetch the rest past the preload of a program that would fit.
     uint32_t preloadCap = 0;
 };

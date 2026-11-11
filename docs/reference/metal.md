@@ -4,17 +4,18 @@ Two implementations of Metal draw the window server on the phone's Adreno 642L. 
 measure it, and what is not known. The numbers: [Metal measurements](metal-measurements.md). How it got here, step by step:
 [the plan](../metal-plan.md).
 
-The tested device for both paths below is the POCO X5 Pro's Adreno 642L; neither path has been run on the MIX 2S. The in-tree
-`hakios-metal` backend does not support Polaris: it accepts chip ID `0x06030500` and its PM4, GMEM, texture and ir3 compiler
-profile describes the A635-family Adreno 642L. Polaris reports `0x06030001`, so `hakios_metal_open()` rejects it. Merely changing
-that check would leave the backend's A635 data in use.
+The tested device for both paths below is the POCO X5 Pro's Adreno 642L; neither path has been run on the MIX 2S. `hakios-metal`
+now has a separate compile-time A630 profile for Polaris, selected with `GPU_PROFILE=a630` (the default remains A635). It
+selects the A630 chip ID, GMEM and shader limits, compiler target, device registers, and CP_BLIT register switch, and the open
+path still rejects a device whose chip ID does not match the selected profile. This is source/build support only: the A630
+profile, command stream and compositor have not been run on a MIX 2S.
 
 The `metal2vulkan` route has a promising A630 match at the software profile layer. Mesa 25.0.7's Turnip device table includes
 GPU ID 630 as A6xx gen1; the Polaris kernel profile reports GPU ID 630, chip ID `0x06030001`, GMEM base `0x00100000` and GMEM
-size 1 MiB. Mesa's A630 entry uses two CCUs, 32 VSC pipes, 32 KiB shared compute memory and 2048 fibers per SP. These matching
-values make metal2vulkan/Turnip the existing Metal route to bring up first on Polaris. They do not establish that its command
-stream, shader compiler or compositor works on the phone; that route still needs controlled device validation. Sources in this
-tree: `xnu-deps/build/mesa/mesa-25.0.7/src/freedreno/common/freedreno_devices.py`,
+size 1 MiB. Mesa's A630 entry uses two CCUs, 32 VSC pipes, 32 KiB shared compute memory and 2048 fibers per SP. The in-tree
+`hakios-metal` profile uses the same Mesa A630 device facts, but the match does not establish that either route's command
+stream, shader compiler or compositor works on the phone; both still need controlled device validation. Sources in this tree:
+`xnu-deps/build/mesa/mesa-25.0.7/src/freedreno/common/freedreno_devices.py`,
 `xnu-deps/build/mesa/mesa-25.0.7/src/freedreno/drm-shim/freedreno_noop.c`, and
 `drivers/gpu/hakios.adreno.c` (`polaris_gpu_profile`).
 
@@ -91,7 +92,8 @@ CA_QC_METALLIB=/path/to/default.metallib tools/ca-metallib.py ~/ca-share    # of
 **hakios-metal.** It is in this tree, in `hakios-metal/`; `HAKIOS_METAL=` names another copy:
 
 ```sh
-(cd hakios-metal && make ios MESA=1)         # needs tools/mk-mesa.sh's tree
+(cd hakios-metal && make ios MESA=1)         # Redwood A635 profile (default)
+(cd hakios-metal && make ios MESA=1 GPU_PROFILE=a630)  # MIX 2S / Polaris A630 profile
 METAL_PLUGIN=ca RC_JOBS=rc.jobs.bench EXTRA_SHARE=~/ca-share REST=1 SYSTEM=1 userland/build.sh
 ```
 

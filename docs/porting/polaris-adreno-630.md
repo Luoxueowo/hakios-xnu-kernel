@@ -45,9 +45,9 @@ allow it. A successful firmware boot alone is not a completed driver.
 - The in-tree `metal2vulkan` route has a matching Mesa/Turnip device profile for Polaris: Mesa 25.0.7 maps GPU ID 630 to
   A6xx gen1, and the Polaris kernel profile reports GPU ID 630, chip ID `0x06030001`, GMEM base `0x00100000`, and 1 MiB GMEM.
   Mesa's A630 device data specifies two CCUs, 32 VSC pipes, 32 KiB shared compute memory, and 2048 fibers per SP. This makes
-  metal2vulkan/Turnip the first existing Metal path to validate on the MIX 2S. It is a profile match only: no Vulkan workload,
-  Metal compositor, or command stream has been validated on Polaris. The separate `hakios-metal` backend remains A635-specific
-  (`0x06030500`) and rejects the A630.
+  metal2vulkan/Turnip one Metal path to validate on the MIX 2S. It is a profile match only: no Vulkan workload, Metal
+  compositor, or command stream has been validated on Polaris. `hakios-metal` now also has a separate build-time A630 profile
+  based on the same Mesa device entry; it has source/build evidence only and still needs controlled phone validation.
 - The Turnip DRM shim's timeline syncobjs now grow their pending-fence list as needed. When a
   fence queue reaches its polling interval, it only advances a point after a nonblocking kernel
   wait confirms completion; it no longer discards the oldest point after an unchecked 10-second
@@ -838,13 +838,12 @@ command isolation review, and bounded hardware submission checks.
    complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno
    buffer allocation, mappings, command submission, synchronization, surfaces and display; then
-   add an A630-specific Metal client profile and exercise that path on the same service. The
-   existing `hakios-metal` implementation cannot be used as-is: `Gpu::chipId()` reads Polaris's
-   `0x06030001`, while `hakios_metal_chip_known()` only accepts `0x06030500` (the A635-family
-   Adreno 642L profile) or zero. Its PM4, 512 KiB GMEM, texture and ir3 compiler tables are also
-   built for that A635 profile; Polaris reports 1 MiB GMEM. The current Metal open path therefore
-   refuses the A630 before command submission. Preserve the chip-ID gate until the A630-specific
-   hardware and compiler data are implemented and validated. The shared service now gates new
+   exercise both the `metal2vulkan` route and `hakios-metal`'s A630 profile on the same service. The
+   A630-specific `hakios-metal` build profile is now present: `Gpu::chipId()` must match Polaris's
+   `0x06030001`, and the profile uses its 1 MiB GMEM plus Mesa's A630 compiler and device data. This
+   is source/build evidence only; it does not validate the command stream or compositor on the
+   phone. Keep the chip-ID gate and do not enable the Metal path until the A630 profile has been
+   exercised on hardware. The shared service now gates new
    submissions after a long completion timeout and retains in-flight resources; add and validate
    an A630 hardware recovery/restart policy and the resource limits needed for persistent system use.
    **Gate:** sustained UI rendering, client teardown, repeated GPU start/stop, and software
@@ -876,10 +875,10 @@ command isolation review, and bounded hardware submission checks.
   Apps RSC active-TCS path remains unverified on hardware.
 - Cache coherency, interrupt availability, A630 hardware hang recovery/restart, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
-- The existing `hakios-metal` window-server client is A635/Adreno 642L-specific. It refuses the
-  Polaris A630 chip ID (`0x06030001` versus its accepted `0x06030500`) and its command, GMEM,
-  texture and ir3 compiler data do not describe the A630. Until an A630-specific implementation
-  is validated, the MIX 2S UI must use the non-Metal rendering path.
+- `hakios-metal` has an A630 build profile (`GPU_PROFILE=a630`) covering the Polaris chip ID, 1 MiB GMEM, Mesa A630
+  compiler/device data, and the A630 CP_BLIT register switch. It has compile/source evidence only: no MIX 2S command stream,
+  Metal compositor, window-server session, hang recovery or sustained workload has been validated. Keep the MIX 2S UI on the
+  non-Metal rendering path until those hardware gates pass.
 - Do not assume CP APRIV can separate kernel and client mappings on this device. The Polaris
   SDM845 kernel's `a630v2` catalog entries omit `ADRENO_APRIV`, and its A6xx ring startup path does
   not program `CP_APRIV_CNTL`. Matching KGSL allocates its CP ring and SQE microcode as

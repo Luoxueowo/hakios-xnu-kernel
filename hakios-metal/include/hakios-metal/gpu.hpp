@@ -70,9 +70,9 @@ struct SurfaceInfo {
     uint32_t offset = 0, rowBytes = 0, width = 0, height = 0, pixelFormat = 0, planes = 0;
 };
 
-// GET_PARAM's numbers (msm_drm.h's MSM_PARAM_*), the ones the kernel answers. GPU_ID is 0 there: the chip id says
-// what the GPU is, 0x06030500 (dt qcom,chipid, an A635-family part, "Adreno 7c+ Gen 3" to Mesa) with the phone's
-// speed bin in the word above it. FAULTS counts the GPU's resets after hangs (boot-arg gpu_recover=1): a submission
+// GET_PARAM's numbers (msm_drm.h's MSM_PARAM_*), the ones the kernel answers. GPU_ID is 0 on Redwood and 630 on
+// Polaris; CHIP_ID identifies the part (the selected profile's chip ID) with the phone's speed bin in the word above
+// it. FAULTS counts the GPU's resets after hangs (boot-arg gpu_recover=1): a submission
 // that completes after the count rose was given up by a reset, not run (command.cpp uses it that way).
 enum : uint32_t {
     kPipe3D = 1,
@@ -157,7 +157,7 @@ public:
 
     // what the driver says about the GPU (kParam...): 0 and *value, or an errno
     int param(uint32_t which, uint64_t* value);
-    // the chip id without the speed bin above it: 0x06030500 on the phone, 0 if the driver does not say
+    // the chip id without the speed bin above it: the selected profile's ID, or 0 if the driver does not say
     uint32_t chipId();
     // how many times the kernel has reset a hung GPU in this run (0 when it cannot say)
     uint64_t faults();
