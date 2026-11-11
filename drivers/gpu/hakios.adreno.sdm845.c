@@ -5,12 +5,13 @@
  *
  * adreno=1..6 performs read-only probes. Explicit adreno=7 stages and releases PAS metadata,
  * adreno=10 loads GMU ITCM while reset stays asserted, adreno=11 installs only the GMU-kernel
- * SMMUv2 context and SID route, adreno=12 boots the GMU and checks HFI firmware version, and
- * adreno=13 sends the A630 HFI performance table; adreno=14 sends that table and the reconstructed
- * DDR/CNOC bandwidth table, then closes the legacy HFI message phase with HFI_TEST. Write stages
- * are guarded by runtime preflight/readbacks and are not to be invoked on hardware during this
- * bring-up. ZAP authentication, GMU-user and 3D contexts, GPU DCVS, command submission, and
- * rendering are still unavailable, so `ready()` remains false.
+ * SMMUv2 context and SID route, adreno=12 takes the default DDR vote through Apps RSC before booting
+ * the GMU and checks HFI firmware version, and adreno=13 sends the A630 HFI performance table;
+ * adreno=14 sends that table and the reconstructed DDR/CNOC bandwidth table, closes the legacy
+ * HFI message phase with HFI_TEST, requests initial DCVS, then releases the temporary host DDR vote.
+ * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
+ * during this bring-up. ZAP authentication, GMU-user and 3D contexts, GPU DCVS, command submission,
+ * and rendering are still unavailable, so `ready()` remains false.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
  *   qcom,gpucc@5090000 (qcom,gpucc-sdm845-v2)
@@ -42,6 +43,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern lck_mtx_t hakios_rsc_lock;
 
 #define SDM845_SOC_BASE                 0x00100000ul
 #define POLARIS_GPUCC_PHYS              0x05090000ul
@@ -109,6 +111,8 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_RPMH_ID_MINOR_SHIFT       8u
 #define POLARIS_RPMH_ID_VERSION_MASK      0xffu
 #define POLARIS_RPMH_TCS_IRQ_STATUS       0x0004u
+#define POLARIS_RPMH_TCS_IRQ_CLEAR        0x0008u
+#define POLARIS_RPMH_TCS_WAIT_FOR_DONE    0x0010u
 #define POLARIS_RPMH_TCS_STATUS_V27       0x0018u
 #define POLARIS_RPMH_TCS_CONTROL_V27      0x0014u
 #define POLARIS_RPMH_TCS_CMD_ENABLE_V27   0x001cu
@@ -120,6 +124,13 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_RPMH_TCS_SLEEP_TYPE       0u
 #define POLARIS_RPMH_TCS_WAKE_TYPE        1u
 #define POLARIS_RPMH_TCS_CONTROL_TYPE     3u
+#define POLARIS_RPMH_TCS_COMMAND_BASE     0x0030u
+#define POLARIS_RPMH_TCS_COMMAND_STRIDE   0x0014u
+#define POLARIS_RPMH_TCS_MSGID_WRITE_WAITED 0x00010108u
+#define POLARIS_RPMH_TCS_ACTIVE_MODE      (1u << 16)
+#define POLARIS_RPMH_TCS_TRIGGER          (1u << 24)
+#define POLARIS_RPMH_TCS_POLL_LIMIT       2000u
+#define POLARIS_RPMH_TCS_POLL_DELAY_US    50u
 #define POLARIS_RPMH_DRV_NUM_TCS_SHIFT    6u
 #define POLARIS_RPMH_DRV_NUM_TCS_MASK     0x3fu
 #define POLARIS_RPMH_DRV_NCPT_SHIFT       27u
@@ -516,6 +527,7 @@ static bool polaris_gmu_hfi_ready;
 static bool polaris_gmu_hfi_sealed;
 static bool polaris_gmu_hfi_perf_table_ready;
 static bool polaris_gmu_hfi_bw_table_ready;
+static bool polaris_gmu_temp_bus_vote_active;
 static bool polaris_gmu_domain_ready;
 static bool polaris_gpu_core_ready;
 static bool polaris_smmu_backend_enabled;
@@ -3433,7 +3445,7 @@ polaris_a630_hfi_bus_row_build(const struct polaris_a630_hfi_bus_route_state *ro
 		row[i] = (commit ? POLARIS_A630_BCM_COMMIT_MASK : 0) |
 		    ((vote_ab != 0 || vote_ib != 0) ? POLARIS_A630_BCM_VALID_MASK : 0) |
 		    ((uint32_t)vote_ab << 14) | (uint32_t)vote_ib;
-		/* Match A630 KGSL build_rpmh_bw_votes(), which records BIT(usecase_index) for wait commands. */
+		/* Qualcomm 4.9 KGSL computes this HFI mask only for usecase 0 and sets BIT(0). */
 		if (commit) {
 			*wait_mask |= 1u;
 		} else {
@@ -3441,6 +3453,22 @@ polaris_a630_hfi_bus_row_build(const struct polaris_a630_hfi_bus_route_state *ro
 		}
 	}
 	return true;
+}
+
+static bool
+polaris_a630_hfi_row_commit_mask(const uint32_t *row, uint32_t command_count, uint32_t *wait_mask)
+{
+	if (row == NULL || wait_mask == NULL || command_count == 0 ||
+	    command_count > POLARIS_A630_HFI_MAX_DDR_COMMANDS) {
+		return false;
+	}
+	*wait_mask = 0;
+	for (uint32_t command = 0; command < command_count; command++) {
+		if ((row[command] & POLARIS_A630_BCM_COMMIT_MASK) != 0) {
+			*wait_mask |= 1u << command;
+		}
+	}
+	return *wait_mask != 0;
 }
 
 static bool
@@ -3470,7 +3498,7 @@ polaris_gmu_hfi_bw_table_build(uint16_t sequence, struct polaris_a630_hfi_bw_tab
 	    !polaris_a630_hfi_bus_route_load(&cnoc_route, &polaris_gmu_cnoc_levels[0], &cnoc_state) ||
 	    ddr_state.vote_count > POLARIS_A630_HFI_MAX_DDR_COMMANDS ||
 	    cnoc_state.vote_count > POLARIS_A630_HFI_MAX_CNOC_COMMANDS) {
-		printf("adreno-sdm845: step 14 cannot reconstruct bounded GPU DDR/CNOC TCS tables from Polaris DT and CMD_DB\n");
+		printf("adreno-sdm845: cannot reconstruct bounded A630 GPU DDR/CNOC TCS tables from Polaris DT and CMD_DB\n");
 		return false;
 	}
 
@@ -3484,7 +3512,7 @@ polaris_gmu_hfi_bw_table_build(uint16_t sequence, struct polaris_a630_hfi_bw_tab
 		uint32_t wait_mask;
 
 		if (!polaris_a630_hfi_bus_row_build(&ddr_state, &polaris_gpu_bus_levels[i], row, addresses, &wait_mask)) {
-			printf("adreno-sdm845: step 14 could not convert GPU bandwidth usecase %u into BCM TCS commands\n", i);
+			printf("adreno-sdm845: could not convert GPU bandwidth usecase %u into BCM TCS commands\n", i);
 			return false;
 		}
 		if (i == 0) {
@@ -3497,7 +3525,7 @@ polaris_gmu_hfi_bw_table_build(uint16_t sequence, struct polaris_a630_hfi_bw_tab
 		uint32_t wait_mask;
 
 		if (!polaris_a630_hfi_bus_row_build(&cnoc_state, &polaris_gmu_cnoc_levels[i], row, addresses, &wait_mask)) {
-			printf("adreno-sdm845: step 14 could not convert GMU CNOC usecase %u into BCM TCS commands\n", i);
+			printf("adreno-sdm845: could not convert GMU CNOC usecase %u into BCM TCS commands\n", i);
 			return false;
 		}
 		if (i == 0) {
@@ -3506,12 +3534,189 @@ polaris_gmu_hfi_bw_table_build(uint16_t sequence, struct polaris_a630_hfi_bw_tab
 	}
 	if (!polaris_a630_hfi_make_header(POLARIS_A630_HFI_ID_BW_VOTE_TABLE,
 	    POLARIS_A630_HFI_BW_TABLE_DWORDS, POLARIS_A630_HFI_TYPE_COMMAND, sequence, &table->header)) {
-		printf("adreno-sdm845: step 14 could not encode the fixed A630 HFI v1 BW_VOTE_TBL header\n");
+		printf("adreno-sdm845: could not encode the fixed A630 HFI v1 BW_VOTE_TBL header\n");
 		return false;
 	}
-	printf("adreno-sdm845: step 14 built HFI BW_VOTE_TBL: %u DDR levels/%u BCM commands and %u CNOC levels/%u BCM commands; wait masks=%#x/%#x\n",
+	printf("adreno-sdm845: built A630 HFI BW_VOTE_TBL: %u DDR levels/%u BCM commands and %u CNOC levels/%u BCM commands; wait masks=%#x/%#x\n",
 	    table->bw_level_num, table->ddr_cmds_num, polaris_gmu_cnoc_level_count,
 	    table->cnoc_cmds_num, table->ddr_wait_bitmask, table->cnoc_wait_bitmask);
+	return true;
+}
+
+/*
+ * Submit one Apps-RSC active TCS usecase. Polaris' validated DRV2 v2.7 layout uses TCS0 for
+ * active requests; serialize it with the other HakiOS RPMh clients and leave an in-flight TCS
+ * untouched if it does not complete within the bounded wait.
+ */
+static bool
+polaris_rpmh_active_tcs_request(const uint32_t *addresses, const uint32_t *data,
+	uint32_t command_count, uint32_t wait_mask, bool *request_submitted)
+{
+	uint32_t revision, major, minor, drv_config, hardware_tcs, commands_per_tcs;
+	uint32_t tcs_offset = polaris_rpmh_tcs_offset;
+	uint32_t tcs_status_offset, tcs_control_offset, tcs_cmd_enable_offset;
+	uint32_t enabled_mask, status, control, done = 0, command_status[POLARIS_A630_HFI_MAX_DDR_COMMANDS];
+	bool completed = false, cleanable = false, success = false;
+
+	if (request_submitted != NULL) {
+		*request_submitted = false;
+	}
+	if (addresses == NULL || data == NULL || command_count == 0 ||
+	    command_count > POLARIS_A630_HFI_MAX_DDR_COMMANDS || command_count >= 32u ||
+	    (polaris_rpmh_tcs_counts[POLARIS_RPMH_TCS_ACTIVE_TYPE] == 0) ||
+	    (wait_mask & ~((1u << command_count) - 1u)) != 0 ||
+	    polaris_rpmh_drv.physical == 0 || polaris_rpmh_drv.size == 0 || !map_block(&polaris_rpmh_drv)) {
+		printf("adreno-sdm845: Apps RSC active-TCS request has invalid bounds or no validated DRV2 mapping\n");
+		return false;
+	}
+	for (uint32_t command = 0; command < command_count; command++) {
+		bool commit = (data[command] & POLARIS_A630_BCM_COMMIT_MASK) != 0;
+
+		if (addresses[command] == 0 || commit != ((wait_mask & (1u << command)) != 0)) {
+			printf("adreno-sdm845: Apps RSC command %u has no address or its commit/wait mask disagrees\n", command);
+			return false;
+		}
+	}
+
+	revision = probe_read(&polaris_rpmh_drv, POLARIS_RPMH_DRV_ID);
+	major = (revision >> POLARIS_RPMH_ID_MAJOR_SHIFT) & POLARIS_RPMH_ID_VERSION_MASK;
+	minor = (revision >> POLARIS_RPMH_ID_MINOR_SHIFT) & POLARIS_RPMH_ID_VERSION_MASK;
+	if (major != 2u || minor != 7u) {
+		printf("adreno-sdm845: Apps RSC active-TCS writes require DRV2 v2.7, found v%u.%u; request refused\n",
+		    major, minor);
+		return false;
+	}
+	drv_config = probe_read(&polaris_rpmh_drv, POLARIS_RPMH_DRV_CONFIG);
+	hardware_tcs = (drv_config >> (POLARIS_RPMH_DRV_NUM_TCS_SHIFT * polaris_rpmh_drv_id)) &
+	    POLARIS_RPMH_DRV_NUM_TCS_MASK;
+	commands_per_tcs = (drv_config >> POLARIS_RPMH_DRV_NCPT_SHIFT) & POLARIS_RPMH_DRV_NCPT_MASK;
+	if (hardware_tcs != polaris_rpmh_total_tcs ||
+	    hardware_tcs < polaris_rpmh_tcs_counts[POLARIS_RPMH_TCS_ACTIVE_TYPE] ||
+	    commands_per_tcs < command_count || tcs_offset + POLARIS_RPMH_TCS_STRIDE > polaris_rpmh_drv.size) {
+		printf("adreno-sdm845: Apps RSC TCS layout has %u/%u commands, hardware TCS=%u, DT TCS=%u; request refused\n",
+		    commands_per_tcs, command_count, hardware_tcs, polaris_rpmh_total_tcs);
+		return false;
+	}
+	tcs_status_offset = POLARIS_RPMH_TCS_STATUS_V27;
+	tcs_control_offset = POLARIS_RPMH_TCS_CONTROL_V27;
+	tcs_cmd_enable_offset = POLARIS_RPMH_TCS_CMD_ENABLE_V27;
+	enabled_mask = (1u << command_count) - 1u;
+
+	lck_mtx_lock(&hakios_rsc_lock);
+	status = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_status_offset);
+	control = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_control_offset);
+	if (status == 0 || probe_read(&polaris_rpmh_drv, tcs_offset + tcs_cmd_enable_offset) != 0) {
+		printf("adreno-sdm845: Apps RSC active TCS0 is busy or has enabled commands (status=%#x control=%#x); request refused\n",
+		    status, control);
+		goto out;
+	}
+
+	probe_write(&polaris_rpmh_drv, tcs_offset + POLARIS_RPMH_TCS_IRQ_CLEAR, 1u);
+	for (uint32_t command = 0; command < command_count; command++) {
+		uint32_t command_offset = tcs_offset + POLARIS_RPMH_TCS_COMMAND_BASE +
+		    POLARIS_RPMH_TCS_COMMAND_STRIDE * command;
+
+		probe_write(&polaris_rpmh_drv, command_offset, POLARIS_RPMH_TCS_MSGID_WRITE_WAITED);
+		probe_write(&polaris_rpmh_drv, command_offset + 4u, addresses[command]);
+		probe_write(&polaris_rpmh_drv, command_offset + 8u, data[command]);
+	}
+	probe_write(&polaris_rpmh_drv, tcs_offset + POLARIS_RPMH_TCS_WAIT_FOR_DONE, wait_mask);
+	probe_write(&polaris_rpmh_drv, tcs_offset + tcs_cmd_enable_offset, enabled_mask);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	control = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_control_offset) & ~POLARIS_RPMH_TCS_TRIGGER;
+	probe_write(&polaris_rpmh_drv, tcs_offset + tcs_control_offset, control);
+	probe_write(&polaris_rpmh_drv, tcs_offset + tcs_control_offset, control | POLARIS_RPMH_TCS_ACTIVE_MODE);
+	probe_write(&polaris_rpmh_drv, tcs_offset + tcs_control_offset,
+	    control | POLARIS_RPMH_TCS_ACTIVE_MODE | POLARIS_RPMH_TCS_TRIGGER);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (request_submitted != NULL) {
+		*request_submitted = true;
+	}
+	for (uint32_t poll = 0; poll < POLARIS_RPMH_TCS_POLL_LIMIT; poll++) {
+		done = probe_read(&polaris_rpmh_drv, tcs_offset + POLARIS_RPMH_TCS_IRQ_STATUS) & 1u;
+		if (done != 0) {
+			completed = true;
+			break;
+		}
+		delay(POLARIS_RPMH_TCS_POLL_DELAY_US);
+	}
+	status = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_status_offset);
+	cleanable = status != 0;
+	if (completed && cleanable) {
+		success = true;
+		for (uint32_t command = 0; command < command_count; command++) {
+			uint32_t command_offset = tcs_offset + POLARIS_RPMH_TCS_COMMAND_BASE +
+			    POLARIS_RPMH_TCS_COMMAND_STRIDE * command;
+
+			command_status[command] = probe_read(&polaris_rpmh_drv, command_offset + 12u);
+			if (command_status[command] != 0) {
+				printf("adreno-sdm845: Apps RSC TCS0 command %u returned status %#x\n",
+				    command, command_status[command]);
+				success = false;
+			}
+		}
+	}
+	if (!completed || !cleanable) {
+		printf("adreno-sdm845: Apps RSC TCS0 %s (IRQ=%#x status=%#x); in-flight state is left intact when busy\n",
+		    completed ? "reported completion but remains busy" : "timed out", done, status);
+	}
+	if (cleanable) {
+		probe_write(&polaris_rpmh_drv, tcs_offset + POLARIS_RPMH_TCS_IRQ_CLEAR, 1u);
+		probe_write(&polaris_rpmh_drv, tcs_offset + tcs_control_offset,
+		    probe_read(&polaris_rpmh_drv, tcs_offset + tcs_control_offset) &
+		    ~(POLARIS_RPMH_TCS_TRIGGER | POLARIS_RPMH_TCS_ACTIVE_MODE));
+		probe_write(&polaris_rpmh_drv, tcs_offset + tcs_cmd_enable_offset, 0u);
+		probe_write(&polaris_rpmh_drv, tcs_offset + POLARIS_RPMH_TCS_WAIT_FOR_DONE, 0u);
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+out:
+	lck_mtx_unlock(&hakios_rsc_lock);
+	return success;
+}
+
+/* Hold a host DDR vote for GMU boot, then release it after GMU DCVS owns the default vote. */
+static bool
+polaris_gmu_temp_bus_vote_set(bool hold_vote)
+{
+	struct polaris_a630_hfi_bw_table table;
+	uint32_t bus_index, tcs_wait_mask;
+	bool request_submitted = false;
+
+	if (!hold_vote && !polaris_gmu_temp_bus_vote_active) {
+		return true;
+	}
+	if (hold_vote && polaris_gmu_temp_bus_vote_active) {
+		return false;
+	}
+	if (polaris_gpu_pwrlevel_count == 0 || polaris_gpu_initial_pwrlevel >= polaris_gpu_pwrlevel_count ||
+	    !polaris_gmu_hfi_bw_table_build(1u, &table)) {
+		printf("adreno-sdm845: cannot derive a temporary startup DDR request from the validated A630 bus table\n");
+		return false;
+	}
+	bus_index = hold_vote ? polaris_gpu_pwrlevels[polaris_gpu_initial_pwrlevel].bus_frequency : 0u;
+	if (bus_index >= table.bw_level_num) {
+		printf("adreno-sdm845: initial GPU powerlevel bus index %u exceeds the generated DDR table\n", bus_index);
+		return false;
+	}
+	if (hold_vote && bus_index == 0u) {
+		printf("adreno-sdm845: initial GPU bus usecase is zero; no temporary Apps RSC vote is needed\n");
+		return true;
+	}
+	if (!polaris_a630_hfi_row_commit_mask(table.ddr_cmd_data[bus_index], table.ddr_cmds_num, &tcs_wait_mask) ||
+	    !polaris_rpmh_active_tcs_request(table.ddr_cmd_addrs, table.ddr_cmd_data[bus_index],
+	    table.ddr_cmds_num, tcs_wait_mask, &request_submitted)) {
+		if (hold_vote && request_submitted) {
+			/* The RSC may have applied a vote before a lost or negative completion. */
+			polaris_gmu_temp_bus_vote_active = true;
+		}
+		printf("adreno-sdm845: Apps RSC did not acknowledge the %s startup DDR vote (usecase %u)\n",
+		    hold_vote ? "temporary" : "release", bus_index);
+		return false;
+	}
+	polaris_gmu_temp_bus_vote_active = hold_vote;
+	printf("adreno-sdm845: Apps RSC %s startup DDR vote (usecase %u, %u BCM commands, wait mask=%#x)\n",
+	    hold_vote ? "accepted temporary" : "released temporary", bus_index,
+	    table.ddr_cmds_num, tcs_wait_mask);
 	return true;
 }
 
@@ -4074,6 +4279,9 @@ polaris_gmu_hfi_stop_after_failure(uint32_t step)
 		__asm__ volatile ("dsb sy" ::: "memory");
 		reset = probe_read(&gmu, GMU_CM3_SYSRESET);
 	}
+	if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
+		printf("adreno-sdm845: step %u could not confirm release of the temporary Apps RSC DDR vote\n", step);
+	}
 	polaris_gmu_firmware_started = false;
 	polaris_gmu_hfi_ready = false;
 	polaris_gmu_hfi_sealed = false;
@@ -4085,7 +4293,7 @@ polaris_gmu_hfi_stop_after_failure(uint32_t step)
 	    step, reset);
 }
 
-/* Boot only the GMU and its legacy HFI queues; GPU-user SID4, ZAP, GX and CP stay off. */
+/* Boot GMU/HFI with the host DDR vote; GPU-user SID4, ZAP, GX and CP stay off. */
 static bool
 polaris_gmu_hfi_start(void)
 {
@@ -4123,7 +4331,7 @@ polaris_gmu_hfi_start(void)
 		return false;
 	}
 	log_info = A630_GMU_LOG_VA | (A630_GMU_LOG_BYTES / POLARIS_SMMU_TABLE_BYTES - 1u);
-	printf("adreno-sdm845: step 12: configure TCM/HFI memory and A630 SFR ID; start CM3, request the DT-default GX/MX rail vote, then initialize HFI\n");
+	printf("adreno-sdm845: step 12: configure TCM/HFI memory and A630 SFR ID; hold the DT-default DDR vote before starting CM3, request GX/MX, then initialize HFI\n");
 
 	polaris_gmu_hfi_perf_table_ready = false;
 	polaris_gmu_hfi_bw_table_ready = false;
@@ -4152,6 +4360,13 @@ polaris_gmu_hfi_start(void)
 		printf("adreno-sdm845: step 12 GMU boot register readback failed; CM3 remains held in reset\n");
 		return false;
 	}
+	if (!polaris_gmu_temp_bus_vote_set(true)) {
+		if (polaris_gmu_temp_bus_vote_active) {
+			(void)polaris_gmu_temp_bus_vote_set(false);
+		}
+		printf("adreno-sdm845: step 12 could not establish the temporary DDR vote; CM3 remains held in reset\n");
+		return false;
+	}
 
 	probe_write(&gmu, GMU_CM3_SYSRESET, 0u);
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -4166,6 +4381,7 @@ polaris_gmu_hfi_start(void)
 	if (init_result != A630_GMU_FW_READY) {
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
+		(void)polaris_gmu_temp_bus_vote_set(false);
 		polaris_smmu_backend_faulted = true;
 		printf("adreno-sdm845: step 12 GMU boot timed out or reported failure (init=%#x); CM3 was reset and rendering remains disabled\n",
 		    init_result);
@@ -4176,6 +4392,7 @@ polaris_gmu_hfi_start(void)
 		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
+		(void)polaris_gmu_temp_bus_vote_set(false);
 		polaris_gmu_firmware_started = false;
 		polaris_smmu_backend_faulted = true;
 		return false;
@@ -4192,6 +4409,7 @@ polaris_gmu_hfi_start(void)
 		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
+		(void)polaris_gmu_temp_bus_vote_set(false);
 		polaris_gmu_firmware_started = false;
 		polaris_smmu_backend_faulted = true;
 		printf("adreno-sdm845: step 12 GMU HFI queue initialization timed out; CM3 was reset\n");
@@ -4203,6 +4421,7 @@ polaris_gmu_hfi_start(void)
 		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
+		(void)polaris_gmu_temp_bus_vote_set(false);
 		polaris_gmu_firmware_started = false;
 		polaris_smmu_backend_faulted = true;
 		if (((hfi_version >> 28) & 0xfu) != 1u) {
@@ -4567,6 +4786,9 @@ stage_zap_shader(void)
 static void
 sdm845_gpu_stop(void)
 {
+	if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
+		printf("adreno-sdm845: GPU stop could not confirm release of the temporary Apps RSC DDR vote\n");
+	}
 	if (polaris_pas_image_active && !polaris_pas_shutdown()) {
 		printf("adreno-sdm845: GPU stop could not shut down PAS image 13; metadata remains allocated\n");
 	}
@@ -4686,7 +4908,7 @@ hakios_adreno_sdm845_init(void)
 			printf("adreno-sdm845: step 12 GMU/HFI startup did not complete; the A630 backend remains disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 12 finished; GMU-kernel SID5 and the initial GX/MX rail vote are active, and GPU rendering remains disabled\n");
+		printf("adreno-sdm845: step 12 finished; GMU-kernel SID5, the initial GX/MX rail vote, and temporary Apps RSC DDR vote are active; GPU rendering remains disabled\n");
 		return;
 	}
 	if (last_step == 13) {
@@ -4708,12 +4930,13 @@ hakios_adreno_sdm845_init(void)
 			return;
 		}
 		if (!polaris_gmu_hfi_send_perf_table() || !polaris_gmu_hfi_send_bw_vote_table() ||
-		    !polaris_gmu_hfi_send_test() || !polaris_gmu_hfi_set_initial_dcvs()) {
+		    !polaris_gmu_hfi_send_test() || !polaris_gmu_hfi_set_initial_dcvs() ||
+		    !polaris_gmu_temp_bus_vote_set(false)) {
 			polaris_gmu_hfi_stop_after_failure(14u);
 			printf("adreno-sdm845: step 14 failed; legacy HFI/default DCVS setup did not complete; GPU-user/3D routes, ZAP authentication, CP submission, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 14 finished; PERF_TBL, BW_VOTE_TBL, HFI_TEST, and default DCVS are acknowledged; the boot rail request remains active for the later GPU-start sequence, and GPU-user/3D routes, ZAP authentication, CP submission, and rendering remain disabled\n");
+		printf("adreno-sdm845: step 14 finished; PERF_TBL, BW_VOTE_TBL, HFI_TEST, and default DCVS are acknowledged, and the temporary host DDR vote is released; the boot rail request remains active for later GPU start, while GPU-user/3D routes, ZAP authentication, CP submission, and rendering remain disabled\n");
 		return;
 	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {

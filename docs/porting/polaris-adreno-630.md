@@ -119,14 +119,21 @@ allow it. A successful firmware boot alone is not a completed driver.
 - `adreno=12` is a separate explicit GMU/HFI bring-up stage. It runs steps 1–6, prepares and maps
   HFI, 16 KiB dump, and 4 KiB log buffers, loads and verifies the raw A630 GMU image, refreshes the
   SMMU snapshot, then installs the GMU-kernel SID5 context. It programs the A6xx TCM-boot, HFI
-  table, log, SFR chip-ID, cache, power-collapse baseline, and AHB-fence registers; releases CM3;
-  polls the firmware-ready status; requests the DT-selected initial GX/MX ARC level through the
+  table, log, SFR chip-ID, cache, power-collapse baseline, and AHB-fence registers; submits the
+  DT-selected temporary DDR vote through Apps RSC active TCS0 when its bus index is nonzero;
+  releases CM3; polls the
+  firmware-ready status; requests the DT-selected initial GX/MX ARC level through the
   A630 boot/slumber OOB registers; initializes the HFI queue; sends the legacy five-dword
   `GMU_INIT`; then sends `FW_VERSION`, checks the matching ACK, and requires A630 GMU 1.3 or newer
   within major version 1. Runtime validation requires the initial powerlevel to be a non-idle row;
   the current Recovery tree selects powerlevel 6 (257 MHz). The OOB path checks register readbacks
-  and the matching acknowledgement, and later startup failures clear it before reset. It leaves
-  SID4 and GPU SID0 unattached and does not load or authenticate ZAP, submit HFI
+  and the matching acknowledgement, and later startup failures clear it before reset. The DDR
+  request requires Apps RSC DRV2 v2.7, an idle TCS0 with no enabled commands, and enough command
+  slots; it is serialized with other HakiOS RPMh users through `hakios_rsc_lock`, waits for each
+  BCM VCD commit, and checks command statuses. A busy or unsupported RSC is refused without a
+  request, and a still-busy timed-out TCS is left untouched. Step 12 keeps the host vote because it
+  does not yet hand bandwidth ownership to GMU DCVS. It leaves SID4 and GPU SID0 unattached and
+  does not load or authenticate ZAP, submit HFI
   performance/bandwidth tables or default DCVS, start command processing, or enable rendering. On
   timeout or an incompatible version after CM3 release, it reasserts reset and marks the backend
   faulted while leaving SID5 attached.
@@ -140,20 +147,24 @@ allow it. A successful firmware boot alone is not a completed driver.
 - `adreno=13` reuses the step 12 GMU/HFI startup, then builds and sends only the A630 v1
   `H2F_MSG_PERF_TBL`. It reads `gfx.lvl`, `cx.lvl`, and `mx.lvl` from CMD_DB, maps Polaris GPU
   and GMU frequencies to SDM845 voltage corners, and packs the ARC indices and kHz frequencies
-  into the fixed 43-dword message. GPU rows follow KGSL order (idle through 710 MHz); the live
-  device-tree order is reversed while building the table. It does not send `BW_VOTE_TBL` or an
-  RPMh TCS request. Qualcomm's A630 flow omits `H2F_MSG_START`, which the A6xx driver sends only
+  into the fixed 43-dword message. Startup also holds the step 12 temporary Apps RSC DDR vote;
+  without a bandwidth table and default DCVS handoff, this stage leaves a nonzero vote active. GPU rows
+  follow KGSL order (idle through 710 MHz); the live device-tree order is reversed while building
+  the table. It does not send `BW_VOTE_TBL` or an additional RPMh TCS request. Qualcomm's A630 flow
+  omits `H2F_MSG_START`, which the A6xx driver sends only
   for A640. If construction or acknowledgement fails, it reasserts
   CM3 reset, marks the backend faulted, and leaves GMU-kernel SID5 attached. This write stage has
   not been run on the phone.
-- `adreno=14` repeats the guarded GMU/HFI startup, sends `PERF_TBL`, then builds and sends the
-  A630 v1 `H2F_MSG_BW_VOTE_TBL`. The builder validates the runtime bus graph and Apps RSC BCM
+- `adreno=14` repeats the guarded GMU/HFI startup and its temporary Apps RSC DDR vote, sends
+  `PERF_TBL`, then builds and sends the A630 v1 `H2F_MSG_BW_VOTE_TBL`. The builder validates the
+  runtime bus graph and Apps RSC BCM
   links, obtains BCM addresses/widths/unit sizes/clock domains from CMD_DB, and converts each DT
   bus vector into sorted TCS commands. The runtime Recovery graph routes GPU-to-DDR through
   `mas-qxm-gpu → slv-qns-llcc → mas-llcc-mc → slv-ebi` (SH0, MC0, ACV), and GPU-to-CNOC through
   `mas-qxm-gpu → slv-qns-memnoc-snoc → mas-qnm-memnoc → slv-qns-cnoc` (SH2, SN15, SN3). It
   mirrors Qualcomm's bus aggregation/division, BCM commit/valid encoding, VCD ordering, and A630
-  KGSL wait-mask construction. The HFI payload has 13 DDR rows and 2 CNOC rows within the A630
+  KGSL HFI wait-mask construction; the direct TCS request derives its wait mask from the
+  per-command commit flags. The HFI payload has 13 DDR rows and 2 CNOC rows within the A630
   fixed-size limits. The stage sends legacy `H2F_MSG_TEST` to close HFI messaging, then uses the
   A630 register-based DCVS OOB path to request the validated DT initial GPU powerlevel and its
   `qcom,bus-freq` row. It reverses the DT powerlevel index into HFI order and checks the DCVS ACK
@@ -162,10 +173,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   phase, matching KGSL's lifecycle. Polaris DT sets `qcom,gpu-quirk-hfi-use-reg`, the upstream
   condition for the register-based DCVS path. A630 does not use the A640-only `H2F_MSG_START`.
   The DCVS frequency vote uses the 4-bit `OPTION_AT_LEAST` field and the bus index is encoded in
-  `gpu_bw_vote.bw_idx` bits 0–7, matching Qualcomm's A630 4.9 HFI_USE_REG path.
-  HakiOS does not directly program Apps RSC active TCS; GMU receives the DCVS request and owns the
-  HFI-described runtime votes. GMU-user and 3D contexts, ZAP authentication, command processor
-  startup, full stop/thermal handling, and rendering remain unavailable. Rejection of either table,
+  `gpu_bw_vote.bw_idx` bits 0–7, matching Qualcomm's A630 4.9 HFI_USE_REG path. After that DCVS
+  acknowledgement, HakiOS releases any temporary vote through Apps RSC TCS0 with the zero-bandwidth
+  row; GMU remains the owner of HFI-described runtime votes. The TCS write path accepts only Apps RSC
+  DRV2 v2.7, protects the shared sequencer with `hakios_rsc_lock`, and checks TCS completion and
+  per-command status. GMU-user and 3D contexts, ZAP authentication, command processor startup, full
+  stop/thermal handling, and rendering remain unavailable. Rejection of either table,
   `HFI_TEST`, or initial DCVS reasserts CM3 reset and marks the backend faulted. This write stage has
   not been run on the phone.
 
@@ -307,21 +320,31 @@ The Qualcomm A6xx KGSL flow uses `gfx.lvl`, `cx.lvl`, and `mx.lvl` ARC tables to
 GMU voltage votes, then sends those rows through the GMU DCVS/HFI path. HakiOS now builds that
 fixed-size performance table in `adreno=13`; the GPU corner mapping follows SDM845 GPUCC's v2
 frequency/corner table, and GMU 200/500 MHz use the SDM845 CX minimum/low corners. This indicates
-the GPU-specific ARC vote owner is the GMU; HakiOS should not duplicate those votes with CPU-side
-active TCS requests. HakiOS now sends the default GX/MX boot OOB request before HFI queue startup,
+the GPU-specific ARC vote owner is the GMU; HakiOS should not duplicate those rail votes with
+CPU-side active TCS requests. Its host TCS transaction only supplies the temporary DDR bandwidth
+usecase. HakiOS now sends the default GX/MX boot OOB request before HFI queue startup,
 then sends an initial GMU DCVS OOB request after `PERF_TBL`, `BW_VOTE_TBL`, and the legacy
-`HFI_TEST` closeout. Both use the DT-selected initial GPU powerlevel and bus index. Qualcomm's
-A630v2 target identifies GMU 1.3 and enables RPMh, while KGSL
-labels the A630/A615 firmware path as legacy HFI. Step 13 sends `PERF_TBL` only; step 14 sends
-`PERF_TBL`, `BW_VOTE_TBL`, then the legacy `HFI_TEST` closeout and initial DCVS register request. Polaris DT sets
+`HFI_TEST` closeout. It brackets GMU boot and that initial DCVS handoff with the DT-selected DDR
+bus usecase through Apps RSC TCS0. Qualcomm's A630v2 target identifies GMU 1.3 and enables RPMh,
+while KGSL labels the A630/A615 firmware path as legacy HFI. Step 13 sends `PERF_TBL` only; step 14
+sends `PERF_TBL`, `BW_VOTE_TBL`, then the legacy `HFI_TEST` closeout and initial DCVS register
+request. Polaris DT sets
 `qcom,gpu-quirk-hfi-use-reg`, the upstream condition for sending that command. The A6xx
 `a6xx_gmu_hfi_start_msg()` returns without sending `H2F_MSG_START` unless the target is A640, so
 this command is not an A630 bring-up requirement. Qualcomm's `gmu_start()` enables the GMU
 domains/clocks, establishes a startup bus vote, runs `GMU_FW_START`, starts HFI, then requests the
-default GPU power level; HakiOS has only implemented the initial rail and DCVS OOB requests, not
-the complete CX/GX clock sequence or temporary startup bus vote. The `HFI_TEST` ACK completes the
-legacy message phase; the DCVS ACK only confirms that GMU firmware accepted the initial request,
-not that HakiOS has verified sustained rail, clock, bus, or GPU operation. See the primary
+default GPU power level; HakiOS now implements the temporary startup DDR vote and its release,
+but not the complete CX/GX clock sequence. The host vote is sent only when Apps RSC DRV2 reports
+v2.7, TCS0 is idle with no commands enabled, and the command capacity fits. It uses the shared
+`hakios_rsc_lock`, writes each BCM address/data pair, waits on the commands whose BCM data carries
+the commit bit, checks command completion status, then disables the TCS. A timeout that leaves
+TCS0 busy does not trigger cleanup writes to that live sequencer. The TCS write path supports v2.7
+only; v3.0 remains read-only until its exact write layout is verified. The `HFI_TEST` ACK completes
+the legacy message phase; the DCVS ACK only confirms that GMU firmware accepted the initial request,
+not that HakiOS has verified sustained rail, clock, bus, or GPU operation. The startup vote order
+follows Qualcomm's 4.9 KGSL [`gmu_start()`](https://android.googlesource.com/kernel/msm/+/refs/heads/android-msm-baiji-4.9-pie-wear-dr/drivers/gpu/msm/kgsl_gmu.c).
+VCD commit flags follow its [MSM bus TCS generator](https://android.googlesource.com/kernel/msm/+/refs/heads/android-msm-baiji-4.9-pie-wear-dr/drivers/soc/qcom/msm_bus/msm_bus_fabric_rpmh.c).
+See the primary
 [`gpucc-sdm845.c`](https://android.googlesource.com/kernel/msm/%2B/048cc82284cb0ee2c7381ec5d1b08a2f7d7aa0b4/drivers/clk/qcom/gpucc-sdm845.c),
 [`SDM845 RPMh level bindings`](https://android.googlesource.com/kernel/common/%2B/3135f5b73592988af0eb1b11ccbb72a8667be201/include/dt-bindings/power/qcom-rpmpd.h),
 [`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm/+/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/kgsl_gmu.c),
@@ -338,10 +361,11 @@ VDD_GX corner values 64/128/192/256/320/384/416; the source's 180 MHz floor maps
 present in this DT. GMU 200/500 MHz map to VDD_CX corner values 48/128. A zero-frequency row uses
 corner requirement zero, then KGSL's ARC lookup selects the first available primary level.
 Step 8 remains read-only: it validates ARC and bus-vector inputs and reports active TCS status,
-but does not reconstruct RPMh command payloads or issue a host TCS request. Step 14 reconstructs
-and sends the HFI bandwidth table, then issues one initial GMU DCVS OOB request; sustained DVFS is
-not operational because verified CX/GX sequencing, GMU/GPU clocks, GPU-user/3D mappings, runtime
-frequency transitions, and stop-time vote handling are still missing.
+but does not issue a host TCS request. Steps 12–14 reconstruct the DDR commands from the validated
+bus table; startup temporarily votes the DT-selected row through Apps RSC, and step 14 releases it
+after GMU accepts initial DCVS. This path is code-only and has not been run on the phone. Sustained
+DVFS is not operational because verified CX/GX sequencing, GMU/GPU clocks, GPU-user/3D mappings,
+runtime frequency transitions, and complete stop-time vote handling are still missing.
 `H2F_MSG_START` is A640-specific in the cited KGSL flow and is not part of the A630 gate.
 
 The A630 legacy HFI v1 wire format is now isolated in `drivers/gpu/hakios.adreno.hfi.h`. It
@@ -466,10 +490,11 @@ bring-up and a bounded test submission.
    shutdown path are implemented behind explicit `adreno=7`, gated on live DT and already-on
    domains. The Apps RSC DRV2 and AOP CMD_DB windows and GPU/GMU operating-point tables are now
    validated from runtime DT; an explicit read-only step 8 inspects the TCS and CX/GFX ARC tables.
-   The A630 GMU/HFI bootstrap, `PERF_TBL`, `BW_VOTE_TBL`, initial boot-rail OOB, and default DCVS
-   stages are implemented behind explicit `adreno=12`/`adreno=13`/`adreno=14`, but none has been
-   run on hardware. Implement SDM845 CX/GX sequencing and clocks plus the temporary startup bus
-   vote, then verify sustained bandwidth/DCVS behavior against the Polaris kernel. Exercise the PAS
+   The A630 GMU/HFI bootstrap, temporary startup DDR TCS vote, `PERF_TBL`, `BW_VOTE_TBL`, initial
+   boot-rail OOB, and default DCVS stages are implemented behind explicit `adreno=12`/`adreno=13`/
+   `adreno=14`, but none has been run on hardware. Implement SDM845 CX/GX sequencing and clocks,
+   then verify the Apps RSC transaction and sustained bandwidth/DCVS behavior against the Polaris
+   kernel. Exercise the PAS
    stage, verify the secure stream/context,
    authenticate ZAP, and bring up GMU firmware/HFI. Clean up in reverse on every failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
@@ -513,10 +538,11 @@ bring-up and a bounded test submission.
   630's GMEM/UBWC configuration.
 - Whether TrustZone PAS calls for GPU firmware are permitted from this boot environment.
 - Whether A630 GMU HFI initializes and accepts the performance/bandwidth tables, boot-rail OOB,
-  and initial DCVS OOB under HakiOS and the Polaris hypervisor, and whether the runtime
+  and initial DCVS OOB under HakiOS and the Polaris hypervisor; whether Apps RSC v2.7 accepts the
+  generated startup/release command rows and wait masks; and whether the runtime
   `gfx.lvl`/`cx.lvl`/`mx.lvl` tables pair correctly with the live GPU/GMU operating points. The
-  `adreno=12`/`adreno=13`/`adreno=14` write stages have not been invoked on the phone, and HakiOS
-  has issued no direct Apps RSC active-TCS requests.
+  `adreno=12`/`adreno=13`/`adreno=14` write stages have not been invoked on the phone; the direct
+  Apps RSC active-TCS path remains unverified on hardware.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
 
