@@ -15,8 +15,8 @@
  * power through the A630 GPU OOB and verifies the GFX3D clock. Step 18 repeats that guarded startup
  * then programs A630 HWCG, VBIF, UCHE, CP defaults, and protected-register ranges. Step 19
  * authenticates ZAP before SQE/CP startup; step 20 submits CP_SET_SECURE_MODE(0) and waits for idle.
- * Step 21 is a kernel-owned fence smoke test only; production user submissions, fence management,
- * runtime GPU DCVS, and rendering remain later stages.
+ * Step 21 is a kernel-owned fence smoke test only. A production ring/fence callback path follows
+ * it but remains gated; client submissions, runtime GPU DCVS, and rendering remain later stages.
  * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
  * during this bring-up. `ready()` remains false.
  *
@@ -90,6 +90,11 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_SET_SECURE_MODE         0x66u
 #define A630_CP_MEM_WRITE               0x3du
 #define A630_CP_WAIT_MEM_WRITES         0x12u
+#define A630_CP_INDIRECT_BUFFER_PFE    0x3fu
+#define A630_CP_EVENT_WRITE             0x46u
+#define A630_CP_CCU_INVALIDATE_DEPTH    0x18u
+#define A630_CP_CCU_INVALIDATE_COLOR    0x19u
+#define A630_CP_CACHE_FLUSH_TS          0x04u
 #define A630_CP_INIT_ORDINALS           11u
 #define A630_CP_INIT_MAX_CONTEXT        (1u << 0)
 #define A630_CP_INIT_ERROR_DETECTION    (1u << 1)
@@ -108,6 +113,9 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_FENCE_TEST_OFFSET       64u
 #define A630_CP_RING_BYTES              (32u * 1024u)
 #define A630_CP_RING_DWORDS             (A630_CP_RING_BYTES / sizeof(uint32_t))
+#define A630_CP_SUBMIT_MAX_IBS           128u
+#define A630_CP_SUBMIT_FIXED_DWORDS      9u
+#define A630_CP_SUBMIT_MAX_DWORDS        (A630_CP_SUBMIT_FIXED_DWORDS + 4u * A630_CP_SUBMIT_MAX_IBS)
 #define A630_CP_RB_CNTL_DEFAULT         0x0000020cu
 #define A630_CP_INIT_TIMEOUT_US         2000000u
 #define A630_CP_INIT_POLL_US            100u
@@ -660,6 +668,9 @@ static bool polaris_gpu_cp_started;
 static bool polaris_gpu_cp_initialized;
 static bool polaris_gpu_unsecured_mode;
 static bool polaris_gpu_fence_smoke_test_done;
+static bool polaris_gpu_ring_submit_ready;
+static uint32_t polaris_gpu_ring_write_pointer;
+static uint32_t polaris_gpu_last_fence;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
 static bool polaris_sqe_safe;
@@ -940,6 +951,10 @@ static bool sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only);
 static void sdm845_gpu_mapped(void);
 static void sdm845_gpu_unmap(uint64_t address, uint64_t size);
 static void sdm845_gpu_to_memory(void *start, uint64_t size);
+static uint32_t sdm845_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+static bool sdm845_gpu_done(uint32_t fence);
+static uint32_t sdm845_gpu_last(void);
+static void sdm845_gpu_report(const char *why);
 static void sdm845_gpu_stop(void);
 static uint32_t smmu_id_size_to_bits(uint32_t encoding);
 
@@ -958,6 +973,10 @@ const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
 	.mapped = sdm845_gpu_mapped,
 	.unmap = sdm845_gpu_unmap,
 	.to_memory = sdm845_gpu_to_memory,
+	.submit = sdm845_gpu_submit,
+	.done = sdm845_gpu_done,
+	.last = sdm845_gpu_last,
+	.report = sdm845_gpu_report,
 	.stop = sdm845_gpu_stop,
 	/* SMMU translations are software-only until a verified context and stream are attached. */
 };
@@ -5884,6 +5903,7 @@ polaris_a630_cp_fence_smoke_test(void)
 {
 	uint32_t packet[A630_CP_FENCE_TEST_DWORDS];
 	uint32_t ring_rptr, ring_wptr, target_rptr, cp_interrupts, cp_fault, protect_status, rbbm_status;
+	uint32_t completed_value;
 	uint32_t packet_offset, packet_dwords = 0;
 	uint64_t fence_address = polaris_gpu_rptr_buffer.gpu_address + A630_CP_FENCE_TEST_OFFSET;
 	vm_offset_t fence_virtual = polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET;
@@ -5954,17 +5974,26 @@ polaris_a630_cp_fence_smoke_test(void)
 		protect_status = probe_read(&gpu, GPU_CP_PROTECT_STATUS);
 		rbbm_status = probe_read(&gpu, GPU_RBBM_STATUS);
 		polaris_cache_lines(fence_virtual, sizeof(uint32_t));
+		__asm__ volatile ("dsb sy" ::: "memory");
 		if ((cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 || protect_status != 0) {
 			goto fault;
 		}
 		if (ring_rptr == target_rptr && (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0 &&
 		    *fence == A630_CP_FENCE_TEST_VALUE) {
+			completed_value = *fence;
+			/* Do not let the smoke-test magic value satisfy the first client fence. */
+			*fence = 0;
+			polaris_cache_lines(fence_virtual, sizeof(uint32_t));
+			__asm__ volatile ("dsb sy" ::: "memory");
+			polaris_gpu_ring_write_pointer = target_rptr;
+			polaris_gpu_last_fence = 0;
+			polaris_gpu_ring_submit_ready = true;
 			polaris_gpu_fence_smoke_test_done = true;
 			printf("adreno-sdm845: step 21 fence write completed at %#llx with value %#x; RPTR=%u CP idle\n",
-			    fence_address, (uint32_t)*fence, ring_rptr);
+			    fence_address, completed_value, ring_rptr);
 			return true;
 		}
-		delay(A630_CP_INIT_POLL_US);
+		delay_for_interval(A630_CP_INIT_POLL_US, NSEC_PER_USEC);
 	}
 	goto fault;
 
@@ -5975,6 +6004,185 @@ fault:
 	    (uint32_t)*fence, probe_read(&gpu, GPU_CP_INTERRUPT_STATUS), probe_read(&gpu, GPU_CP_HW_FAULT),
 	    probe_read(&gpu, GPU_CP_PROTECT_STATUS), probe_read(&gpu, GPU_RBBM_STATUS));
 	return false;
+}
+
+/*
+ * A630's production A6xx submit stream invalidates both CCU caches, chains each client IB through
+ * CP_INDIRECT_BUFFER_PFE, then writes the sequence number through CACHE_FLUSH_TS. The ring is
+ * private backend memory; client IOVAs are accepted only from the separate client aperture.
+ */
+static uint32_t
+sdm845_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	uint32_t packet[A630_CP_SUBMIT_MAX_DWORDS];
+	uint32_t packet_dwords = 0, wanted, ring_rptr = 0, ring_wptr, room = 0;
+	uint32_t next_wptr, fence;
+	uint64_t fence_address;
+	vm_offset_t fence_virtual;
+	volatile uint32_t *fence_word;
+
+	if (!sdm845_gpu_ready() || !polaris_gpu_ring_submit_ready ||
+	    !polaris_gpu_cp_started || !polaris_gpu_cp_initialized || !polaris_gpu_unsecured_mode ||
+	    !polaris_gpu_fence_smoke_test_done || !polaris_zap_authenticated ||
+	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active || polaris_smmu_backend_faulted ||
+	    count > A630_CP_SUBMIT_MAX_IBS || (count != 0 && (addresses == NULL || words == NULL)) ||
+	    polaris_gpu_ring_buffer.virtual == 0 || polaris_gpu_rptr_buffer.virtual == 0 ||
+	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
+	    polaris_gpu_rptr_buffer.requested_size < A630_CP_FENCE_TEST_OFFSET + sizeof(uint32_t) ||
+	    !polaris_gpu_ring_buffer.gpu_read_only || polaris_gpu_rptr_buffer.gpu_read_only) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t bytes = (uint64_t)words[i] * sizeof(uint32_t);
+
+		if (words[i] == 0 || (addresses[i] & (sizeof(uint32_t) - 1u)) != 0 ||
+		    addresses[i] < POLARIS_GPU_VA_START || addresses[i] >= POLARIS_GPU_VA_END ||
+		    bytes > POLARIS_GPU_VA_END - addresses[i]) {
+			return 0;
+		}
+	}
+	if (!map_block(&gpu)) {
+		return 0;
+	}
+
+	ring_wptr = probe_read(&gpu, GPU_CP_RB_WPTR);
+	if (ring_wptr >= A630_CP_RING_DWORDS || ring_wptr != polaris_gpu_ring_write_pointer) {
+		goto fault;
+	}
+	wanted = A630_CP_SUBMIT_FIXED_DWORDS + 4u * count;
+	for (uint32_t elapsed = 0; elapsed < A630_CP_INIT_TIMEOUT_US; elapsed += A630_CP_INIT_POLL_US) {
+		ring_rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
+		if (ring_rptr >= A630_CP_RING_DWORDS ||
+		    (probe_read(&gpu, GPU_CP_INTERRUPT_STATUS) & A630_CP_INTERRUPT_ERROR_MASK) != 0 ||
+		    probe_read(&gpu, GPU_CP_HW_FAULT) != 0 || probe_read(&gpu, GPU_CP_PROTECT_STATUS) != 0) {
+			goto fault;
+		}
+		room = (ring_rptr + A630_CP_RING_DWORDS - ring_wptr - 1u) % A630_CP_RING_DWORDS;
+		if (room >= wanted) {
+			break;
+		}
+		delay_for_interval(A630_CP_INIT_POLL_US, NSEC_PER_USEC);
+	}
+	if (room < wanted) {
+		return 0;
+	}
+
+	fence = polaris_gpu_last_fence + 1u;
+	if (fence == 0) {
+		fence = 1u;
+	}
+	fence_address = polaris_gpu_rptr_buffer.gpu_address + A630_CP_FENCE_TEST_OFFSET;
+	fence_virtual = polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET;
+	if (fence_address < POLARIS_GPU_PRIVATE_VA_START || fence_address >= POLARIS_GPU_PRIVATE_VA_END ||
+	    (fence_address & (sizeof(uint32_t) - 1u)) != 0 || fence_address > UINT32_MAX) {
+		goto fault;
+	}
+	fence_word = (volatile uint32_t *)fence_virtual;
+
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
+	packet[packet_dwords++] = A630_CP_CCU_INVALIDATE_DEPTH;
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
+	packet[packet_dwords++] = A630_CP_CCU_INVALIDATE_COLOR;
+	for (uint32_t i = 0; i < count; i++) {
+		packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_INDIRECT_BUFFER_PFE, 3u);
+		packet[packet_dwords++] = (uint32_t)addresses[i];
+		packet[packet_dwords++] = (uint32_t)(addresses[i] >> 32);
+		packet[packet_dwords++] = words[i];
+	}
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 4u);
+	packet[packet_dwords++] = A630_CP_CACHE_FLUSH_TS; /* Poll the memory fence; no IRQ is enabled. */
+	packet[packet_dwords++] = (uint32_t)fence_address;
+	packet[packet_dwords++] = (uint32_t)(fence_address >> 32);
+	packet[packet_dwords++] = fence;
+	if (packet_dwords != wanted || packet_dwords > A630_CP_SUBMIT_MAX_DWORDS ||
+	    packet[0] == 0 || packet[2] == 0 || packet[packet_dwords - 5u] == 0) {
+		goto fault;
+	}
+
+	uint32_t first_dwords = packet_dwords < A630_CP_RING_DWORDS - ring_wptr ?
+	    packet_dwords : A630_CP_RING_DWORDS - ring_wptr;
+	vm_offset_t first = polaris_gpu_ring_buffer.virtual + ring_wptr * sizeof(uint32_t);
+	memcpy((void *)first, packet, first_dwords * sizeof(uint32_t));
+	polaris_cache_lines(first, first_dwords * sizeof(uint32_t));
+	if (first_dwords != packet_dwords) {
+		uint32_t second_dwords = packet_dwords - first_dwords;
+		memcpy((void *)polaris_gpu_ring_buffer.virtual,
+		    packet + first_dwords, second_dwords * sizeof(uint32_t));
+		polaris_cache_lines(polaris_gpu_ring_buffer.virtual, second_dwords * sizeof(uint32_t));
+	}
+	/* The fence cache line is device-owned after startup; clean/invalidate before publishing WPTR. */
+	polaris_cache_lines((vm_offset_t)fence_word, sizeof(*fence_word));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	next_wptr = (ring_wptr + packet_dwords) % A630_CP_RING_DWORDS;
+	probe_write(&gpu, GPU_CP_RB_WPTR, next_wptr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&gpu, GPU_CP_RB_WPTR) != next_wptr) {
+		goto fault;
+	}
+	polaris_gpu_ring_write_pointer = next_wptr;
+	polaris_gpu_last_fence = fence;
+	return fence;
+
+fault:
+	polaris_smmu_backend_faulted = true;
+	polaris_gpu_ring_submit_ready = false;
+	printf("adreno-sdm845: A630 CP submit failed or ring state changed: RPTR=%#x WPTR=%#x CP_INT=%#x CP_FAULT=%#x CP_PROTECT=%#x; backend faulted and hardware/resources are retained\n",
+	    probe_read(&gpu, GPU_CP_RB_RPTR), probe_read(&gpu, GPU_CP_RB_WPTR),
+	    probe_read(&gpu, GPU_CP_INTERRUPT_STATUS), probe_read(&gpu, GPU_CP_HW_FAULT),
+	    probe_read(&gpu, GPU_CP_PROTECT_STATUS));
+	return 0;
+}
+
+static bool
+sdm845_gpu_done(uint32_t fence)
+{
+	volatile uint32_t *fence_word;
+
+	if (fence == 0) {
+		return true;
+	}
+	if (!sdm845_gpu_ready() || !polaris_gpu_ring_submit_ready || polaris_smmu_backend_faulted ||
+	    polaris_gpu_rptr_buffer.virtual == 0 || (int32_t)(polaris_gpu_last_fence - fence) < 0) {
+		return false;
+	}
+	fence_word = (volatile uint32_t *)(polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET);
+	polaris_cache_lines((vm_offset_t)fence_word, sizeof(*fence_word));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	return (int32_t)(*fence_word - fence) >= 0;
+}
+
+static uint32_t
+sdm845_gpu_last(void)
+{
+	return polaris_gpu_last_fence;
+}
+
+static void
+sdm845_gpu_report(const char *why)
+{
+	uint32_t completed_fence = 0;
+	volatile uint32_t *fence_word;
+
+	if (why == NULL) {
+		why = "unspecified failure";
+	}
+	if (!map_block(&gpu)) {
+		printf("adreno-sdm845: GPU report: %s; MMIO window unavailable, last fence=%u\n", why,
+		    polaris_gpu_last_fence);
+		return;
+	}
+	if (polaris_gpu_ring_submit_ready && polaris_gpu_rptr_buffer.virtual != 0) {
+		fence_word = (volatile uint32_t *)(polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET);
+		polaris_cache_lines((vm_offset_t)fence_word, sizeof(*fence_word));
+		__asm__ volatile ("dsb sy" ::: "memory");
+		completed_fence = *fence_word;
+	}
+	printf("adreno-sdm845: GPU report: %s; last fence=%u done=%u RPTR=%#x WPTR=%#x software WPTR=%u status=%#x interrupt=%#x CP fault=%#x CP interrupt=%#x protection=%#x\n",
+	    why, polaris_gpu_last_fence, completed_fence,
+	    probe_read(&gpu, GPU_CP_RB_RPTR), probe_read(&gpu, GPU_CP_RB_WPTR),
+	    polaris_gpu_ring_write_pointer, probe_read(&gpu, GPU_RBBM_STATUS),
+	    probe_read(&gpu, GPU_RBBM_INT_0_STATUS), probe_read(&gpu, GPU_CP_HW_FAULT),
+	    probe_read(&gpu, GPU_CP_INTERRUPT_STATUS), probe_read(&gpu, GPU_CP_PROTECT_STATUS));
 }
 
 static bool

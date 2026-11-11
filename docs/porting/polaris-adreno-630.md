@@ -256,8 +256,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   GPU write and fence readback without opening the ring to clients. It follows the A630 PM4 packet
   definitions and KGSL fence-write ordering in [`adreno_pm4types.h`](https://android.googlesource.com/kernel/msm/%2B/f5996ba85abd9d67bdb9506421177a9625ce29c4/drivers/gpu/msm/adreno_pm4types.h) and
   [`adreno_ringbuffer.c`](https://android.googlesource.com/kernel/msm/%2B/037b70a47d04f86b930d349f38a8dcfd7fd07944/drivers/gpu/msm/adreno_ringbuffer.c).
-  `ready()` remains false and user submissions are disabled. This write stage has not been run on
-  the phone.
+  After checking the magic value, it clears that word so it cannot satisfy the first production
+  fence. `ready()` remains false and user submissions are disabled. This write stage has not been
+  run on the phone.
 - Once SQE halt has been released, `sdm845_gpu_stop()` now leaves the GMU OOB vote, PAS image,
   SMMU mappings and CP buffers intact. A630's graceful idle/slumber, ring stop and reset sequence
   is not implemented yet, so stop deliberately refuses to tear resources down underneath a live
@@ -521,9 +522,13 @@ shared service and lifecycle hooks through the selected backend. Redwood keeps i
 implementation behind that boundary. Polaris selects its own profile and a not-ready operations
 table. Its software map, commit, unmap and cache-maintenance callbacks are implemented; GMU
 firmware/HFI startup and initial ARC/DCVS requests are staged, while complete CX/GX sequencing,
-active GMU-user/3D SMMU context attachment, live command submission/fence operations, complete stop
-and thermal hooks are still missing. The permanent `ready()` gate prevents calls from reaching the
-unfinished path. No callback falls through into Redwood's SMMUv500 or register state.
+active GMU-user/3D SMMU context attachment, recoverable stop and thermal hooks are still missing.
+The A630 backend now has dormant `submit`, `done`, `last`, and `report` callbacks: submit builds
+the A6xx CCU-invalidate / `CP_INDIRECT_BUFFER_PFE` / `CACHE_FLUSH_TS` sequence, validates each IB
+against the client IOVA aperture, handles ring wrap and bounded space polling, and keeps the
+completion word in the private RPTR allocation. These callbacks remain unreachable from the public
+service because the current `ready()` gate is false; no callback falls through into Redwood's
+SMMUv500 or register state.
 
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
 software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use the private range
@@ -554,9 +559,11 @@ The backend boundary must carry at least: SoC/GPU identity, firmware file set, M
 GMEM and frequency capabilities, SMMU implementation and stream/context assignments, startup and
 stop operations, and the GPU address/map/submit/fence operations consumed by `hakios.gpu.cpp`.
 The shared `HakiosGPUUserClient::submit()` rejects zero-byte command buffers before forming an IB
-entry, in addition to its existing alignment, relocation and bounds checks.
-The public `HakiosGPU` service must only start after its selected backend has completed the CP
-bring-up and a bounded test submission.
+entry, in addition to its existing alignment, relocation and bounds checks. The A630 backend accepts
+at most 128 IBs and only client IOVAs in `[0x40000000, 0x100000000)`; this does not validate IB
+contents or isolate command streams on the shared SID0 page table. The public `HakiosGPU` service
+must only start after its selected backend has completed CP bring-up, command isolation review, and
+bounded hardware submission checks.
 
 ## Work and acceptance gates
 
@@ -590,9 +597,11 @@ bring-up and a bounded test submission.
    `CP_SET_SECURE_MODE(0)` transition, and a kernel-owned CP memory-write fence smoke test. None
    of these write stages has been run. Verify the Apps RSC transaction, sustained bandwidth/DCVS
    behavior, GX sequencing, core readbacks, CP idle/error status, fence visibility and PAS cleanup
-   against Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. Next
-   implement production ring/fence management and recoverable power-down before accepting
-   submissions.
+   against Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. The dormant
+   production ring/fence callbacks are now implemented from the upstream A6xx submit ordering
+   ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)); they have not been exercised on hardware. Next validate the packets,
+   fence visibility, register protection and ring mappings on Polaris, then implement and validate
+   recoverable power-down before accepting client submissions.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
