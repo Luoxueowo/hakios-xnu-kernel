@@ -329,10 +329,11 @@ allow it. A successful firmware boot alone is not a completed driver.
   IB and writable mapping in a temporary client root. The production submit callback now serializes
   client work across CPU-driven root switches and waits for a full idle boundary before returning to
   the kernel root for its fence. `ready()` requires a separate client-enable latch that bring-up
-  opens only after the explicit `gpu=1` path passes step 23. Orderly stop is still not validated for
-  client workloads; its current backend conservatively retains GPU resources if clients were ever
-  enabled. Loader-return quiesce uses a bounded reset/route-fault path. These lifecycle paths also
-  need on-phone validation.
+  opens only after the explicit `gpu=1` path passes step 23. Orderly stop now checks whether client
+  spaces are still open: it rejects new client spaces while allowing existing clients to finish,
+  then closes the gate and attempts shutdown after the last client has been destroyed. Orderly stop
+  is still not validated for client workloads. Loader-return quiesce uses a bounded reset/route-fault
+  path. These lifecycle paths also need on-phone validation.
 - `sdm845_gpu_stop()` first confirms the kernel fence and CP are idle, drains all four Polaris
   VBIF XINs, releases the GPU/boot OOB holds, and requests the A630 legacy-HFI slumber state using
   the DT-selected initial performance and bandwidth indices. It checks GMU slumber, CX busy and

@@ -584,6 +584,7 @@ static LCK_GRP_DECLARE(polaris_gpu_client_lck_grp, "polaris-gpu-client-space");
 static LCK_MTX_DECLARE(polaris_gpu_client_lck, &polaris_gpu_client_lck_grp);
 static struct polaris_gpu_client_space polaris_gpu_client_spaces[POLARIS_GPU_MAX_CLIENT_SPACES];
 static struct polaris_gpu_client_space polaris_gpu_context_probe_client;
+static bool polaris_gpu_stop_pending;
 static struct polaris_gpu_dma_buffer polaris_gpu_context_probe_ib;
 static struct polaris_gpu_dma_buffer polaris_gpu_context_probe_data;
 static struct polaris_smmu_address_space *polaris_gpu_active_space;
@@ -2746,6 +2747,17 @@ polaris_gpu_client_space_lookup(void *handle)
 }
 
 static bool
+polaris_gpu_clients_active_locked(void)
+{
+	for (uint32_t i = 0; i < POLARIS_GPU_MAX_CLIENT_SPACES; i++) {
+		if (polaris_gpu_client_spaces[i].allocated) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
 polaris_gpu_client_space_map_private(struct polaris_gpu_client_space *client)
 {
 	/* A630v2 has no APRIV: expose only read-only CP fetch pages, never the writable fence scratch. */
@@ -2802,6 +2814,10 @@ sdm845_gpu_client_space_create(void **handle)
 		return false;
 	}
 	lck_mtx_lock(&polaris_gpu_client_lck);
+	if (polaris_gpu_stop_pending) {
+		lck_mtx_unlock(&polaris_gpu_client_lck);
+		return false;
+	}
 	for (uint32_t i = 0; i < POLARIS_GPU_MAX_CLIENT_SPACES; i++) {
 		if (!polaris_gpu_client_spaces[i].allocated) {
 			client = &polaris_gpu_client_spaces[i];
@@ -2923,9 +2939,15 @@ sdm845_gpu_client_space_destroy(void *handle, bool safe_to_free)
 	if (client->smmu.mapped_pages != 0 || !polaris_smmu_space_destroy(&client->smmu)) {
 		goto quarantine;
 	}
+	bool stop_after_destroy;
 	lck_mtx_lock(&polaris_gpu_client_lck);
 	bzero(client, sizeof(*client));
+	stop_after_destroy = polaris_gpu_stop_pending && !polaris_gpu_clients_active_locked();
 	lck_mtx_unlock(&polaris_gpu_client_lck);
+	if (stop_after_destroy) {
+		printf("adreno-sdm845: last A630 client space closed; completing the pending GPU stop\n");
+		sdm845_gpu_stop();
+	}
 	return;
 
 quarantine:
@@ -6278,8 +6300,17 @@ sdm845_gpu_stop(void)
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active;
 	bool gx_off = false;
-	bool client_submission_was_enabled = polaris_gpu_client_submission_enabled;
 	bool cp_idle_state = !polaris_gpu_cp_started && !polaris_gpu_cp_initialized;
+
+	/* Serialize stop requests with UserClient::start, which allocates client spaces outside HakiosGPU's lock. */
+	lck_mtx_lock(&polaris_gpu_client_lck);
+	bool clients_active = polaris_gpu_clients_active_locked();
+	polaris_gpu_stop_pending = true;
+	lck_mtx_unlock(&polaris_gpu_client_lck);
+	if (clients_active) {
+		printf("adreno-sdm845: GPU stop deferred until open A630 client spaces close; new clients are refused\n");
+		return;
+	}
 
 	/* Keep both client gates closed before touching any hardware state. */
 	polaris_gpu_client_submission_enabled = false;
@@ -6314,7 +6345,7 @@ sdm845_gpu_stop(void)
 	    !polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready ||
 	    !polaris_gpu_core_ready || !polaris_gpu_oob_active ||
 	    ((polaris_gpu_cp_started || polaris_gpu_cp_initialized) && !cp_idle_state) ||
-	    polaris_smmu_backend_faulted || client_submission_was_enabled ||
+	    polaris_smmu_backend_faulted ||
 	    polaris_gmu_temp_bus_vote_active || !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active)) {
