@@ -47,8 +47,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   wait confirms completion; it no longer discards the oldest point after an unchecked 10-second
   wait. Submit syncobj arrays are copied and bounds-checked, and output handles/capacity slots are
   reserved before submission so concurrent syncobj operations cannot consume them before the
-  returned fence is recorded. This prevents a timed-out fence from being reported complete. The
-  shim compiled to an arm64 iOS object on 2026-11-12; no Vulkan workload has run on the phone.
+  returned fence is recorded. `drmSyncobjTransfer` now returns `EINVAL` for an unmaterialized
+  source point unless `WAIT_FOR_SUBMIT` was requested; that flag waits up to five seconds for the
+  point to be submitted, then returns `ETIME` on timeout. It pins both handles while waiting and
+  preserves a binary destination if it cannot reserve the replacement fence. This follows the
+  upstream [Linux DRM syncobj implementation](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/drm_syncobj.c).
+  The shim compiled to an arm64 iOS object on 2026-11-12; no Vulkan workload has run on the phone.
 - On 2026-11-12, Recovery ADB confirmed `/vendor` is the phone's `ext4 ro` mount from
   `/dev/block/sde47`. `devices/polaris/pull-firmware.sh` pulled the seven A630 files from
   `/vendor/firmware` and compared each pulled file's SHA-256 against the device-side hash. The

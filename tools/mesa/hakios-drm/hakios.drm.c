@@ -252,7 +252,7 @@ struct syncobj_point {
 struct syncobj {
 	bool used;
 	uint64_t reached;                       /* the last point known reached */
-	size_t pending, reserved, capacity;
+	size_t pending, reserved, references, capacity;
 	struct syncobj_point *on_the_way;
 };
 static struct syncobj syncobjs[SYNCOBJS];
@@ -263,6 +263,16 @@ static struct syncobj *
 syncobj_of(uint32_t handle)
 {
 	return handle != 0 && handle < SYNCOBJS && syncobjs[handle].used ? &syncobjs[handle] : NULL;
+}
+
+/* Destroyed handles remain allocated while an ioctl holds a reference or output reservation. */
+static void
+syncobj_reclaim_locked(struct syncobj *s)
+{
+	if (s != NULL && !s->used && s->reserved == 0 && s->references == 0) {
+		free(s->on_the_way);
+		memset(s, 0, sizeof(*s));
+	}
 }
 
 /* whether the kernel is done with submission FENCE: waited for until DEADLINE (absolute CLOCK_MONOTONIC ns; 0: not at all) */
@@ -346,7 +356,7 @@ drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 	(void)fd;
 	pthread_mutex_lock(&syncobj_lock);
 	for (uint32_t h = 1; h < SYNCOBJS; h++) {
-		if (!syncobjs[h].used && syncobjs[h].reserved == 0) {
+		if (!syncobjs[h].used && syncobjs[h].reserved == 0 && syncobjs[h].references == 0) {
 			memset(&syncobjs[h], 0, sizeof(syncobjs[h]));
 			syncobjs[h].used = true;
 			syncobjs[h].reached = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? 1 : 0;
@@ -373,10 +383,7 @@ drmSyncobjDestroy(int fd, uint32_t handle)
 		return -EINVAL;
 	}
 	s->used = false;
-	if (s->reserved == 0) {
-		free(s->on_the_way);
-		memset(s, 0, sizeof(*s));
-	}
+	syncobj_reclaim_locked(s);
 	pthread_mutex_unlock(&syncobj_lock);
 	return 0;
 }
@@ -530,9 +537,13 @@ drmSyncobjTransfer(int fd, uint32_t dst, uint64_t dst_point, uint32_t src, uint6
 {
 	struct syncobj *d, *s;
 	uint64_t want = src_point != 0 ? src_point : 1, to = dst_point != 0 ? dst_point : 1;
+	int result = 0;
+	const int64_t deadline = now_ns() + 5000000000LL;
 
 	(void)fd;
-	(void)flags;
+	if (flags & ~DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) {
+		return -EINVAL;
+	}
 	pthread_mutex_lock(&syncobj_lock);
 	d = syncobj_of(dst);
 	s = syncobj_of(src);
@@ -540,24 +551,71 @@ drmSyncobjTransfer(int fd, uint32_t dst, uint64_t dst_point, uint32_t src, uint6
 		pthread_mutex_unlock(&syncobj_lock);
 		return -EINVAL;
 	}
-	syncobj_poll(s);
-	if (dst_point == 0) d->reached = 0, d->pending = 0;
-	if (s->reached >= want) {
-		if (to > d->reached) d->reached = to;
-	} else {
+	d->references++;
+	s->references++;
+	for (;;) {
+		uint32_t source_fence = 0;
+		bool materialized = false;
+
+		syncobj_poll(s);
+		if (s->reached >= want) {
+			if (dst_point == 0) d->reached = 0, d->pending = 0;
+			if (to > d->reached) d->reached = to;
+			break;
+		}
 		for (size_t k = 0; k < s->pending; k++) {
 			if (s->on_the_way[k].point >= want) {
-				if (!syncobj_add(d, to, s->on_the_way[k].fence)) {
-					pthread_mutex_unlock(&syncobj_lock);
-					return -ENOMEM;
-				}
+				source_fence = s->on_the_way[k].fence;
+				materialized = true;
 				break;
 			}
 		}
+		if (materialized) {
+			if (dst_point == 0) {
+				/* Keep a binary destination intact if reserving its replacement can fail. */
+				if (!syncobj_reserve(d, 1)) {
+					result = -ENOMEM;
+				} else {
+					d->reached = 0;
+					d->pending = 0;
+					d->on_the_way[d->pending].point = to;
+					d->on_the_way[d->pending].fence = source_fence;
+					d->pending++;
+				}
+			} else if (!syncobj_add(d, to, source_fence)) {
+				result = -ENOMEM;
+			}
+			break;
+		}
+		if (!(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT)) {
+			result = -EINVAL;
+			break;
+		}
+		int64_t remaining = deadline - now_ns();
+		if (remaining <= 0) {
+			result = -ETIME;
+			break;
+		}
+		/* The default condition clock is realtime; convert the monotonic remainder. */
+		struct timeval tv;
+		struct timespec until;
+		gettimeofday(&tv, NULL);
+		int64_t real = (int64_t)tv.tv_sec * 1000000000LL + (int64_t)tv.tv_usec * 1000LL + remaining;
+		until.tv_sec = real / 1000000000LL;
+		until.tv_nsec = real % 1000000000LL;
+		pthread_cond_timedwait(&syncobj_submitted, &syncobj_lock, &until);
 	}
-	pthread_cond_broadcast(&syncobj_submitted);
+	if (result == 0) pthread_cond_broadcast(&syncobj_submitted);
+	d->references--;
+	s->references--;
+	if (d == s) {
+		syncobj_reclaim_locked(d);
+	} else {
+		syncobj_reclaim_locked(d);
+		syncobj_reclaim_locked(s);
+	}
 	pthread_mutex_unlock(&syncobj_lock);
-	return 0;
+	return result;
 }
 
 static uint32_t last_fence;     /* the fence of the last submission the kernel took */
@@ -628,10 +686,7 @@ syncobj_release_outputs_locked(const struct drm_msm_gem_submit_syncobj *entries,
 	for (uint32_t handle = 1; handle < SYNCOBJS; handle++) {
 		if (additions[handle] != 0 && syncobjs[handle].reserved >= additions[handle]) {
 			syncobjs[handle].reserved -= additions[handle];
-			if (!syncobjs[handle].used && syncobjs[handle].reserved == 0) {
-				free(syncobjs[handle].on_the_way);
-				memset(&syncobjs[handle], 0, sizeof(syncobjs[handle]));
-			}
+			syncobj_reclaim_locked(&syncobjs[handle]);
 		}
 	}
 }
@@ -652,10 +707,7 @@ syncobj_commit_outputs_locked(const struct drm_msm_gem_submit_syncobj *entries, 
 		s->on_the_way[s->pending].point = entries[i].point != 0 ? entries[i].point : 1;
 		s->on_the_way[s->pending].fence = fence;
 		s->pending++;
-		if (!s->used && s->reserved == 0) {
-			free(s->on_the_way);
-			memset(s, 0, sizeof(*s));
-		}
+		syncobj_reclaim_locked(s);
 	}
 	return true;
 }
