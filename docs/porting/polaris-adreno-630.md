@@ -699,6 +699,12 @@ buffer address through `GET_IOVA`. This matches Polaris's existing client apertu
 mapping model. This is source inspection only; Turnip allocation and rendering have not been
 exercised on the phone.
 
+Turnip also treats `MSM_PARAM_TIMESTAMP` as the A6xx always-on GPU counter, with a fixed 19.2-MHz
+period. The shared Redwood profile reports `mach_absolute_time()`, which is not that counter. The
+Polaris backend now reads the GMU always-on counter with the A6xx high/low/high sequence, and only
+answers while the GMU firmware, CX domain and GMU clock are confirmed active. This source-level
+compatibility fix still needs runtime validation on the phone.
+
 The table descriptor format follows the existing project mapper and the ARM LPAE definitions in
 upstream Linux [`io-pgtable-arm.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c).
 The Polaris probe uses SMMUv2 IDR2 to confirm 4K support and decode OAS using upstream Linux

@@ -1021,6 +1021,7 @@ static uint32_t polaris_a630_gpu_client_submit(struct polaris_gpu_client_space *
 	const uint64_t *addresses, const uint32_t *words, uint32_t count);
 static bool polaris_a630_gpu_fence_complete(uint32_t fence);
 static uint32_t smmu_id_size_to_bits(uint32_t encoding);
+static uint32_t probe_read(struct probe_block *block, uint32_t offset);
 
 static bool
 polaris_sdm845_gpu_hardware_ready(void)
@@ -1040,9 +1041,39 @@ sdm845_gpu_ready(void)
 	return polaris_gpu_client_submission_enabled && polaris_sdm845_gpu_hardware_ready();
 }
 
+/* Turnip interprets MSM_PARAM_TIMESTAMP as the A6xx 19.2-MHz always-on counter. */
+static bool
+sdm845_gpu_timestamp(uint64_t *value)
+{
+	uint32_t cx, gmu_clock;
+
+	if (value == NULL || !polaris_gmu_firmware_started || !polaris_gmu_hfi_ready ||
+	    !polaris_gmu_domain_ready || gpucc.virtual == 0 || gmu.virtual == 0) {
+		return false;
+	}
+	cx = probe_read(&gpucc, GPUCC_CX_GDSCR);
+	gmu_clock = probe_read(&gpucc, GPUCC_CX_GMU_CBCR);
+	if ((cx & GDSC_POWER_ON) == 0 ||
+	    (gmu_clock & (CBCR_ENABLE | CBCR_OFF)) != CBCR_ENABLE) {
+		return false;
+	}
+	for (uint32_t attempt = 0; attempt < 8u; attempt++) {
+		uint32_t high = probe_read(&gmu, GMU_ALWAYS_ON_COUNTER_H);
+		uint32_t low = probe_read(&gmu, GMU_ALWAYS_ON_COUNTER_L);
+		uint32_t high_again = probe_read(&gmu, GMU_ALWAYS_ON_COUNTER_H);
+
+		if (high == high_again) {
+			*value = (uint64_t)high << 32 | low;
+			return true;
+		}
+	}
+	return false;
+}
+
 const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
 	.ready = sdm845_gpu_ready,
 	.parameter = hakios_gpu_profile_parameter,
+	.timestamp = sdm845_gpu_timestamp,
 	.quiesce = sdm845_gpu_quiesce,
 	.client_space_create = sdm845_gpu_client_space_create,
 	.client_space_destroy = sdm845_gpu_client_space_destroy,

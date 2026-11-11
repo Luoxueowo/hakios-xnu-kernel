@@ -11,6 +11,7 @@
 struct hakios_gpu_backend_ops {
 	bool (*ready)(void);
 	bool (*parameter)(uint32_t which, uint64_t *value);
+	bool (*timestamp)(uint64_t *value); /* optional hardware counter for MSM_PARAM_TIMESTAMP */
 	void (*quiesce)(void);
 	void (*minute)(void);
 	bool (*client_space_create)(void **space);

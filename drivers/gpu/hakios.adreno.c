@@ -3695,6 +3695,9 @@ hakios_gpu_ready(void)
 bool
 hakios_gpu_parameter(uint32_t which, uint64_t *value)
 {
+	if (which == 0x05 && gpu_backend_ops != NULL && gpu_backend_ops->timestamp != NULL) {
+		return gpu_backend_ops->timestamp(value);
+	}
 	return gpu_backend_ops != NULL && gpu_backend_ops->parameter != NULL &&
 	    gpu_backend_ops->parameter(which, value);
 }
