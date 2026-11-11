@@ -173,6 +173,22 @@ A630 legacy queue/message contract, not assumptions taken from newer HFI variant
 The current step 8 remains read-only: it discovers the tables and TCS state but sends neither an
 HFI message nor an RPMh request.
 
+The A630 legacy HFI v1 wire format is now isolated in `drivers/gpu/hakios.adreno.hfi.h`. It
+provides bounded shared-table initialization, command queue writes, response queue reads,
+sequence-number generation, the GMU init command, and v1 ACK matching. The queue header is 12
+dwords, the queue table is 54 dwords, and each queue contains 1024 dwords. A630's legacy queue IDs
+are 0/4/5/1 for command/message/debug/dispatch; the dispatch queue remains disabled. The host
+allocation is page-rounded to 20 KiB and its GMU virtual address belongs to the noncached kernel
+range beginning at `0x60000000`. `adreno=3` checks and reports this protocol layout, but the helpers
+do not map or cache-maintain memory, attach a GMU SMMU context, ring interrupts, or start HFI.
+
+Qualcomm's matching A630 KGSL implementation gives the GMU separate `gmu_user` and `gmu_kernel`
+SMMU contexts and allocates HFI memory through the GMU-kernel context. Polaris preflight currently
+validates their stream IDs (4 and 5), but does not discover or establish either context bank. The
+HFI queue must be mapped into the verified GMU-kernel address space; the GPU user page table cannot
+be assumed to serve the GMU stream. See the primary Qualcomm [`kgsl_hfi.h`](https://android.googlesource.com/kernel/msm.git/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_hfi.h) and
+[`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm.git/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_gmu.c) sources.
+
 The local firmware set is `a630_gmu.bin`, `a630_sqe.fw`, and `a630_zap.{mdt,b00,b01,b02,elf}`.
 The `mdt` describes three program headers, with a single loadable segment matching `b02`; the
 signed metadata/other chunks still need to follow the exact Qualcomm MDT/PAS loading contract.

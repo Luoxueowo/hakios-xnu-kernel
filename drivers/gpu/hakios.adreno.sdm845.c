@@ -32,6 +32,7 @@
 #include <vm/vm_kern.h>
 
 #include "hakios.gpu_backend.h"
+#include "hakios.adreno.hfi.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
@@ -1637,6 +1638,13 @@ probe_gmu(void)
 	bool counter_stable = false;
 
 	polaris_gmu_domain_ready = false;
+	if (!polaris_a630_hfi_layout_valid()) {
+		printf("adreno-sdm845: step 3: A630 legacy HFI layout is inconsistent; GMU access is refused\n");
+		return false;
+	}
+	printf("adreno-sdm845: step 3: A630 HFI v1 layout: %u-byte allocation, %u-dword queues, GMU VA %#x, legacy IDs cmd/msg/debug/dispatch=0/4/5/1; transport is not started\n",
+	    (uint32_t)POLARIS_A630_HFI_ALLOCATION_BYTES, (uint32_t)POLARIS_A630_HFI_QUEUE_DWORDS,
+	    POLARIS_A630_HFI_GMU_KERNEL_BASE);
 	if (!probe_gpucc_bus("step 3") || !map_block(&gpucc)) {
 		return false;
 	}
