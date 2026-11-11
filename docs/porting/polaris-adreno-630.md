@@ -584,14 +584,17 @@ map/commit/unmap and submit. Polaris allocates up to 64 client roots with ASIDs 
 are mapped only in that client's root, while each root maps the kernel SQE, ring and fence pages
 at the same privileged-only IOVAs. The A6xx submit packet switches SID0 from the trusted ring
 using `CP_SMMU_TABLE_UPDATE` (TTBR0, ASID, ContextIDR and context-bank number) before dispatching
-the client's IBs, then invalidates GPU caches
+the client's IBs, then invalidates GPU caches. It disables CP register protection around the
+trusted table update and restores it before the client IBs, following the upstream A6xx context
+switch sequence
 ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
 [`adreno_iommu.c`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_iommu.c)).
 Client close queues and waits for a trusted switch back to the kernel root before reclaiming the
 client root. If client BO fences or that switch cannot be proven complete, the mappings and root
-are retained. Keep the public-client gate closed until it is confirmed that user IBs cannot issue
-their own table switches or reach private mappings; this command-stream security property and all
-runtime behavior remain unverified on the phone.
+are retained. The protected-mode bracket does not validate client IB opcodes or prove that the
+A630 SQE rejects a client-issued table switch or protected-mode change. Keep the public-client gate
+closed until the SQE command-stream boundary and private-page isolation are confirmed; both that
+boundary and all runtime behavior remain unverified on the phone.
 
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
 software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use the private range

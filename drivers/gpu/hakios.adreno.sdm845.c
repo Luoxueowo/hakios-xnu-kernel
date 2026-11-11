@@ -93,6 +93,7 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_INDIRECT_BUFFER_PFE    0x3fu
 #define A630_CP_EVENT_WRITE             0x46u
 #define A630_CP_SMMU_TABLE_UPDATE       0x53u
+#define A630_CP_SET_PROTECTED_MODE      0x5fu
 #define A630_CP_CACHE_INVALIDATE        0x31u
 #define A630_CP_CCU_INVALIDATE_DEPTH    0x18u
 #define A630_CP_CCU_INVALIDATE_COLOR    0x19u
@@ -116,7 +117,7 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_RING_BYTES              (32u * 1024u)
 #define A630_CP_RING_DWORDS             (A630_CP_RING_BYTES / sizeof(uint32_t))
 #define A630_CP_SUBMIT_MAX_IBS           128u
-#define A630_CP_SUBMIT_FIXED_DWORDS      16u
+#define A630_CP_SUBMIT_FIXED_DWORDS      20u
 #define A630_CP_SUBMIT_MAX_DWORDS        (A630_CP_SUBMIT_FIXED_DWORDS + 4u * A630_CP_SUBMIT_MAX_IBS)
 #define A630_CP_RB_CNTL_DEFAULT         0x0000020cu
 #define A630_CP_RB_CNTL_NO_UPDATE       0x08000000u
@@ -7048,9 +7049,10 @@ fault:
 }
 
 /*
- * A630's production A6xx submit stream switches TTBR0/ASID in the trusted ring, invalidates GPU
- * and CCU caches, chains each client IB through CP_INDIRECT_BUFFER_PFE, then writes the sequence
- * number through CACHE_FLUSH_TS. Kernel private pages are present at fixed IOVAs in every root.
+ * A630's production A6xx submit stream switches TTBR0/ASID in the trusted ring, temporarily
+ * disables CP register protection for that switch, restores protection before client IBs,
+ * invalidates GPU and CCU caches, then writes the sequence through CACHE_FLUSH_TS. Kernel private
+ * pages are present at fixed IOVAs in every root.
  */
 static uint32_t
 sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words, uint32_t count)
@@ -7132,6 +7134,8 @@ sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words
 	}
 	fence_word = (volatile uint32_t *)fence_virtual;
 
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_SET_PROTECTED_MODE, 1u);
+	packet[packet_dwords++] = 0u; /* Trusted ring may update the SMMU table registers. */
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_SMMU_TABLE_UPDATE, 4u);
 	packet[packet_dwords++] = (uint32_t)target_space->root->phys;
 	packet[packet_dwords++] = (uint32_t)(target_space->root->phys >> 32) |
@@ -7140,6 +7144,8 @@ sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words
 	packet[packet_dwords++] = target_space->context_bank;
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
 	packet[packet_dwords++] = A630_CP_CACHE_INVALIDATE;
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_SET_PROTECTED_MODE, 1u);
+	packet[packet_dwords++] = 1u; /* Keep protected-register checks active for client IBs. */
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
 	packet[packet_dwords++] = A630_CP_CCU_INVALIDATE_DEPTH;
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
