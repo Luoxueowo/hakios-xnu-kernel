@@ -689,6 +689,16 @@ builds on the 4K LPAE tables and active SID0 context. User submissions remain di
 step 23 client-root IB, ring confidentiality, completion after return to the kernel root, and the
 orderly stop/quiesce path are validated on the device.
 
+The pinned Mesa 25.0.7 Turnip source selects its userspace-I/O-virtual-address path when both
+`MSM_PARAM_VA_START` and `MSM_PARAM_VA_SIZE` succeed. That path allocates addresses from the
+reported aperture and calls `MSM_INFO_SET_IOVA` for each GEM buffer. HakiosGPU instead assigns and
+maps each buffer's address in the selected backend, exposes it through `MSM_INFO_GET_IOVA`, and
+currently rejects `MSM_INFO_SET_IOVA`. Keep the two VA parameters unsupported until the service can
+safely implement reassignment; Turnip then takes its kernel-assigned-address path and obtains each
+buffer address through `GET_IOVA`. This matches Polaris's existing client aperture and per-client
+mapping model. This is source inspection only; Turnip allocation and rendering have not been
+exercised on the phone.
+
 The table descriptor format follows the existing project mapper and the ARM LPAE definitions in
 upstream Linux [`io-pgtable-arm.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c).
 The Polaris probe uses SMMUv2 IDR2 to confirm 4K support and decode OAS using upstream Linux
