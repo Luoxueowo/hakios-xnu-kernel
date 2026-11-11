@@ -669,6 +669,8 @@ static bool polaris_gpu_cp_initialized;
 static bool polaris_gpu_unsecured_mode;
 static bool polaris_gpu_fence_smoke_test_done;
 static bool polaris_gpu_ring_submit_ready;
+/* Keep public client submission disabled until stop and loader quiesce are implemented. */
+static bool polaris_gpu_client_submission_enabled;
 static uint32_t polaris_gpu_ring_write_pointer;
 static uint32_t polaris_gpu_last_fence;
 static bool polaris_smmu_backend_enabled;
@@ -961,7 +963,8 @@ static uint32_t smmu_id_size_to_bits(uint32_t encoding);
 static bool
 sdm845_gpu_ready(void)
 {
-	return polaris_smmu_backend_enabled && !polaris_smmu_backend_faulted && polaris_sqe_safe &&
+	return polaris_gpu_client_submission_enabled && polaris_smmu_backend_enabled &&
+	    !polaris_smmu_backend_faulted && polaris_sqe_safe &&
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active && polaris_gmu_hfi_ready &&
 	    polaris_gmu_hfi_sealed && polaris_gpu_oob_active && polaris_gpu_core_ready &&
 	    polaris_gpu_core_configured && polaris_zap_authenticated && polaris_pas_image_active &&

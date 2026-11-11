@@ -268,8 +268,13 @@ allow it. A successful firmware boot alone is not a completed driver.
   definitions and KGSL fence-write ordering in [`adreno_pm4types.h`](https://android.googlesource.com/kernel/msm/%2B/f5996ba85abd9d67bdb9506421177a9625ce29c4/drivers/gpu/msm/adreno_pm4types.h) and
   [`adreno_ringbuffer.c`](https://android.googlesource.com/kernel/msm/%2B/037b70a47d04f86b930d349f38a8dcfd7fd07944/drivers/gpu/msm/adreno_ringbuffer.c).
   After checking the magic value, it clears that word so it cannot satisfy the first production
-  fence. `ready()` remains false and user submissions are disabled. This write stage has not been
-  run on the phone.
+  fence. `ready()` also requires a separate public-client enable latch, which this bring-up path
+  never raises. User submissions therefore remain disabled even after the kernel-owned smoke test.
+  This write stage has not been run on the phone.
+- The A630 backend keeps the public-client enable latch closed until both orderly stop and
+  loader-return quiesce can prove that CP, GMU, and SMMU resources are safe to release. This avoids
+  the previous mismatch where step 21 could satisfy every other `ready()` condition even though
+  production client submission and teardown were still incomplete.
 - Once SQE halt has been released, `sdm845_gpu_stop()` now leaves the GMU OOB vote, PAS image,
   SMMU mappings and CP buffers intact. A630's graceful idle/slumber, ring stop and reset sequence
   is not implemented yet, so stop deliberately refuses to tear resources down underneath a live
