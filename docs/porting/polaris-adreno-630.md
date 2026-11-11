@@ -107,18 +107,20 @@ allow it. A successful firmware boot alone is not a completed driver.
   the aligned image span with `PAS_MEM_SETUP`, copies `.b02`, then shuts PAS down. It deliberately
   defers `PAS_AUTH_AND_RESET` until the secure GPU SMMU route is verified. This write stage has not
   been invoked on the device; `ready()` remains false.
-- `adreno=11` is an explicit SMMUv2 write stage. It runs steps 1–6, prepares the detached HFI
-  allocation/page tables, then performs a fresh read-only SMMU scan. It proceeds only when the
-  runtime DT allows dynamic non-static routes, the SMMU client interface is enabled, the GMU is
-  clocked with CM3 held in reset, the 3D core is off, and the selected GMU-kernel context and
-  SID5 route still match the blank/untranslated snapshot. It installs only the GMU-kernel
-  stage-1 context and SID5 route, verifies register readbacks, and attempts rollback on failure.
-  It does not attach SID4 or SID0, authenticate ZAP, start the GMU/HFI, or enable rendering. This
-  stage has not been run on the phone because SMMU write ownership under the active hypervisor is
-  still unverified; `ready()` remains false.
+- `adreno=11` is an explicit SMMUv2 write stage. It runs steps 1–6, prepares detached HFI buffers
+  and separate GMU-kernel/GMU-user page-table roots, then performs a fresh read-only SMMU scan.
+  It proceeds only when the runtime DT allows dynamic non-static routes, the SMMU client interface
+  is enabled, the GMU is clocked with CM3 held in reset, the 3D core is off, and two clear/unrouted
+  context banks plus the SID5/SID4 routes still match the scan. It installs independent stage-1
+  contexts and routes for GMU-kernel SID5 and GMU-user SID4, verifies register readbacks, and
+  attempts rollback on a failed individual attach. The user root is initially empty; firmware
+  shared buffers remain in the kernel context. It does not attach SID0, authenticate ZAP, start the
+  GMU/HFI, or enable rendering. This stage has not been run on the phone because SMMU write
+  ownership under the active hypervisor is still unverified; `ready()` remains false.
 - `adreno=12` is a separate explicit GMU/HFI bring-up stage. It runs steps 1–6, prepares and maps
   HFI, 16 KiB dump, and 4 KiB log buffers, loads and verifies the raw A630 GMU image, refreshes the
-  SMMU snapshot, then installs the GMU-kernel SID5 context. It programs the A6xx TCM-boot, HFI
+  SMMU snapshot, then installs the GMU-kernel SID5 and empty GMU-user SID4 contexts. It programs
+  the A6xx TCM-boot, HFI
   table, log, SFR chip-ID, cache, power-collapse baseline, and AHB-fence registers; submits the
   DT-selected temporary DDR vote through Apps RSC active TCS0 when its bus index is nonzero;
   releases CM3; polls the
@@ -132,11 +134,11 @@ allow it. A successful firmware boot alone is not a completed driver.
   slots; it is serialized with other HakiOS RPMh users through `hakios_rsc_lock`, waits for each
   BCM VCD commit, and checks command statuses. A busy or unsupported RSC is refused without a
   request, and a still-busy timed-out TCS is left untouched. Step 12 keeps the host vote because it
-  does not yet hand bandwidth ownership to GMU DCVS. It leaves SID4 and GPU SID0 unattached and
+  does not yet hand bandwidth ownership to GMU DCVS. It leaves GPU SID0 unattached and
   does not load or authenticate ZAP, submit HFI
   performance/bandwidth tables or default DCVS, start command processing, or enable rendering. On
   timeout or an incompatible version after CM3 release, it reasserts reset and marks the backend
-  faulted while leaving SID5 attached.
+  faulted while leaving GMU SID5/SID4 attached.
   This stage has not been invoked on the phone. The sequence follows Qualcomm's A6xx GMU TCM boot
   and HFI queue setup plus its A630 legacy `GMU_INIT`/`FW_VERSION` path
   ([`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/815ef3fd67546132532651279885563ff35a4605/drivers/gpu/msm/adreno_a6xx_gmu.c),
@@ -153,7 +155,7 @@ allow it. A successful firmware boot alone is not a completed driver.
   the table. It does not send `BW_VOTE_TBL` or an additional RPMh TCS request. Qualcomm's A630 flow
   omits `H2F_MSG_START`, which the A6xx driver sends only
   for A640. If construction or acknowledgement fails, it reasserts
-  CM3 reset, marks the backend faulted, and leaves GMU-kernel SID5 attached. This write stage has
+  CM3 reset, marks the backend faulted, and leaves GMU SID5/SID4 attached. This write stage has
   not been run on the phone.
 - `adreno=14` repeats the guarded GMU/HFI startup and its temporary Apps RSC DDR vote, sends
   `PERF_TBL`, then builds and sends the A630 v1 `H2F_MSG_BW_VOTE_TBL`. The builder validates the
@@ -177,7 +179,7 @@ allow it. A successful firmware boot alone is not a completed driver.
   acknowledgement, HakiOS releases any temporary vote through Apps RSC TCS0 with the zero-bandwidth
   row; GMU remains the owner of HFI-described runtime votes. The TCS write path accepts only Apps RSC
   DRV2 v2.7, protects the shared sequencer with `hakios_rsc_lock`, and checks TCS completion and
-  per-command status. GMU-user and 3D contexts, ZAP authentication, command processor startup, full
+  per-command status. The 3D context, ZAP authentication, command processor startup, full
   stop/thermal handling, and rendering remain unavailable. Rejection of either table,
   `HFI_TEST`, or initial DCVS reasserts CM3 reset and marks the backend faulted. This write stage has
   not been run on the phone.
@@ -375,12 +377,12 @@ dwords, the queue table is 54 dwords, and each queue contains 1024 dwords. A630'
 are 0/4/5/1 for command/message/debug/dispatch; the dispatch queue remains disabled. The HFI
 table/queue allocation is page-rounded to 20 KiB and its GMU virtual address belongs to the
 noncached kernel range beginning at `0x60000000`. `adreno=3` checks and reports this protocol
-layout. Step 9 prepares detached HFI/dump/log mappings, step 11 attaches the GMU-kernel context,
-step 12 starts the GMU, applies the default GX/MX boot vote, sends `GMU_INIT`, and verifies the
-A630 GMU firmware version through `FW_VERSION`. Step 13 builds and sends the 43-dword HFI v1
+layout. Step 9 prepares detached HFI/dump/log mappings and an empty GMU-user root; step 11 attaches
+separate GMU-kernel and GMU-user contexts. Step 12 starts the GMU, applies the default GX/MX boot
+vote, sends `GMU_INIT`, and verifies the A630 GMU firmware version through `FW_VERSION`. Step 13 builds and sends the 43-dword HFI v1
 `PERF_TBL`; step 14 sends that table with the 160-dword `BW_VOTE_TBL`, then sends `HFI_TEST` and
-requests the initial register-based DCVS level. Runtime frequency changes, GMU-user and 3D
-contexts, command processor startup, and rendering remain pending. The cited A630 HFI flow does not
+requests the initial register-based DCVS level. Runtime frequency changes and the 3D context,
+command processor startup, and rendering remain pending. The cited A630 HFI flow does not
 use the A640-only `H2F_MSG_START`.
 Steps 12–14 are code-only bring-up stages and have not
 been invoked on the phone.
@@ -504,11 +506,11 @@ bring-up and a bounded test submission.
    The local firmware probe validates the ZAP MDT layout and applies the upstream SQE check to the
    payload after its 4-byte file prefix; the extracted SQE passes the version floor. The read-only
    SMMUv2 probe scans stream routes and context registers and produces conditional CB/SMR
-   candidates; step 9 builds a detached GMU-kernel context image and step 11 can install just that
-   context/SID route with readback and rollback. Neither step 11 nor any SMMU write stage has been
+   candidates; step 9 builds detached GMU-kernel and empty GMU-user roots and step 11 can install
+   both context/SID routes with readback and rollback. Neither step 11 nor any SMMU write stage has
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
-   a controlled HakiOS boot. Then verify the GMU-kernel attach and extend it to the GMU-user and
-   3D contexts with verified attributes, validate A630 CP register protection, bring up GMU and
+   a controlled HakiOS boot. Then verify both GMU context attachments and extend the planner to the
+   3D context with verified attributes, validate A630 CP register protection, bring up GMU and
    core mappings, ring and fences, and exercise the mapper on-device. Keep the backend disabled
    until those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user

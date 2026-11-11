@@ -4,13 +4,13 @@
  * GPUCC and KGSL SMMU are different blocks, and the latter is SMMUv2 rather than SMMUv500.
  *
  * adreno=1..6 performs read-only probes. Explicit adreno=7 stages and releases PAS metadata,
- * adreno=10 loads GMU ITCM while reset stays asserted, adreno=11 installs only the GMU-kernel
- * SMMUv2 context and SID route, adreno=12 takes the default DDR vote through Apps RSC before booting
- * the GMU and checks HFI firmware version, and adreno=13 sends the A630 HFI performance table;
+ * adreno=10 loads GMU ITCM while reset stays asserted, adreno=11 installs separate GMU-kernel and
+ * GMU-user SMMUv2 contexts and SID routes, and adreno=12 takes the default DDR vote through Apps RSC
+ * before booting the GMU and checking its HFI firmware version. adreno=13 sends the A630 HFI performance table;
  * adreno=14 sends that table and the reconstructed DDR/CNOC bandwidth table, closes the legacy
  * HFI message phase with HFI_TEST, requests initial DCVS, then releases the temporary host DDR vote.
  * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
- * during this bring-up. ZAP authentication, GMU-user and 3D contexts, GPU DCVS, command submission,
+ * during this bring-up. ZAP authentication, 3D context, GPU DCVS, command submission,
  * and rendering are still unavailable, so `ready()` remains false.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
@@ -432,6 +432,7 @@ static bool polaris_smmu_context_routed[POLARIS_SMMU_MAX_CONTEXT_BANKS];
 static uint32_t polaris_smmu_free_smr_slots[POLARIS_SMMU_MAX_CONTEXT_BANKS];
 static uint32_t polaris_smmu_free_smr_count;
 static struct polaris_smmu_route_candidate polaris_smmu_gmu_kernel_route;
+static struct polaris_smmu_route_candidate polaris_smmu_gmu_user_route;
 static uint32_t polaris_smmu_stream_ids[POLARIS_SMMU_MAX_STREAM_IDS];
 static uint32_t polaris_smmu_stream_count;
 struct polaris_smmu_stream_route {
@@ -1771,66 +1772,92 @@ polaris_smmu_context_is_blank(uint32_t bank)
 }
 
 static bool
-polaris_smmu_gmu_kernel_attach(void)
+polaris_smmu_context_attach(struct polaris_smmu_address_space *space,
+	const struct polaris_smmu_route_candidate *route)
 {
-	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL];
-	const struct polaris_smmu_route_candidate *route = &polaris_smmu_gmu_kernel_route;
 	struct polaris_smmu_context_image image;
+	const char *name;
+	uint32_t expected_stream_id;
 	uint32_t old_smr = 0, old_s2cr, new_s2cr, new_smr = 0;
 	uint32_t context, reset, init_result;
 	uint64_t context_offset;
 	bool context_touched = false, s2cr_touched = false, smr_touched = false;
 	bool restored;
 
-	if (!route->valid || !polaris_smmu_dynamic_routes_safe || !polaris_smmu_client_enabled ||
-	    !polaris_smmu_context_snapshot_valid || !polaris_smmu_route_scan_complete ||
-	    route->stream_id != 5u || route->context_bank < 1u || route->context_bank > 4u ||
+	if (space == NULL || route == NULL) {
+		printf("adreno-sdm845: SMMU attach received a null address space or route\n");
+		return false;
+	}
+	if (space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL]) {
+		name = "GMU-kernel";
+		expected_stream_id = 5u;
+	} else if (space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER]) {
+		name = "GMU-user";
+		expected_stream_id = 4u;
+	} else {
+		printf("adreno-sdm845: SMMU attach accepts only the two separate GMU address spaces\n");
+		return false;
+	}
+	if (!route->valid || !polaris_smmu_dynamic_routes_safe ||
+	    !polaris_smmu_client_enabled || !polaris_smmu_context_snapshot_valid || !polaris_smmu_route_scan_complete ||
+	    route->stream_id != expected_stream_id || route->slot >= POLARIS_SMMU_MAX_CONTEXT_BANKS ||
+	    route->context_bank < 1u || route->context_bank > 4u ||
 	    route->context_bank >= polaris_smmu_context_bank_count || polaris_smmu_context_routed[route->context_bank] ||
 	    !polaris_smmu_context_blank[route->context_bank] || polaris_smmu_backend_faulted ||
-	    polaris_gpu_core_ready || !polaris_gmu_domain_ready || gmu.virtual == 0 ||
+	    polaris_gpu_core_ready || !polaris_gmu_domain_ready || gmu.virtual == 0 || space->context_active ||
 	    space->root == NULL || !polaris_smmu_context_image_build(space, &image)) {
-		printf("adreno-sdm845: GMU-kernel SMMU attach preconditions are incomplete; no attach writes were made\n");
+		printf("adreno-sdm845: %s SMMU attach preconditions are incomplete; no attach writes were made\n", name);
 		return false;
+	}
+	for (uint32_t i = 0; i < POLARIS_SMMU_ADDRESS_SPACE_COUNT; i++) {
+		if (&polaris_smmu_spaces[i] != space && polaris_smmu_spaces[i].context_active &&
+		    polaris_smmu_spaces[i].context_bank == route->context_bank) {
+			printf("adreno-sdm845: %s CB%u is already assigned to %s; attach refused\n", name,
+			    route->context_bank, polaris_smmu_spaces[i].name);
+			return false;
+		}
 	}
 	reset = probe_read(&gmu, GMU_CM3_SYSRESET);
 	init_result = probe_read(&gmu, GMU_CM3_FW_INIT_RESULT);
 	if ((reset & 1u) == 0 || init_result == A630_GMU_FW_READY) {
-		printf("adreno-sdm845: GMU-kernel attach requires CM3 held in reset (reset=%#x firmware-init=%#x)\n",
-		    reset, init_result);
+		printf("adreno-sdm845: %s attach requires CM3 held in reset (reset=%#x firmware-init=%#x)\n",
+		    name, reset, init_result);
 		return false;
 	}
 	if ((probe_read(&smmu, SMMU_SCR0) & SMMU_SCR0_CLIENTPD) != 0 ||
 	    !polaris_smmu_context_is_blank(route->context_bank)) {
-		printf("adreno-sdm845: GMU-kernel context or SMMU client state changed since the read-only scan; attach refused\n");
+		printf("adreno-sdm845: %s context or SMMU client state changed since the read-only scan; attach refused\n", name);
 		return false;
 	}
 	context_offset = (uint64_t)polaris_smmu_context_base +
 	    (uint64_t)route->context_bank * polaris_smmu_context_page_size;
 	if (context_offset + polaris_smmu_context_page_size > smmu.size || context_offset > UINT32_MAX ||
-	    SMMU_CBA2R(route->context_bank) + sizeof(uint32_t) > polaris_smmu_context_base) {
-		printf("adreno-sdm845: GMU-kernel context-bank window is invalid; attach refused\n");
+	    SMMU_CBA2R(route->context_bank) + sizeof(uint32_t) > polaris_smmu_context_base ||
+	    SMMU_S2CR(route->slot) + sizeof(uint32_t) > smmu.size ||
+	    (route->stream_matching && SMMU_SMR(route->slot) + sizeof(uint32_t) > polaris_smmu_context_base)) {
+		printf("adreno-sdm845: %s context or route register window is invalid; attach refused\n", name);
 		return false;
 	}
 	context = (uint32_t)context_offset;
 	old_s2cr = probe_read(&smmu, SMMU_S2CR(route->slot));
 	if (old_s2cr != route->expected_s2cr) {
-		printf("adreno-sdm845: GMU-kernel S2CR[%u] changed since planning; attach refused\n", route->slot);
+		printf("adreno-sdm845: %s S2CR[%u] changed since planning; attach refused\n", name, route->slot);
 		return false;
 	}
 	if (route->stream_matching) {
 		old_smr = probe_read(&smmu, SMMU_SMR(route->slot));
 		if (old_smr != route->expected_smr || (!!(old_smr & SMMU_SMR_VALID) != route->existing_smr)) {
-			printf("adreno-sdm845: GMU-kernel SMR[%u] changed since planning; attach refused\n", route->slot);
+			printf("adreno-sdm845: %s SMR[%u] changed since planning; attach refused\n", name, route->slot);
 			return false;
 		}
 	}
 	if (((old_s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK) == SMMU_S2CR_TYPE_TRANS) {
-		printf("adreno-sdm845: GMU-kernel S2CR[%u] already translates; attach refused\n", route->slot);
+		printf("adreno-sdm845: %s S2CR[%u] already translates; attach refused\n", name, route->slot);
 		return false;
 	}
 
-	printf("adreno-sdm845: explicit SMMUv2 stage: configure GMU-kernel ASID %u at CB%u for SID%u; this stage writes context and route registers\n",
-	    space->asid, route->context_bank, route->stream_id);
+	printf("adreno-sdm845: explicit SMMUv2 stage: configure %s ASID %u at CB%u for SID%u; this stage writes context and route registers\n",
+	    name, space->asid, route->context_bank, route->stream_id);
 	context_touched = true;
 	probe_write(&smmu, context + SMMU_CB_SCTLR, 0);
 	probe_write(&smmu, SMMU_CBA2R(route->context_bank), image.cba2r);
@@ -1854,13 +1881,13 @@ polaris_smmu_gmu_kernel_attach(void)
 	    probe_read(&smmu, context + SMMU_CB_CONTEXTIDR) != 0 ||
 	    probe_read(&smmu, context + SMMU_CB_MAIR0) != image.mair0 ||
 	    probe_read(&smmu, context + SMMU_CB_MAIR1) != image.mair1) {
-		printf("adreno-sdm845: GMU-kernel context register readback failed before SCTLR enable\n");
+		printf("adreno-sdm845: %s context register readback failed before SCTLR enable\n", name);
 		goto rollback;
 	}
 	probe_write(&smmu, context + SMMU_CB_SCTLR, image.sctlr);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	if (probe_read(&smmu, context + SMMU_CB_SCTLR) != image.sctlr) {
-		printf("adreno-sdm845: GMU-kernel SCTLR readback failed\n");
+		printf("adreno-sdm845: %s SCTLR readback failed\n", name);
 		goto rollback;
 	}
 	space->context_bank = route->context_bank;
@@ -1878,7 +1905,7 @@ polaris_smmu_gmu_kernel_attach(void)
 	if ((probe_read(&smmu, SMMU_S2CR(route->slot)) &
 	    (SMMU_S2CR_TYPE_FIELD_MASK | SMMU_S2CR_CBNDX_MASK)) !=
 	    (new_s2cr & (SMMU_S2CR_TYPE_FIELD_MASK | SMMU_S2CR_CBNDX_MASK))) {
-		printf("adreno-sdm845: GMU-kernel S2CR readback failed\n");
+		printf("adreno-sdm845: %s S2CR readback failed\n", name);
 		goto rollback;
 	}
 	if (route->stream_matching && !route->existing_smr) {
@@ -1888,12 +1915,12 @@ polaris_smmu_gmu_kernel_attach(void)
 		__asm__ volatile ("dsb sy" ::: "memory");
 		if ((probe_read(&smmu, SMMU_SMR(route->slot)) &
 		    (SMMU_SMR_VALID | SMMU_SMR_ID_MASK | (SMMU_SMR_MASK_MASK << SMMU_SMR_MASK_SHIFT))) != new_smr) {
-			printf("adreno-sdm845: GMU-kernel SMR readback failed\n");
+			printf("adreno-sdm845: %s SMR readback failed\n", name);
 			goto rollback;
 		}
 	}
-	printf("adreno-sdm845: GMU-kernel SMMU context is active at CB%u for SID%u; firmware/HFI startup remains disabled\n",
-	    route->context_bank, route->stream_id);
+	printf("adreno-sdm845: %s SMMU context is active at CB%u for SID%u; firmware/HFI startup remains disabled\n",
+	    name, route->context_bank, route->stream_id);
 	return true;
 
 rollback:
@@ -1924,13 +1951,28 @@ rollback:
 	    (!smr_touched || probe_read(&smmu, SMMU_SMR(route->slot)) == old_smr);
 	if (!restored) {
 		polaris_smmu_backend_faulted = true;
-		printf("adreno-sdm845: GMU-kernel SMMU rollback could not be verified; backend is faulted and remains disabled\n");
+		printf("adreno-sdm845: %s SMMU rollback could not be verified; backend is faulted and remains disabled\n", name);
 	} else if (polaris_smmu_backend_faulted) {
-		printf("adreno-sdm845: GMU-kernel SMMU state was restored, but the backend remains faulted after TLB synchronization failure\n");
+		printf("adreno-sdm845: %s SMMU state was restored, but the backend remains faulted after TLB synchronization failure\n",
+		    name);
 	} else {
-		printf("adreno-sdm845: GMU-kernel SMMU attach failed; original route and blank context were restored\n");
+		printf("adreno-sdm845: %s SMMU attach failed; original route and blank context were restored\n", name);
 	}
 	return false;
+}
+
+static bool
+polaris_smmu_gmu_kernel_attach(void)
+{
+	return polaris_smmu_context_attach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL],
+	    &polaris_smmu_gmu_kernel_route);
+}
+
+static bool
+polaris_smmu_gmu_user_attach(void)
+{
+	return polaris_smmu_context_attach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER],
+	    &polaris_smmu_gmu_user_route);
 }
 
 static void
@@ -2021,12 +2063,40 @@ sdm845_gpu_to_memory(void *start, uint64_t size)
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
+static bool
+polaris_smmu_space_root_prepare(struct polaris_smmu_address_space *space)
+{
+	bool ready;
+
+	if (space == NULL) {
+		return false;
+	}
+	lck_mtx_lock(&polaris_smmu_pt_lock);
+	if (space->root == NULL) {
+		space->root = polaris_smmu_table_new();
+		if (space->root != NULL) {
+			space->root->dirty = true;
+		}
+	}
+	ready = space->root != NULL;
+	if (ready) {
+		polaris_smmu_commit_locked();
+	}
+	lck_mtx_unlock(&polaris_smmu_pt_lock);
+	if (!ready) {
+		printf("adreno-sdm845: cannot allocate the detached SMMUv2 root for %s\n", space->name);
+	}
+	return ready;
+}
+
 /* Prepare an HFI allocation and GMU-kernel page tables without attaching or enabling the SMMU. */
 static bool
 polaris_hfi_software_prepare(void)
 {
 	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL];
+	struct polaris_smmu_address_space *user_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER];
 	struct polaris_smmu_context_image context_image;
+	struct polaris_smmu_context_image user_context_image;
 	vm_size_t allocation_size;
 	vm_offset_t allocation = 0, uncached;
 	uint64_t phys;
@@ -2050,6 +2120,9 @@ polaris_hfi_software_prepare(void)
 	if (!polaris_smmu_supports_4k || polaris_smmu_oas_bits < 32 || polaris_smmu_oas_bits > 48 ||
 	    polaris_smmu_context_page_size == 0 || polaris_smmu_context_bank_count == 0) {
 		printf("adreno-sdm845: step 9 requires a validated SMMUv2 4-KiB stage-1 configuration\n");
+		return false;
+	}
+	if (!polaris_smmu_space_root_prepare(user_space)) {
 		return false;
 	}
 	if (polaris_hfi_allocation == 0) {
@@ -2113,7 +2186,8 @@ polaris_hfi_software_prepare(void)
 		sdm845_gpu_mapped();
 		polaris_hfi_space_mapped = true;
 	}
-	if (!polaris_smmu_context_image_build(space, &context_image)) {
+	if (!polaris_smmu_context_image_build(space, &context_image) ||
+	    !polaris_smmu_context_image_build(user_space, &user_context_image)) {
 		printf("adreno-sdm845: step 9 cannot build an AArch64 SMMUv2 context image for the detached GMU-kernel root\n");
 		return false;
 	}
@@ -2124,6 +2198,9 @@ polaris_hfi_software_prepare(void)
 	    polaris_hfi_physical, context_image.cbar, context_image.cba2r,
 	    context_image.tcr, context_image.tcr2, context_image.ttbr0, context_image.ttbr1,
 	    context_image.mair0, context_image.sctlr);
+	printf("adreno-sdm845: step 9 GMU-user detached empty context: ASID=%u CBAR=%#x CBA2R=%#x TCR=%#x TCR2=%#x TTBR0=%#llx; no SMMU register was written\n",
+	    user_space->asid, user_context_image.cbar, user_context_image.cba2r, user_context_image.tcr,
+	    user_context_image.tcr2, user_context_image.ttbr0);
 	return true;
 }
 
@@ -2466,10 +2543,11 @@ polaris_smmu_plan_attach(bool stream_matching, uint32_t sid_bits)
 	static const uint32_t plan_streams[] = { 0, 5, 4 };
 	static const char *const plan_names[] = { "3D user", "GMU kernel", "GMU user" };
 	uint32_t route_slots[sizeof(plan_streams) / sizeof(plan_streams[0])];
+	uint32_t claimed_slots[sizeof(plan_streams) / sizeof(plan_streams[0])];
 	uint32_t gmu_banks[2], gmu_bank_count = 0, route_count = 0;
 	bool route_ok[sizeof(plan_streams) / sizeof(plan_streams[0])] = { false, false, false };
 	bool gpu_cb0_candidate;
-	struct polaris_smmu_stream_route *kernel_route;
+	struct polaris_smmu_stream_route *kernel_route, *user_route;
 
 	printf("adreno-sdm845: read-only SMMUv2 attach planner: GPU SID0 reserves Qualcomm CB0; secure GPU SIDs1/2 are excluded; HYP-protected CB5-7 are excluded\n");
 	if (!polaris_smmu_client_enabled) {
@@ -2512,9 +2590,10 @@ polaris_smmu_plan_attach(bool stream_matching, uint32_t sid_bits)
 		uint32_t candidate_slot;
 
 		route_ok[i] = polaris_smmu_plan_route_slot(plan_streams[i], stream_matching, sid_bits,
-		    route_slots, route_count, &candidate_slot);
+		    claimed_slots, route_count, &candidate_slot);
 		if (route_ok[i]) {
-			route_slots[route_count] = candidate_slot;
+			route_slots[i] = candidate_slot;
+			claimed_slots[route_count] = candidate_slot;
 			printf("adreno-sdm845: attach plan: %s SID%u may use %s slot %u\n", plan_names[i], plan_streams[i],
 			    stream_matching ? "SMR/S2CR" : "SID-indexed S2CR", candidate_slot);
 			route_count++;
@@ -2550,6 +2629,37 @@ polaris_smmu_plan_attach(bool stream_matching, uint32_t sid_bits)
 		printf("adreno-sdm845: GMU-kernel stage-1 candidate: SID%u -> CB%u via %s slot %u%s\n",
 		    plan_streams[1], gmu_banks[0], stream_matching ? "SMR/S2CR" : "SID-indexed S2CR",
 		    route_slots[1], existing_smr ? " (existing exact SMR)" : "");
+	}
+	user_route = polaris_smmu_find_route(plan_streams[2]);
+	if (gmu_bank_count == 2 && route_ok[2] && user_route != NULL) {
+		uint32_t expected_smr = 0;
+		uint32_t expected_s2cr;
+		bool existing_smr = stream_matching && user_route->matches == 1;
+
+		if (existing_smr) {
+			expected_smr = user_route->smr;
+			expected_s2cr = user_route->s2cr;
+		} else if (stream_matching) {
+			expected_smr = probe_read(&smmu, SMMU_SMR(route_slots[2]));
+			expected_s2cr = probe_read(&smmu, SMMU_S2CR(route_slots[2]));
+			if (expected_smr & SMMU_SMR_VALID) {
+				printf("adreno-sdm845: GMU-user candidate slot %u became valid during planning\n", route_slots[2]);
+				return;
+			}
+		} else {
+			expected_s2cr = user_route->s2cr;
+		}
+		polaris_smmu_gmu_user_route.valid = true;
+		polaris_smmu_gmu_user_route.stream_matching = stream_matching;
+		polaris_smmu_gmu_user_route.existing_smr = existing_smr;
+		polaris_smmu_gmu_user_route.stream_id = plan_streams[2];
+		polaris_smmu_gmu_user_route.slot = route_slots[2];
+		polaris_smmu_gmu_user_route.context_bank = gmu_banks[1];
+		polaris_smmu_gmu_user_route.expected_smr = expected_smr;
+		polaris_smmu_gmu_user_route.expected_s2cr = expected_s2cr;
+		printf("adreno-sdm845: GMU-user stage-1 candidate: SID%u -> CB%u via %s slot %u%s\n",
+		    plan_streams[2], gmu_banks[1], stream_matching ? "SMR/S2CR" : "SID-indexed S2CR",
+		    route_slots[2], existing_smr ? " (existing exact SMR)" : "");
 	}
 	if (gpu_cb0_candidate && gmu_bank_count == 2 && route_ok[0] && route_ok[1] && route_ok[2]) {
 		printf("adreno-sdm845: read-only full-plan candidate: GPU SID0->CB0; GMU kernel SID5->CB%u; GMU user SID4->CB%u; this planner performs no register writes\n",
@@ -4133,8 +4243,9 @@ polaris_gmu_hfi_start_stage(uint32_t step)
 		printf("adreno-sdm845: step %u could not load GMU ITCM; reset remains asserted\n", step);
 		return false;
 	}
-	if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid || !polaris_smmu_gmu_kernel_attach()) {
-		printf("adreno-sdm845: step %u could not attach the verified GMU-kernel SID5 context; GMU remains stopped\n", step);
+	if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid || !polaris_smmu_gmu_user_route.valid ||
+	    !polaris_smmu_gmu_kernel_attach() || !polaris_smmu_gmu_user_attach()) {
+		printf("adreno-sdm845: step %u could not attach both verified GMU SMMUv2 contexts; GMU remains stopped\n", step);
 		return false;
 	}
 	if (!polaris_gmu_hfi_start()) {
@@ -4289,16 +4400,18 @@ polaris_gmu_hfi_stop_after_failure(uint32_t step)
 	polaris_gmu_hfi_bw_table_ready = false;
 	polaris_hfi_state.initialized = false;
 	polaris_smmu_backend_faulted = true;
-	printf("adreno-sdm845: step %u failure cleanup requested CM3 reset (readback=%#x); GMU-kernel SID5 remains attached and backend stays faulted\n",
+	printf("adreno-sdm845: step %u failure cleanup requested CM3 reset (readback=%#x); GMU SID5/SID4 contexts remain attached and backend stays faulted\n",
 	    step, reset);
 }
 
-/* Boot GMU/HFI with the host DDR vote; GPU-user SID4, ZAP, GX and CP stay off. */
+/* Boot GMU/HFI with the host DDR vote; the GMU-user and GMU-kernel contexts are both active. */
 static bool
 polaris_gmu_hfi_start(void)
 {
 	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL];
 	const struct polaris_smmu_route_candidate *route = &polaris_smmu_gmu_kernel_route;
+	struct polaris_smmu_address_space *user_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER];
+	const struct polaris_smmu_route_candidate *user_route = &polaris_smmu_gmu_user_route;
 	uint32_t reset, init_result, context, s2cr, log_info, hfi_version, firmware_version;
 
 	if (!polaris_gmu_firmware_loaded || polaris_gmu_firmware_started || polaris_gmu_hfi_ready ||
@@ -4307,8 +4420,10 @@ polaris_gmu_hfi_start(void)
 	    !polaris_hfi_state.initialized || polaris_hfi_state.gmu_address != POLARIS_A630_HFI_GMU_KERNEL_BASE ||
 	    !space->context_active || space->context_bank == UINT32_MAX || !route->valid ||
 	    route->stream_id != 5u || route->context_bank != space->context_bank ||
+	    !user_space->context_active || user_space->context_bank == UINT32_MAX || !user_route->valid ||
+	    user_route->stream_id != 4u || user_route->context_bank != user_space->context_bank ||
 	    polaris_smmu_backend_faulted || smmu.virtual == 0 || gmu.virtual == 0) {
-		printf("adreno-sdm845: step 12 requires the verified GMU image, mapped HFI/dump/log memory, and active SID5 context; no GMU start writes were made\n");
+		printf("adreno-sdm845: step 12 requires verified GMU memory and active SID5/SID4 kernel/user contexts; no GMU start writes were made\n");
 		return false;
 	}
 	reset = probe_read(&gmu, GMU_CM3_SYSRESET);
@@ -4328,6 +4443,17 @@ polaris_gmu_hfi_start(void)
 	    probe_read(&smmu, SMMU_SMR(route->slot)) !=
 	    (SMMU_SMR_VALID | (route->stream_id & SMMU_SMR_ID_MASK)))) {
 		printf("adreno-sdm845: step 12 SID5 route or GMU-kernel context changed after attachment; GMU start refused\n");
+		return false;
+	}
+	context = polaris_smmu_context_base + user_space->context_bank * polaris_smmu_context_page_size;
+	s2cr = probe_read(&smmu, SMMU_S2CR(user_route->slot));
+	if ((s2cr & (SMMU_S2CR_TYPE_FIELD_MASK | SMMU_S2CR_CBNDX_MASK)) !=
+	    ((SMMU_S2CR_TYPE_TRANS << SMMU_S2CR_TYPE_SHIFT) | user_space->context_bank) ||
+	    (probe_read(&smmu, context + SMMU_CB_SCTLR) & SMMU_SCTLR_M) == 0 ||
+	    (user_route->stream_matching &&
+	    probe_read(&smmu, SMMU_SMR(user_route->slot)) !=
+	    (SMMU_SMR_VALID | (user_route->stream_id & SMMU_SMR_ID_MASK)))) {
+		printf("adreno-sdm845: step 12 SID4 route or GMU-user context changed after attachment; GMU start refused\n");
 		return false;
 	}
 	log_info = A630_GMU_LOG_VA | (A630_GMU_LOG_BYTES / POLARIS_SMMU_TABLE_BYTES - 1u);
@@ -4431,7 +4557,7 @@ polaris_gmu_hfi_start(void)
 		return false;
 	}
 	polaris_gmu_hfi_ready = true;
-	printf("adreno-sdm845: step 12 GMU firmware and legacy HFI are ready (HFI=%#x GMU=%#x); initial GX/MX rail vote was acknowledged, while GPU-user SID4, 3D SID0, ZAP, CP, and rendering remain disabled\n",
+	printf("adreno-sdm845: step 12 GMU firmware and legacy HFI are ready (HFI=%#x GMU=%#x); GMU SID5/SID4 kernel/user contexts and initial GX/MX rail vote are active, while 3D SID0, ZAP, CP, and rendering remain disabled\n",
 	    hfi_version, firmware_version);
 	return true;
 }
@@ -4861,10 +4987,10 @@ hakios_adreno_sdm845_init(void)
 		return;
 	}
 	if (last_step == 11) {
-		printf("adreno-sdm845: step 11 explicitly attaches only the GMU-kernel SMMUv2 context; it runs steps 1..6, prepares HFI tables, rechecks SMMU state, and writes CB/SID registers\n");
+		printf("adreno-sdm845: step 11 explicitly attaches separate GMU-kernel SID5 and GMU-user SID4 SMMUv2 contexts; it runs steps 1..6, prepares both roots and HFI tables, rechecks SMMU state, then writes CB/SID registers\n");
 		for (uint32_t i = 0; i < 6; i++) {
 			if (!probes[i]()) {
-				printf("adreno-sdm845: step %u failed; the GMU-kernel SMMU context is not attached\n", i + 1);
+				printf("adreno-sdm845: step %u failed; neither GMU SMMUv2 context is attached\n", i + 1);
 				return;
 			}
 		}
@@ -4872,19 +4998,19 @@ hakios_adreno_sdm845_init(void)
 			printf("adreno-sdm845: step 11 could not prepare HFI tables; the SMMU remains unchanged\n");
 			return;
 		}
-		if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid) {
-			printf("adreno-sdm845: step 11 could not refresh a GMU-kernel attach candidate; the SMMU remains unchanged\n");
+		if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid || !polaris_smmu_gmu_user_route.valid) {
+			printf("adreno-sdm845: step 11 could not refresh both GMU attach candidates; the SMMU remains unchanged\n");
 			return;
 		}
-		if (!polaris_smmu_gmu_kernel_attach()) {
-			printf("adreno-sdm845: step 11 did not attach the GMU-kernel context; HFI and firmware remain stopped\n");
+		if (!polaris_smmu_gmu_kernel_attach() || !polaris_smmu_gmu_user_attach()) {
+			printf("adreno-sdm845: step 11 did not attach both GMU contexts; HFI and firmware remain stopped\n");
 			return;
 		}
-		printf("adreno-sdm845: step 11 attached only GMU SID5; GMU firmware/HFI, GMU-user SID4, 3D SID0, and rendering remain disabled\n");
+		printf("adreno-sdm845: step 11 attached GMU SID5/SID4 to separate kernel/user contexts; GMU firmware/HFI, 3D SID0, ZAP, and rendering remain disabled\n");
 		return;
 	}
 	if (last_step == 12) {
-		printf("adreno-sdm845: step 12 explicitly boots GMU firmware and the first legacy HFI command; it runs steps 1..6, prepares HFI/dump/log memory, loads ITCM, refreshes SID5 routing, then attaches SID5 and starts HFI\n");
+		printf("adreno-sdm845: step 12 explicitly boots GMU firmware and the first legacy HFI command; it runs steps 1..6, prepares HFI/dump/log memory and both GMU roots, loads ITCM, refreshes SID4/SID5 routing, attaches both contexts, then starts HFI\n");
 		for (uint32_t i = 0; i < 6; i++) {
 			if (!probes[i]()) {
 				printf("adreno-sdm845: step %u failed; GMU startup is not attempted\n", i + 1);
@@ -4899,20 +5025,20 @@ hakios_adreno_sdm845_init(void)
 			printf("adreno-sdm845: step 12 could not load GMU ITCM; reset remains asserted\n");
 			return;
 		}
-		if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid ||
-		    !polaris_smmu_gmu_kernel_attach()) {
-			printf("adreno-sdm845: step 12 could not attach the verified GMU-kernel SID5 context; GMU remains stopped\n");
+		if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid || !polaris_smmu_gmu_user_route.valid ||
+		    !polaris_smmu_gmu_kernel_attach() || !polaris_smmu_gmu_user_attach()) {
+			printf("adreno-sdm845: step 12 could not attach both verified GMU SMMUv2 contexts; GMU remains stopped\n");
 			return;
 		}
 		if (!polaris_gmu_hfi_start()) {
 			printf("adreno-sdm845: step 12 GMU/HFI startup did not complete; the A630 backend remains disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 12 finished; GMU-kernel SID5, the initial GX/MX rail vote, and temporary Apps RSC DDR vote are active; GPU rendering remains disabled\n");
+		printf("adreno-sdm845: step 12 finished; GMU SID5/SID4 kernel/user contexts, the initial GX/MX rail vote, and temporary Apps RSC DDR vote are active; GPU rendering remains disabled\n");
 		return;
 	}
 	if (last_step == 13) {
-		printf("adreno-sdm845: step 13 explicitly boots the GMU and sends only HFI PERF_TBL; it runs steps 1..6, prepares HFI memory, loads GMU ITCM, attaches SID5, then starts HFI and submits GPU/GMU ARC performance levels\n");
+		printf("adreno-sdm845: step 13 explicitly boots the GMU and sends only HFI PERF_TBL; it runs steps 1..6, prepares HFI memory and both GMU roots, loads GMU ITCM, attaches SID4/SID5, then starts HFI and submits GPU/GMU ARC performance levels\n");
 		if (!polaris_gmu_hfi_start_stage(13u)) {
 			return;
 		}
@@ -4921,7 +5047,7 @@ hakios_adreno_sdm845_init(void)
 			printf("adreno-sdm845: step 13 failed; BW table, GX core, CP, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL and the initial GX/MX rail vote are acknowledged, while BW_VOTE_TBL, default DCVS, GPU-user/3D routes, ZAP authentication, CP, and rendering remain disabled; A630 uses legacy HFI, not the A640-only HFI START command\n");
+		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL and the initial GX/MX rail vote are acknowledged, while BW_VOTE_TBL, default DCVS, 3D SID0, ZAP authentication, CP, and rendering remain disabled; A630 uses legacy HFI, not the A640-only HFI START command\n");
 		return;
 	}
 	if (last_step == 14) {
@@ -4933,14 +5059,14 @@ hakios_adreno_sdm845_init(void)
 		    !polaris_gmu_hfi_send_test() || !polaris_gmu_hfi_set_initial_dcvs() ||
 		    !polaris_gmu_temp_bus_vote_set(false)) {
 			polaris_gmu_hfi_stop_after_failure(14u);
-			printf("adreno-sdm845: step 14 failed; legacy HFI/default DCVS setup did not complete; GPU-user/3D routes, ZAP authentication, CP submission, and rendering remain disabled\n");
+			printf("adreno-sdm845: step 14 failed; legacy HFI/default DCVS setup did not complete; 3D SID0, ZAP authentication, CP submission, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 14 finished; PERF_TBL, BW_VOTE_TBL, HFI_TEST, and default DCVS are acknowledged, and the temporary host DDR vote is released; the boot rail request remains active for later GPU start, while GPU-user/3D routes, ZAP authentication, CP submission, and rendering remain disabled\n");
+		printf("adreno-sdm845: step 14 finished; PERF_TBL, BW_VOTE_TBL, HFI_TEST, and default DCVS are acknowledged, and the temporary host DDR vote is released; the boot rail request remains active for later GPU start, while 3D SID0, ZAP authentication, CP submission, and rendering remain disabled\n");
 		return;
 	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches only GMU SID5, step 12 boots GMU/HFI with the initial rail vote, step 13 sends PERF_TBL, and step 14 sends both HFI tables, HFI_TEST, and initial DCVS; "
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches GMU SID5/SID4, step 12 boots GMU/HFI with the initial rail vote, step 13 sends PERF_TBL, and step 14 sends both HFI tables, HFI_TEST, and initial DCVS; "
 		    "requested step %u is capped at %zu in the sequential probe path\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);
