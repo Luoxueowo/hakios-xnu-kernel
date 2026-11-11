@@ -25,6 +25,8 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 
+#include "hakios.gpu_backend.h"
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 
@@ -81,6 +83,18 @@ static struct probe_block gpucc = { "gpucc", POLARIS_GPUCC_PHYS, POLARIS_GPUCC_S
 static struct probe_block gmu = { "gmu", POLARIS_GMU_PHYS, POLARIS_GMU_SIZE, 0 };
 static struct probe_block smmu = { "kgsl-smmu-v2", POLARIS_SMMU_PHYS, POLARIS_SMMU_SIZE, 0 };
 static struct probe_block gpu = { "3d-core", POLARIS_GPU_PHYS, POLARIS_GPU_SIZE, 0 };
+
+static bool
+sdm845_gpu_ready(void)
+{
+	return false;				/* no writable A630 backend is registered yet */
+}
+
+const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
+	.ready = sdm845_gpu_ready,
+	.parameter = hakios_gpu_profile_parameter,
+	/* The read-only probe exposes no maps, submissions, fences, or Redwood SoC maintenance. */
+};
 
 static bool
 map_block(struct probe_block *block)

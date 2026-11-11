@@ -101,6 +101,8 @@
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
+#include "hakios.gpu_backend.h"
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
@@ -3129,8 +3131,8 @@ gpu_block_stop(void)
  * end of a run, a panic). Only the two writes that keep the GMU out of memory that is no longer
  * its to use.
  */
-void
-hakios_adreno_quiesce(void)
+static void
+redwood_adreno_quiesce(void)
 {
 	if (cx_off) {
 		return;
@@ -3185,6 +3187,49 @@ hakios_adreno_quiesce(void)
 #define EVENT_INVALIDATE_DEPTH  0x18
 #define EVENT_INVALIDATE_COLOR  0x19
 
+/* Values exposed through the MSM GET_PARAM interface. Redwood remains the default profile. */
+struct gpu_profile {
+	uint32_t gpu_id;
+	uint64_t chip_id;
+	uint64_t gmem_base;
+	uint64_t gmem_size;
+	uint64_t max_frequency;
+	uint64_t highest_bank_bit;
+	uint64_t ubwc_swizzle;
+	uint64_t macrotile_mode;
+};
+
+static const struct gpu_profile redwood_gpu_profile = {
+	.gpu_id = 0,
+	.chip_id = GPU_CHIP_ID,
+	.gmem_base = 0,
+	.gmem_size = 512 * 1024,
+	.max_frequency = 0,                  /* read from core_khz after Redwood fuse/profile setup */
+	.highest_bank_bit = 14,
+	.ubwc_swizzle = 6,
+	.macrotile_mode = 1,
+};
+
+static const struct gpu_profile polaris_gpu_profile = {
+	.gpu_id = 630,                       /* Linux A6xx catalog: revn = 630 */
+	.chip_id = 0x06030001ull,            /* Polaris DT: qcom,chipid */
+	.gmem_base = 0x00100000ull,          /* A6xx gen1 profile: GMEM starts at 1 MiB */
+	.gmem_size = 1024 * 1024,            /* A630 A6xx catalog: SZ_1M */
+	.max_frequency = 710000000ull,       /* Polaris DT qcom,gpu-pwrlevel@0 */
+	.highest_bank_bit = 15,              /* Polaris DT qcom,highest-bank-bit */
+	.ubwc_swizzle = 6,                   /* SDM845 UBWC 2.0 enables swizzle levels 2 and 3 */
+	.macrotile_mode = 0,                 /* SDM845 UBWC profile leaves macrotile mode disabled */
+};
+
+static const struct gpu_profile *gpu_profile = &redwood_gpu_profile;
+static const struct hakios_gpu_backend_ops *gpu_backend_ops;
+
+void
+hakios_gpu_backend_select(const struct hakios_gpu_backend_ops *ops)
+{
+	gpu_backend_ops = ops;
+}
+
 static bool gpu_kept;
 static uint32_t gpu_fence;              /* the number of the last submission */
 static uint32_t gpu_timed;              /* ... of the last whose times have been added up */
@@ -3212,8 +3257,8 @@ static void gpu_block_stop(void);
  * next kernel's step 4 takes it down (stale_stop()). Boot-arg adreno_dirty=1 makes every ending
  * a panic's in this respect, to see that work.
  */
-void
-hakios_gpu_stop(void)
+static void
+redwood_gpu_stop(void)
 {
 	if (gpu_kept) {
 		uint32_t waited = 0;
@@ -3241,24 +3286,28 @@ hakios_adreno_stop(void)
 {
 	uint32_t dirty = 0;
 
-	if (gpu_kept && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
+	if (hakios_gpu_ready() && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
 		HakiosGPUStop();
 	}
 }
 
-bool
-hakios_gpu_ready(void)
+static bool
+redwood_gpu_ready(void)
 {
 	return gpu_kept;
 }
 
 /* The answers to msm's GET_PARAM (Linux's adreno_get_param for this GPU; the numbers are msm_drm.h's). */
 bool
-hakios_gpu_parameter(uint32_t which, uint64_t *value)
+hakios_gpu_profile_parameter(uint32_t which, uint64_t *value)
 {
 	switch (which) {
-	case 0x01:                              /* GPU_ID: none, the chip ID says it */
+	case 0x01:                              /* GPU_ID */
+		*value = gpu_profile->gpu_id;
+		return true;
 	case 0x06:                              /* GMEM_BASE */
+		*value = gpu_profile->gmem_base;
+		return true;
 	case 0x08:                              /* PP_PGTABLE */
 	case 0x09:                              /* FAULTS */
 	case 0x0a:                              /* SUSPENDS */
@@ -3266,13 +3315,13 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 0;
 		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = gpu_profile->gmem_size;
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
-		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
+		*value = gpu_profile->chip_id | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
-		*value = core_khz * 1000ull;
+		*value = gpu_profile == &redwood_gpu_profile ? core_khz * 1000ull : gpu_profile->max_frequency;
 		return true;
 	case 0x05:                              /* TIMESTAMP */
 		*value = mach_absolute_time();
@@ -3281,13 +3330,13 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = gpu_profile->highest_bank_bit;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
-		*value = 6;
+		*value = gpu_profile->ubwc_swizzle;
 		return true;
 	case 0x13:                              /* MACROTILE_MODE */
-		*value = 1;
+		*value = gpu_profile->macrotile_mode;
 		return true;
 	default:                                /* among them VA_START, VA_SIZE: addresses are ours to give */
 		return false;
@@ -3345,20 +3394,20 @@ hakios_gpu_address_free(uint64_t address, uint64_t size)
 }
 
 /* One 4K page of ours at an address of the 3D core's; after the last of a buffer's, hakios_gpu_mapped(). */
-bool
-hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+static bool
+redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 {
 	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
 }
 
-void
-hakios_gpu_mapped(void)
+static void
+redwood_gpu_mapped(void)
 {
 	space_commit(&core_space);
 }
 
-void
-hakios_gpu_unmap(uint64_t address, uint64_t size)
+static void
+redwood_gpu_unmap(uint64_t address, uint64_t size)
 {
 	uint32_t context = smmu_context(&core_space);
 
@@ -3373,15 +3422,15 @@ hakios_gpu_unmap(uint64_t address, uint64_t size)
 }
 
 /* Memory that the 3D core and a program see without this processor's cache in between: out of that cache. */
-void
-hakios_gpu_to_memory(void *start, uint64_t size)
+static void
+redwood_gpu_to_memory(void *start, uint64_t size)
 {
 	to_memory((vm_offset_t)start, size);
 }
 
 /* How far the 3D core has got. */
-bool
-hakios_gpu_done(uint32_t fence)
+static bool
+redwood_gpu_done(uint32_t fence)
 {
 	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
 
@@ -3389,8 +3438,8 @@ hakios_gpu_done(uint32_t fence)
 	return (int32_t)(*word - fence) >= 0;
 }
 
-uint32_t
-hakios_gpu_last(void)
+static uint32_t
+redwood_gpu_last(void)
 {
 	return gpu_fence;
 }
@@ -3444,8 +3493,8 @@ gpu_times(void)
  * How long the 3D core has worked since this was last asked, on how many submissions, and how
  * many of those took it under 0.1, 0.25, 0.5, 1, 2, 4 milliseconds and longer.
  */
-void
-hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+static void
+redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 {
 	gpu_times();
 	*microseconds = gpu_ticks * 10 / 192;
@@ -3461,8 +3510,8 @@ hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
  * Linux's a6xx_submit puts them in the ring. Returns the submission's number; 0: the ring is
  * full and the core is not reading it.
  */
-uint32_t
-hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+static uint32_t
+redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	uint32_t wanted = 26 + 4 * count, room = 0;
 
@@ -3506,8 +3555,8 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 }
 
 /* A submission does not come back: what the 3D core and its SMMU context say. */
-void
-hakios_gpu_report(const char *why)
+static void
+redwood_gpu_report(const char *why)
 {
 	uint32_t context = smmu_context(&core_space);
 
@@ -3550,8 +3599,8 @@ static struct block tsens = { "tsens1", 0x0c265000, 0x200 };
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
 
-void
-hakios_adreno_minute(void)
+static void
+redwood_adreno_minute(void)
 {
 	int32_t tenths[2];
 
@@ -3572,6 +3621,130 @@ hakios_adreno_minute(void)
 	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz\n", tenths[0] / 10,
 	    tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
 	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000);
+}
+
+const struct hakios_gpu_backend_ops hakios_gpu_redwood_backend_ops = {
+	.ready = redwood_gpu_ready,
+	.parameter = hakios_gpu_profile_parameter,
+	.quiesce = redwood_adreno_quiesce,
+	.minute = redwood_adreno_minute,
+	.map = redwood_gpu_map,
+	.mapped = redwood_gpu_mapped,
+	.unmap = redwood_gpu_unmap,
+	.to_memory = redwood_gpu_to_memory,
+	.submit = redwood_gpu_submit,
+	.done = redwood_gpu_done,
+	.last = redwood_gpu_last,
+	.worked = redwood_gpu_worked,
+	.report = redwood_gpu_report,
+	.stop = redwood_gpu_stop,
+};
+
+void
+hakios_adreno_quiesce(void)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->quiesce != NULL) {
+		gpu_backend_ops->quiesce();
+	}
+}
+
+void
+hakios_adreno_minute(void)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->minute != NULL) {
+		gpu_backend_ops->minute();
+	}
+}
+
+bool
+hakios_gpu_ready(void)
+{
+	return gpu_backend_ops != NULL && gpu_backend_ops->ready != NULL && gpu_backend_ops->ready();
+}
+
+bool
+hakios_gpu_parameter(uint32_t which, uint64_t *value)
+{
+	return gpu_backend_ops != NULL && gpu_backend_ops->parameter != NULL &&
+	    gpu_backend_ops->parameter(which, value);
+}
+
+bool
+hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+{
+	return gpu_backend_ops != NULL && gpu_backend_ops->map != NULL &&
+	    gpu_backend_ops->map(address, phys, read_only);
+}
+
+void
+hakios_gpu_mapped(void)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->mapped != NULL) {
+		gpu_backend_ops->mapped();
+	}
+}
+
+void
+hakios_gpu_unmap(uint64_t address, uint64_t size)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->unmap != NULL) {
+		gpu_backend_ops->unmap(address, size);
+	}
+}
+
+void
+hakios_gpu_to_memory(void *start, uint64_t size)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->to_memory != NULL) {
+		gpu_backend_ops->to_memory(start, size);
+	}
+}
+
+uint32_t
+hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	return gpu_backend_ops != NULL && gpu_backend_ops->submit != NULL ?
+	    gpu_backend_ops->submit(addresses, words, count) : 0;
+}
+
+bool
+hakios_gpu_done(uint32_t fence)
+{
+	return gpu_backend_ops != NULL && gpu_backend_ops->done != NULL && gpu_backend_ops->done(fence);
+}
+
+uint32_t
+hakios_gpu_last(void)
+{
+	return gpu_backend_ops != NULL && gpu_backend_ops->last != NULL ? gpu_backend_ops->last() : 0;
+}
+
+void
+hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->worked != NULL) {
+		gpu_backend_ops->worked(microseconds, submissions, by);
+	} else {
+		*microseconds = 0;
+		*submissions = 0;
+		bzero(by, 7 * sizeof(by[0]));
+	}
+}
+
+void
+hakios_gpu_report(const char *why)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->report != NULL) {
+		gpu_backend_ops->report(why);
+	}
+}
+
+void
+hakios_gpu_stop(void)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->stop != NULL) {
+		gpu_backend_ops->stop();
+	}
 }
 
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */
@@ -3769,10 +3942,13 @@ hakios_adreno_init(void)
 	vm_offset_t soc_base = pe_arm_get_soc_base_phys();
 
 	if (soc_base == HAKIOS_SDM845_SOC_BASE) {
+		gpu_profile = &polaris_gpu_profile;
+		hakios_gpu_backend_select(&hakios_gpu_sdm845_backend_ops);
 		hakios_adreno_sdm845_init();
 		return;
 	}
 	if (soc_base != HAKIOS_SOC_BASE) {
+		hakios_gpu_backend_select(NULL);
 		if ((PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) ||
 		    (PE_parse_boot_argn("adreno", &only, sizeof(only)) && only)) {
 			printf("adreno: no backend for SoC peripheral base %#llx; GPU registers are left untouched\n",
@@ -3780,6 +3956,8 @@ hakios_adreno_init(void)
 		}
 		return;
 	}
+	gpu_profile = &redwood_gpu_profile;
+	hakios_gpu_backend_select(&hakios_gpu_redwood_backend_ops);
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}

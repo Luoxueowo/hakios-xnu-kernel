@@ -60,15 +60,39 @@ Do not assume that copying the Redwood `mdt` plus `b02` path is sufficient. Conf
 and version compatibility from the image header and A630-specific upstream/vendor loader before
 starting the CP.
 
+## MSM capability profile
+
+The shared service's `GET_PARAM` answers are being changed from Redwood constants to a selected
+GPU profile. For Polaris, the profile values now recorded in `hakios.adreno.c` are:
+
+| MSM parameter | Polaris value | Evidence |
+|---|---:|---|
+| `GPU_ID` | `630` | Linux A6xx catalog `.revn = 630` |
+| `CHIP_ID` | `0x06030001` | Polaris DT `qcom,chipid` |
+| `GMEM_BASE` | `0x00100000` | Linux MSM Adreno code returns `0x100000` for A6xx families before gen3 |
+| `GMEM_SIZE` | `1 MiB` | Linux A6xx catalog A630 profile |
+| `MAX_FREQ` | `710 MHz` | Polaris DT `qcom,gpu-pwrlevel@0/qcom,gpu-freq` |
+| `HIGHEST_BANK_BIT` | `15` | Polaris DT and SDM845 UBWC profile |
+| `UBWC_SWIZZLE` | `6` | SDM845 UBWC 2.0 profile (levels 2 and 3) |
+| `MACROTILE_MODE` | `0` | SDM845 UBWC profile leaves this field unset |
+
+References: Linux [`a6xx_catalog.c`](https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/master/drivers/gpu/drm/msm/adreno/a6xx_catalog.c),
+[`adreno_gpu.c`](https://android.googlesource.com/kernel/common/+/e21ee273e6fa3879aec9a27251cfce98156e07c4/drivers/gpu/drm/msm/adreno/adreno_gpu.c),
+and Qualcomm's [`ubwc_config.c`](https://android.googlesource.com/kernel/common/+/1b237f190eb3d36f52dffe07a40b5eb210280e00/drivers/soc/qcom/ubwc_config.c).
+The profile only describes the hardware to the existing MSM client; it does not make the A630
+backend ready or expose GPU rendering.
+
 ## Implementation shape
 
-Keep the existing MSM/HakiosGPU client contract where it is genuinely hardware independent, but
-split platform bring-up into explicit backends selected by the SoC profile. The current Redwood
-backend must keep its existing fail-closed selection. The Polaris backend owns the SDM845/A630
-register map, clock and power sequence, RPMh/GMU setup, PAS firmware loading, SMMUv2 configuration,
-and A630 core capabilities. Shared code may own image access, page-table allocation where formats
-match, ring submission primitives, fences, and the IOKit service; each shared operation needs an
-explicit compatibility reason rather than a shared `#define` assumption.
+Keep the existing MSM/HakiosGPU client contract where it is genuinely hardware independent.
+`hakios.gpu_backend.h` now defines the operations boundary, and `hakios.adreno.c` dispatches the
+shared service and lifecycle hooks through the selected backend. Redwood keeps its existing
+implementation behind that boundary. Polaris selects its own profile and an intentionally
+not-ready operations table; unimplemented map, submit, fence, stop and thermal hooks therefore
+cannot fall through into Redwood's SMMUv500 or register state. The A630 implementation must fill
+those operations with SDM845/A630 register, clock, power, RPMh/GMU, PAS firmware, SMMUv2 and core
+logic. Shared code may own page-table allocation where formats match, ring primitives and the
+IOKit service only after each shared operation has an explicit compatibility reason.
 
 The backend boundary must carry at least: SoC/GPU identity, firmware file set, MMIO resources,
 GMEM and frequency capabilities, SMMU implementation and stream/context assignments, startup and
