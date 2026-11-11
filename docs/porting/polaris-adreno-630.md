@@ -521,16 +521,17 @@ shared service and lifecycle hooks through the selected backend. Redwood keeps i
 implementation behind that boundary. Polaris selects its own profile and a not-ready operations
 table. Its software map, commit, unmap and cache-maintenance callbacks are implemented; GMU
 firmware/HFI startup and initial ARC/DCVS requests are staged, while complete CX/GX sequencing,
-active GMU-user/3D SMMU context attachment, command submission, fences, stop and thermal hooks are
-still missing. The permanent `ready()` gate prevents calls from reaching the
+active GMU-user/3D SMMU context attachment, live command submission/fence operations, complete stop
+and thermal hooks are still missing. The permanent `ready()` gate prevents calls from reaching the
 unfinished path. No callback falls through into Redwood's SMMUv500 or register state.
 
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
-software-only, locked 32-bit IOVA allocator: the lower 1 GiB is reserved for backend-owned
-firmware/ring mappings, while client allocations use `[0x40000000, 0x100000000)`. It records each
-allocation and accepts only exact frees. The new 4K LPAE stage-1 tables can describe those IOVAs,
-but no context bank or stream is programmed, so the SMMU does not consume them and rendering
-remains disabled.
+software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use the private range
+`[0x00010000, 0x40000000)`; the shared service receives client allocations only from
+`[0x40000000, 0x100000000)`. Both allocators round to 64-KiB extents and accept exact frees. This
+address partition does not isolate command streams: the 3D SID0 context still uses one page table
+for backend and client mappings. The new 4K LPAE stage-1 tables can describe both ranges, but no
+context bank or stream is programmed until a guarded bring-up step, and rendering remains disabled.
 
 The table descriptor format follows the existing project mapper and the ARM LPAE definitions in
 upstream Linux [`io-pgtable-arm.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c).

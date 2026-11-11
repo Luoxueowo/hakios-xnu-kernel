@@ -402,11 +402,10 @@ static const struct polaris_a630_protected_reg polaris_a630_protected_regs[A630_
 	{ 0x8d0, 0x23, 0 }, { 0x980, 0x4, 0 }, { 0xa630, 0x0, 1 },
 };
 
-/*
- * A630 advertises a 32-bit GPU VA aperture. Reserve its lower GiB for backend-owned
- * firmware/ring mappings and hand the remaining 3 GiB to the shared buffer service.
- * These are software IOVAs; no SMMU translation is installed until the backend is ready.
- */
+/* A630 uses a 32-bit GPU VA aperture split between private backend buffers and client BOs. */
+#define POLARIS_GPU_PRIVATE_VA_START     0x00010000ull
+#define POLARIS_GPU_PRIVATE_VA_END       0x40000000ull
+#define POLARIS_GPU_PRIVATE_VA_MAX_ALLOCS 16u
 #define POLARIS_GPU_VA_START             0x40000000ull
 #define POLARIS_GPU_VA_END               0x100000000ull
 #define POLARIS_GPU_VA_ALIGN             0x10000ull
@@ -443,8 +442,11 @@ static LCK_GRP_DECLARE(polaris_smmu_lck_grp, "polaris-smmu-pt");
 static LCK_MTX_DECLARE(polaris_smmu_pt_lock, &polaris_smmu_lck_grp);
 static struct gpu_va_range polaris_gpu_va_free[POLARIS_GPU_VA_MAX_RANGES];
 static struct gpu_va_range polaris_gpu_va_allocated[POLARIS_GPU_VA_MAX_ALLOCS];
+static struct gpu_va_range polaris_gpu_private_va_allocated[POLARIS_GPU_PRIVATE_VA_MAX_ALLOCS];
 static uint32_t polaris_gpu_va_free_count;
 static uint32_t polaris_gpu_va_allocated_count;
+static uint32_t polaris_gpu_private_va_allocated_count;
+static uint64_t polaris_gpu_private_va_next = POLARIS_GPU_PRIVATE_VA_START;
 static bool polaris_gpu_va_initialized;
 
 struct polaris_smmu_table {
@@ -856,6 +858,65 @@ sdm845_gpu_address_free(uint64_t address, uint64_t size)
 	polaris_gpu_va_allocated_count--;
 	memmove(&polaris_gpu_va_allocated[allocation], &polaris_gpu_va_allocated[allocation + 1],
 	    (polaris_gpu_va_allocated_count - allocation) * sizeof(polaris_gpu_va_allocated[0]));
+out:
+	lck_mtx_unlock(&polaris_gpu_va_lock);
+}
+
+/* Backend-only firmware/ring IOVAs live below the client aperture and are freed in reverse order. */
+static uint64_t
+polaris_gpu_private_address_allocate(uint64_t size)
+{
+	uint64_t rounded, address = 0;
+
+	if (!polaris_gpu_va_round(size, &rounded)) {
+		return 0;
+	}
+	lck_mtx_lock(&polaris_gpu_va_lock);
+	if (!polaris_gpu_va_initialized ||
+	    polaris_gpu_private_va_allocated_count >= POLARIS_GPU_PRIVATE_VA_MAX_ALLOCS ||
+	    polaris_gpu_private_va_next < POLARIS_GPU_PRIVATE_VA_START ||
+	    polaris_gpu_private_va_next > POLARIS_GPU_PRIVATE_VA_END ||
+	    rounded > POLARIS_GPU_PRIVATE_VA_END - polaris_gpu_private_va_next) {
+		goto out;
+	}
+	address = polaris_gpu_private_va_next;
+	polaris_gpu_private_va_allocated[polaris_gpu_private_va_allocated_count].start = address;
+	polaris_gpu_private_va_allocated[polaris_gpu_private_va_allocated_count].size = rounded;
+	polaris_gpu_private_va_allocated_count++;
+	polaris_gpu_private_va_next += rounded;
+out:
+	lck_mtx_unlock(&polaris_gpu_va_lock);
+	return address;
+}
+
+static void
+polaris_gpu_private_address_free(uint64_t address, uint64_t size)
+{
+	uint64_t rounded;
+	uint32_t allocation;
+
+	if (!polaris_gpu_va_round(size, &rounded) || (address & (POLARIS_GPU_VA_ALIGN - 1)) != 0 ||
+	    address < POLARIS_GPU_PRIVATE_VA_START || address >= POLARIS_GPU_PRIVATE_VA_END ||
+	    rounded > POLARIS_GPU_PRIVATE_VA_END - address) {
+		return;
+	}
+	lck_mtx_lock(&polaris_gpu_va_lock);
+	allocation = polaris_gpu_private_va_allocated_count;
+	for (uint32_t i = 0; i < polaris_gpu_private_va_allocated_count; i++) {
+		if (polaris_gpu_private_va_allocated[i].start == address &&
+		    polaris_gpu_private_va_allocated[i].size == rounded) {
+			allocation = i;
+			break;
+		}
+	}
+	if (allocation == polaris_gpu_private_va_allocated_count) {
+		goto out;
+	}
+	polaris_gpu_private_va_allocated[allocation].size = 0;
+	while (polaris_gpu_private_va_allocated_count != 0 &&
+	    polaris_gpu_private_va_allocated[polaris_gpu_private_va_allocated_count - 1].size == 0) {
+		polaris_gpu_private_va_next = polaris_gpu_private_va_allocated[--polaris_gpu_private_va_allocated_count].start;
+	}
 out:
 	lck_mtx_unlock(&polaris_gpu_va_lock);
 }
@@ -2312,7 +2373,7 @@ polaris_gpu_dma_buffer_release(struct polaris_gpu_dma_buffer *buffer)
 	if (buffer->gpu_address != 0 && buffer->allocation_size != 0) {
 		polaris_smmu_space_unmap(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], buffer->gpu_address,
 		    buffer->allocation_size);
-		sdm845_gpu_address_free(buffer->gpu_address, buffer->allocation_size);
+		polaris_gpu_private_address_free(buffer->gpu_address, buffer->allocation_size);
 	}
 	if (buffer->virtual != 0 && buffer->allocation_size != 0) {
 		kmem_free(kernel_map, buffer->virtual, buffer->allocation_size);
@@ -2356,10 +2417,10 @@ polaris_gpu_dma_buffer_allocate(struct polaris_gpu_dma_buffer *buffer, uint64_t 
 			return false;
 		}
 	}
-	gpu_address = sdm845_gpu_address(allocation_size);
+	gpu_address = polaris_gpu_private_address_allocate(allocation_size);
 	if (gpu_address == 0 || (gpu_address & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0) {
 		if (gpu_address != 0) {
-			sdm845_gpu_address_free(gpu_address, allocation_size);
+			polaris_gpu_private_address_free(gpu_address, allocation_size);
 		}
 		kmem_free(kernel_map, allocation, allocation_size);
 		printf("adreno-sdm845: step 16 could not reserve a 64-KiB-aligned A630 GPU virtual range\n");
