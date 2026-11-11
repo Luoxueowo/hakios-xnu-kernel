@@ -219,7 +219,7 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define SMMU_CB_TLBSTATUS               0x07f4u
 #define SMMU_SCTLR_M                    (1u << 0)
 
-/* A6xx GMU offsets are in 32-bit words in the register XML. */
+/* A6xx GMU register XML uses global word offsets; the Polaris GMU window begins at word 0x1a800. */
 #define GMU_WORD(n)                     (4u * (n))
 #define GMU_ALWAYS_ON_COUNTER_L         GMU_WORD(0x5088)
 #define GMU_ALWAYS_ON_COUNTER_H         GMU_WORD(0x5089)
@@ -243,6 +243,15 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define GMU_GMU2HOST_INTR_CLR            GMU_WORD(0x5191)
 #define GMU_GMU2HOST_INTR_INFO           GMU_WORD(0x5192)
 #define GMU_HOST2GMU_INTR_SET            GMU_WORD(0x5194)
+#define GMU_REGISTER_WINDOW_BASE_WORD     0x1a800u
+#define GMU_REGISTER_GLOBAL_WORD(n)      GMU_WORD((n) - GMU_REGISTER_WINDOW_BASE_WORD)
+#define GMU_BOOT_SLUMBER_OPTION          GMU_REGISTER_GLOBAL_WORD(0x1cbf8u)
+#define GMU_GX_VOTE_IDX                  GMU_REGISTER_GLOBAL_WORD(0x1cbf9u)
+#define GMU_MX_VOTE_IDX                  GMU_REGISTER_GLOBAL_WORD(0x1cbfau)
+#define GMU_DCVS_ACK_OPTION              GMU_REGISTER_GLOBAL_WORD(0x1cbfcu)
+#define GMU_DCVS_PERF_SETTING            GMU_REGISTER_GLOBAL_WORD(0x1cbfdu)
+#define GMU_DCVS_BW_SETTING              GMU_REGISTER_GLOBAL_WORD(0x1cbfeu)
+#define GMU_DCVS_RETURN                  GMU_REGISTER_GLOBAL_WORD(0x1cbffu)
 #define GMU_AHB_FENCE_RANGE_0            GMU_WORD(0x9311)
 #define A630_GMU_FW_MAX_BYTES           0x8000u
 #define A630_GMU_FW_READY                0xbabefaceu
@@ -252,6 +261,12 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define A630_GMU_HFI_QUEUE_START_POLLS   10000u
 #define A630_GMU_HFI_ACK_POLLS           10000u
 #define A630_GMU_HFI_POLL_DELAY_US       100u
+#define A630_GMU_OOB_BOOT_SET_MASK       (1u << 22)
+#define A630_GMU_OOB_BOOT_ACK_MASK       (1u << 30)
+#define A630_GMU_OOB_DCVS_SET_MASK       (1u << 23)
+#define A630_GMU_OOB_DCVS_ACK_MASK       (1u << 31)
+#define A630_GMU_DCVS_ACK_NONBLOCK       0u
+#define A630_GMU_DCVS_CLKSET_AT_LEAST    3u
 #define A630_GMU_HFI_DUMP_BYTES          0x4000u
 #define A630_GMU_LOG_BYTES               0x1000u
 #define A630_GMU_DUMP_VA                 0x60100000u
@@ -482,6 +497,7 @@ static uint32_t polaris_rpmh_total_tcs;
 static const uint8_t *polaris_cmd_db;
 static struct polaris_gpu_operating_point polaris_gpu_pwrlevels[POLARIS_MAX_GPU_PWRLEVELS];
 static uint32_t polaris_gpu_pwrlevel_count;
+static uint32_t polaris_gpu_initial_pwrlevel;
 static struct polaris_msm_bus_vector polaris_gpu_bus_levels[POLARIS_MAX_GPU_BUS_LEVELS];
 static uint32_t polaris_gpu_bus_level_count;
 static struct polaris_msm_bus_vector polaris_gmu_cnoc_levels[POLARIS_EXPECTED_GMU_BUS_LEVELS];
@@ -498,6 +514,8 @@ static bool polaris_gmu_firmware_loaded;
 static bool polaris_gmu_firmware_started;
 static bool polaris_gmu_hfi_ready;
 static bool polaris_gmu_hfi_sealed;
+static bool polaris_gmu_hfi_perf_table_ready;
+static bool polaris_gmu_hfi_bw_table_ready;
 static bool polaris_gmu_domain_ready;
 static bool polaris_gpu_core_ready;
 static bool polaris_smmu_backend_enabled;
@@ -813,16 +831,18 @@ polaris_dt_clocks_match(DTEntry node, const char *name, const struct polaris_dt_
 static bool
 polaris_runtime_pwrlevels_validate(void)
 {
-	DTEntry gpu_table = NULL, gmu_table = NULL;
+	DTEntry gpu_node = NULL, gpu_table = NULL, gmu_table = NULL;
 	char path[160];
-	uint32_t gpu_count = 0, gmu_count = 0, previous_gpu_frequency = UINT32_MAX;
+	uint32_t gpu_count = 0, gmu_count = 0, initial_gpu_pwrlevel, previous_gpu_frequency = UINT32_MAX;
 	bool gpu_idle_seen = false, gmu_nonzero_seen = false;
 
-	if (SecureDTLookupEntry(NULL, POLARIS_GPU_PWRLEVELS_DT_PATH, &gpu_table) != kSuccess || gpu_table == NULL ||
+	if (SecureDTLookupEntry(NULL, POLARIS_GPU_DT_PATH, &gpu_node) != kSuccess || gpu_node == NULL ||
+	    !polaris_dt_get_u32(gpu_node, "qcom,initial-pwrlevel", &initial_gpu_pwrlevel) ||
+	    SecureDTLookupEntry(NULL, POLARIS_GPU_PWRLEVELS_DT_PATH, &gpu_table) != kSuccess || gpu_table == NULL ||
 	    !polaris_dt_has_compatible(gpu_table, "qcom,gpu-pwrlevels") ||
 	    SecureDTLookupEntry(NULL, POLARIS_GMU_PWRLEVELS_DT_PATH, &gmu_table) != kSuccess || gmu_table == NULL ||
 	    !polaris_dt_has_compatible(gmu_table, "qcom,gmu-pwrlevels")) {
-		printf("adreno-sdm845: runtime GPU/GMU operating-point tables are missing or have unexpected compatibles\n");
+		printf("adreno-sdm845: runtime GPU default powerlevel or GPU/GMU operating-point tables are missing or invalid\n");
 		return false;
 	}
 
@@ -864,6 +884,11 @@ polaris_runtime_pwrlevels_validate(void)
 		printf("adreno-sdm845: Polaris GPU operating-point table lacks a bounded descending range and terminal idle entry\n");
 		return false;
 	}
+	if (initial_gpu_pwrlevel >= gpu_count - 1u) {
+		printf("adreno-sdm845: Polaris initial GPU powerlevel %u is outside the %u non-idle operating points\n",
+		    initial_gpu_pwrlevel, gpu_count - 1u);
+		return false;
+	}
 	for (uint32_t i = gpu_count; i < POLARIS_MAX_GPU_PWRLEVELS; i++) {
 		DTEntry level = NULL;
 
@@ -874,6 +899,7 @@ polaris_runtime_pwrlevels_validate(void)
 		}
 	}
 	polaris_gpu_pwrlevel_count = gpu_count;
+	polaris_gpu_initial_pwrlevel = initial_gpu_pwrlevel;
 
 	for (uint32_t i = 0; i < POLARIS_MAX_GMU_PWRLEVELS; i++) {
 		DTEntry level = NULL;
@@ -2973,6 +2999,73 @@ polaris_cmd_db_arc_vote(const struct polaris_cmd_db_resource *primary,
 	return true;
 }
 
+/* KGSL's OOB clear writes the GMU interrupt-set register with its acknowledgement mask. */
+static void
+polaris_gmu_oob_clear(uint32_t mask)
+{
+	if (gmu.virtual != 0 && mask != 0) {
+		probe_write(&gmu, GMU_HOST2GMU_INTR_SET, mask);
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+}
+
+/* Send KGSL's A630 boot/slumber OOB request with the DT-selected initial GX/MX ARC vote. */
+static bool
+polaris_gmu_boot_rail_request(void)
+{
+	struct polaris_cmd_db_resource gfx_level, mx_level;
+	const struct polaris_gpu_operating_point *initial;
+	uint32_t vote, gx_index, mx_index;
+	uint16_t corner;
+	bool acknowledged = false;
+
+	if (!polaris_gmu_firmware_started || polaris_gpu_pwrlevel_count < 2u ||
+	    polaris_gpu_initial_pwrlevel >= polaris_gpu_pwrlevel_count - 1u || gmu.virtual == 0) {
+		printf("adreno-sdm845: step 12 cannot request the GMU boot rail without a running GMU and validated initial GPU powerlevel\n");
+		return false;
+	}
+	initial = &polaris_gpu_pwrlevels[polaris_gpu_initial_pwrlevel];
+	if (initial->frequency_hz == 0 ||
+	    !polaris_gpu_voltage_corner(initial->frequency_hz, &corner) ||
+	    !polaris_cmd_db_resource_lookup("gfx.lvl", &gfx_level) ||
+	    !polaris_cmd_db_resource_lookup("mx.lvl", &mx_level) ||
+	    !polaris_cmd_db_arc_vote(&gfx_level, &mx_level, corner, &vote)) {
+		printf("adreno-sdm845: step 12 could not map initial GPU powerlevel %u (%u Hz) to validated GX/MX ARC indices\n",
+		    polaris_gpu_initial_pwrlevel, initial->frequency_hz);
+		return false;
+	}
+	gx_index = vote & 0xffu;
+	mx_index = (vote >> 8) & 0xffu;
+	printf("adreno-sdm845: step 12 requests initial GX/MX ARC vote for GPU powerlevel %u (%u Hz; GX=%u MX=%u)\n",
+	    polaris_gpu_initial_pwrlevel, initial->frequency_hz, gx_index, mx_index);
+	probe_write(&gmu, GMU_BOOT_SLUMBER_OPTION, 0u); /* OOB_BOOT_OPTION */
+	probe_write(&gmu, GMU_GX_VOTE_IDX, gx_index);
+	probe_write(&gmu, GMU_MX_VOTE_IDX, mx_index);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&gmu, GMU_BOOT_SLUMBER_OPTION) != 0u ||
+	    probe_read(&gmu, GMU_GX_VOTE_IDX) != gx_index || probe_read(&gmu, GMU_MX_VOTE_IDX) != mx_index) {
+		printf("adreno-sdm845: step 12 GMU boot rail register readback failed; no OOB request was sent\n");
+		return false;
+	}
+	probe_write(&gmu, GMU_HOST2GMU_INTR_SET, A630_GMU_OOB_BOOT_SET_MASK);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t poll = 0; poll < A630_GMU_HFI_QUEUE_START_POLLS; poll++) {
+		if ((probe_read(&gmu, GMU_GMU2HOST_INTR_INFO) & A630_GMU_OOB_BOOT_ACK_MASK) != 0) {
+			acknowledged = true;
+			break;
+		}
+		delay(A630_GMU_HFI_POLL_DELAY_US);
+	}
+	probe_write(&gmu, GMU_GMU2HOST_INTR_CLR, A630_GMU_OOB_BOOT_ACK_MASK);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!acknowledged) {
+		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
+		printf("adreno-sdm845: step 12 timed out waiting for the A630 boot/slumber OOB acknowledgement\n");
+		return false;
+	}
+	return true;
+}
+
 static bool
 polaris_gmu_hfi_perf_table_build(uint16_t sequence, uint32_t message[POLARIS_A630_HFI_PERF_TABLE_DWORDS])
 {
@@ -3863,6 +3956,7 @@ polaris_gmu_hfi_send_perf_table(void)
 		printf("adreno-sdm845: step 13 PERF_TBL ACK is too short (%u dwords)\n", response_dwords);
 		return false;
 	}
+	polaris_gmu_hfi_perf_table_ready = true;
 	return true;
 }
 
@@ -3883,6 +3977,7 @@ polaris_gmu_hfi_send_bw_vote_table(void)
 		printf("adreno-sdm845: step 14 BW_VOTE_TBL ACK is too short (%u dwords)\n", response_dwords);
 		return false;
 	}
+	polaris_gmu_hfi_bw_table_ready = true;
 	return true;
 }
 
@@ -3892,10 +3987,11 @@ polaris_gmu_hfi_send_test(void)
 	uint32_t message[2], response_dwords = 0;
 	uint32_t sequence = polaris_a630_hfi_next_sequence(&polaris_hfi_state);
 
-	if (sequence == 0 || !polaris_a630_hfi_make_test((uint16_t)sequence, message) ||
+	if (!polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready || sequence == 0 ||
+	    !polaris_a630_hfi_make_test((uint16_t)sequence, message) ||
 	    !polaris_gmu_hfi_send_command(message, sizeof(message) / sizeof(message[0]), NULL, 0,
 	    &response_dwords)) {
-		printf("adreno-sdm845: step 14 A630 legacy HFI_TEST was not acknowledged\n");
+		printf("adreno-sdm845: step 14 requires acknowledged A630 performance/bandwidth tables before HFI_TEST\n");
 		return false;
 	}
 	if (response_dwords < 3u) {
@@ -3906,12 +4002,74 @@ polaris_gmu_hfi_send_test(void)
 	return true;
 }
 
+/* A630 HFI_USE_REG targets take their initial GPU/BW level through GMU DCVS registers. */
+static bool
+polaris_gmu_hfi_set_initial_dcvs(void)
+{
+	const struct polaris_gpu_operating_point *initial;
+	uint32_t perf_index, bw_index, frequency_vote, bandwidth_vote, dcvs_result = UINT32_MAX;
+	bool acknowledged = false;
+
+	if (!polaris_gmu_hfi_ready || !polaris_gmu_hfi_sealed || !polaris_gmu_hfi_perf_table_ready ||
+	    !polaris_gmu_hfi_bw_table_ready || polaris_gpu_pwrlevel_count < 2u ||
+	    polaris_gpu_initial_pwrlevel >= polaris_gpu_pwrlevel_count - 1u ||
+	    gmu.virtual == 0) {
+		printf("adreno-sdm845: step 14 requires acknowledged A630 PERF_TBL, BW_VOTE_TBL, and HFI_TEST before DCVS\n");
+		return false;
+	}
+	initial = &polaris_gpu_pwrlevels[polaris_gpu_initial_pwrlevel];
+	perf_index = polaris_gpu_pwrlevel_count - polaris_gpu_initial_pwrlevel - 1u;
+	bw_index = initial->bus_frequency;
+	if (perf_index >= POLARIS_A630_HFI_MAX_GPU_LEVELS || bw_index >= polaris_gpu_bus_level_count ||
+	    bw_index > 0xffu) {
+		printf("adreno-sdm845: step 14 initial GPU/bus index is outside the acknowledged A630 HFI tables\n");
+		return false;
+	}
+	frequency_vote = (perf_index & 0xffu) | (A630_GMU_DCVS_CLKSET_AT_LEAST << 28);
+	/* Polaris follows the A630 4.9 HFI_USE_REG layout: BW index occupies bits 0..7. */
+	bandwidth_vote = bw_index;
+	probe_write(&gmu, GMU_DCVS_ACK_OPTION, A630_GMU_DCVS_ACK_NONBLOCK);
+	probe_write(&gmu, GMU_DCVS_PERF_SETTING, frequency_vote);
+	probe_write(&gmu, GMU_DCVS_BW_SETTING, bandwidth_vote);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&gmu, GMU_DCVS_ACK_OPTION) != A630_GMU_DCVS_ACK_NONBLOCK ||
+	    probe_read(&gmu, GMU_DCVS_PERF_SETTING) != frequency_vote ||
+	    probe_read(&gmu, GMU_DCVS_BW_SETTING) != bandwidth_vote) {
+		printf("adreno-sdm845: step 14 GMU DCVS register readback failed; no DCVS OOB was sent\n");
+		return false;
+	}
+	probe_write(&gmu, GMU_HOST2GMU_INTR_SET, A630_GMU_OOB_DCVS_SET_MASK);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t poll = 0; poll < A630_GMU_HFI_ACK_POLLS; poll++) {
+		if ((probe_read(&gmu, GMU_GMU2HOST_INTR_INFO) & A630_GMU_OOB_DCVS_ACK_MASK) != 0) {
+			acknowledged = true;
+			break;
+		}
+		delay(A630_GMU_HFI_POLL_DELAY_US);
+	}
+	probe_write(&gmu, GMU_GMU2HOST_INTR_CLR, A630_GMU_OOB_DCVS_ACK_MASK);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (acknowledged) {
+		dcvs_result = probe_read(&gmu, GMU_DCVS_RETURN);
+	}
+	polaris_gmu_oob_clear(A630_GMU_OOB_DCVS_ACK_MASK);
+	if (!acknowledged || dcvs_result != 0u) {
+		printf("adreno-sdm845: step 14 initial GMU DCVS failed (ack=%u result=%#x; pwrlevel=%u perf=%u bus=%u)\n",
+		    (unsigned)acknowledged, dcvs_result, polaris_gpu_initial_pwrlevel, perf_index, bw_index);
+		return false;
+	}
+	printf("adreno-sdm845: step 14 initial GPU DCVS accepted (DT powerlevel=%u, HFI perf=%u, bus=%u)\n",
+	    polaris_gpu_initial_pwrlevel, perf_index, bw_index);
+	return true;
+}
+
 static void
 polaris_gmu_hfi_stop_after_failure(uint32_t step)
 {
 	uint32_t reset = UINT32_MAX;
 
 	if (gmu.virtual != 0) {
+		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK | A630_GMU_OOB_DCVS_ACK_MASK);
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
 		reset = probe_read(&gmu, GMU_CM3_SYSRESET);
@@ -3919,6 +4077,8 @@ polaris_gmu_hfi_stop_after_failure(uint32_t step)
 	polaris_gmu_firmware_started = false;
 	polaris_gmu_hfi_ready = false;
 	polaris_gmu_hfi_sealed = false;
+	polaris_gmu_hfi_perf_table_ready = false;
+	polaris_gmu_hfi_bw_table_ready = false;
 	polaris_hfi_state.initialized = false;
 	polaris_smmu_backend_faulted = true;
 	printf("adreno-sdm845: step %u failure cleanup requested CM3 reset (readback=%#x); GMU-kernel SID5 remains attached and backend stays faulted\n",
@@ -3963,8 +4123,10 @@ polaris_gmu_hfi_start(void)
 		return false;
 	}
 	log_info = A630_GMU_LOG_VA | (A630_GMU_LOG_BYTES / POLARIS_SMMU_TABLE_BYTES - 1u);
-	printf("adreno-sdm845: step 12: configure TCM boot, HFI table, dump/log memory, and A630 SFR ID; then start CM3 and poll HFI_INIT\n");
+	printf("adreno-sdm845: step 12: configure TCM/HFI memory and A630 SFR ID; start CM3, request the DT-default GX/MX rail vote, then initialize HFI\n");
 
+	polaris_gmu_hfi_perf_table_ready = false;
+	polaris_gmu_hfi_bw_table_ready = false;
 	/* Qualcomm's TCM boot setup: all shared-memory addresses are in GMU-kernel SID5. */
 	probe_write(&gmu, GMU_GENERAL_7, 1u); /* retain GMU TCM */
 	probe_write(&gmu, GMU_CM3_FW_INIT_RESULT, 0u);
@@ -4010,6 +4172,14 @@ polaris_gmu_hfi_start(void)
 		return false;
 	}
 	polaris_gmu_firmware_started = true;
+	if (!polaris_gmu_boot_rail_request()) {
+		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
+		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		polaris_gmu_firmware_started = false;
+		polaris_smmu_backend_faulted = true;
+		return false;
+	}
 	probe_write(&gmu, GMU_HFI_CTRL_INIT, 1u);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	for (uint32_t poll = 0; poll < A630_GMU_HFI_QUEUE_START_POLLS; poll++) {
@@ -4019,6 +4189,7 @@ polaris_gmu_hfi_start(void)
 		delay(A630_GMU_HFI_POLL_DELAY_US);
 	}
 	if ((probe_read(&gmu, GMU_HFI_CTRL_STATUS) & 1u) == 0) {
+		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
 		polaris_gmu_firmware_started = false;
@@ -4029,6 +4200,7 @@ polaris_gmu_hfi_start(void)
 	hfi_version = probe_read(&gmu, GMU_HFI_VERSION_INFO);
 	if (((hfi_version >> 28) & 0xfu) != 1u || !polaris_gmu_hfi_send_init() ||
 	    !polaris_gmu_hfi_verify_firmware_version(&firmware_version)) {
+		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
 		polaris_gmu_firmware_started = false;
@@ -4040,7 +4212,7 @@ polaris_gmu_hfi_start(void)
 		return false;
 	}
 	polaris_gmu_hfi_ready = true;
-	printf("adreno-sdm845: step 12 GMU firmware and legacy HFI are ready (HFI=%#x GMU=%#x); GPU-user SID4, 3D SID0, ZAP, votes, CP, and rendering remain disabled\n",
+	printf("adreno-sdm845: step 12 GMU firmware and legacy HFI are ready (HFI=%#x GMU=%#x); initial GX/MX rail vote was acknowledged, while GPU-user SID4, 3D SID0, ZAP, CP, and rendering remain disabled\n",
 	    hfi_version, firmware_version);
 	return true;
 }
@@ -4514,7 +4686,7 @@ hakios_adreno_sdm845_init(void)
 			printf("adreno-sdm845: step 12 GMU/HFI startup did not complete; the A630 backend remains disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 12 finished; only the GMU-kernel SID5 route is active, and GPU rendering remains disabled\n");
+		printf("adreno-sdm845: step 12 finished; GMU-kernel SID5 and the initial GX/MX rail vote are active, and GPU rendering remains disabled\n");
 		return;
 	}
 	if (last_step == 13) {
@@ -4527,25 +4699,25 @@ hakios_adreno_sdm845_init(void)
 			printf("adreno-sdm845: step 13 failed; BW table, GX core, CP, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL is acknowledged, while BW_VOTE_TBL, GPU-user/3D routes, ZAP authentication, CP, and rendering remain disabled; A630 uses legacy HFI, not the A640-only HFI START command\n");
+		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL and the initial GX/MX rail vote are acknowledged, while BW_VOTE_TBL, default DCVS, GPU-user/3D routes, ZAP authentication, CP, and rendering remain disabled; A630 uses legacy HFI, not the A640-only HFI START command\n");
 		return;
 	}
 	if (last_step == 14) {
-		printf("adreno-sdm845: step 14 boots GMU/HFI, sends A630 PERF_TBL and BW_VOTE_TBL, then HFI_TEST closes this boot's HFI message phase; GPU rendering stays disabled\n");
+		printf("adreno-sdm845: step 14 boots GMU/HFI, sends A630 PERF_TBL and BW_VOTE_TBL, closes the HFI message phase with HFI_TEST, then requests the DT-default GPU/bus DCVS level through OOB registers; rendering stays disabled\n");
 		if (!polaris_gmu_hfi_start_stage(14u)) {
 			return;
 		}
 		if (!polaris_gmu_hfi_send_perf_table() || !polaris_gmu_hfi_send_bw_vote_table() ||
-		    !polaris_gmu_hfi_send_test()) {
+		    !polaris_gmu_hfi_send_test() || !polaris_gmu_hfi_set_initial_dcvs()) {
 			polaris_gmu_hfi_stop_after_failure(14u);
-			printf("adreno-sdm845: step 14 failed; legacy HFI setup did not complete, GPU-user/3D routes, GX core, CP, and rendering remain disabled\n");
+			printf("adreno-sdm845: step 14 failed; legacy HFI/default DCVS setup did not complete; GPU-user/3D routes, ZAP authentication, CP submission, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 14 finished; PERF_TBL, BW_VOTE_TBL, and HFI_TEST are acknowledged; the GMU will accept no further HFI messages until reboot, and GPU-user/3D routes, ZAP authentication, GX core, CP, and rendering remain disabled\n");
+		printf("adreno-sdm845: step 14 finished; PERF_TBL, BW_VOTE_TBL, HFI_TEST, and default DCVS are acknowledged; the boot rail request remains active for the later GPU-start sequence, and GPU-user/3D routes, ZAP authentication, CP submission, and rendering remain disabled\n");
 		return;
 	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches only GMU SID5, step 12 boots GMU/HFI, step 13 sends PERF_TBL, and step 14 sends PERF_TBL/BW_VOTE_TBL plus HFI_TEST; "
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches only GMU SID5, step 12 boots GMU/HFI with the initial rail vote, step 13 sends PERF_TBL, and step 14 sends both HFI tables, HFI_TEST, and initial DCVS; "
 		    "requested step %u is capped at %zu in the sequential probe path\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);
