@@ -195,6 +195,9 @@ allocation is page-rounded to 20 KiB and its GMU virtual address belongs to the 
 range beginning at `0x60000000`. `adreno=3` checks and reports this protocol layout. The HFI
 helpers manage the wire format only; step 9 supplies the detached software mapping, while context
 attachment, register programming, cache-policy setup, interrupts, and HFI startup remain pending.
+The queue-table header still reports four active slots with dispatch disabled in its queue header,
+matching Qualcomm's A630 `hfi_init` (`num_active_q = HFI_QUEUE_MAX`); HakiOS preserves that v1
+contract ([`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_hfi.c)).
 
 Qualcomm's matching A630 KGSL implementation gives the GMU separate `gmu_user` and `gmu_kernel`
 SMMU contexts and allocates HFI memory through the GMU-kernel context. Polaris preflight currently

@@ -168,6 +168,7 @@ polaris_a630_hfi_init(struct polaris_a630_hfi_state *state, volatile void *memor
 	table->header.first_queue_offset_dwords = sizeof(table->header) / sizeof(uint32_t);
 	table->header.queue_header_size_dwords = sizeof(table->queue[0]) / sizeof(uint32_t);
 	table->header.queue_count = POLARIS_A630_HFI_QUEUE_COUNT;
+	/* A630 KGSL uses four active slots even when the dispatch slot status is disabled. */
 	table->header.active_queue_count = POLARIS_A630_HFI_QUEUE_COUNT;
 	for (uint32_t i = 0; i < POLARIS_A630_HFI_QUEUE_COUNT; i++) {
 		volatile struct polaris_a630_hfi_queue_header *queue = &table->queue[i];
