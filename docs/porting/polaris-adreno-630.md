@@ -248,6 +248,16 @@ allow it. A successful firmware boot alone is not a completed driver.
   `adreno_set_unsecured_mode()` call after `a6xx_send_cp_init()` in [`adreno.c`](https://android.googlesource.com/kernel/msm/%2B/604f9dc59bcb86b3967048ebe36c48aff59b2592/drivers/gpu/msm/adreno.c) and the `CP_SET_SECURE_MODE` packet helper in [`adreno_ringbuffer.c`](https://android.googlesource.com/kernel/msm/%2B/3a9ea3d5335330e66dc313253c055442c9db7b8e/drivers/gpu/msm/adreno_ringbuffer.c).
   It still does not enable fences, user submissions or rendering. This write stage has not been run
   on the phone; `ready()` remains false.
+- `adreno=21` repeats the guarded setup through unsecured CP mode, then submits one kernel-owned
+  `CP_MEM_WRITE` to IOVA `RPTR + 64`, followed by `CP_WAIT_MEM_WRITES`. The destination is a
+  dedicated writable cache line in the existing SID0 scratch page, separate from the CP RPTR word;
+  the command ring remains GPU read-only. It waits for RPTR/WPTR 19, CP/AHB idle and clear CP error
+  status, invalidates the CPU cache line and checks the fence magic value. This exercises a bounded
+  GPU write and fence readback without opening the ring to clients. It follows the A630 PM4 packet
+  definitions and KGSL fence-write ordering in [`adreno_pm4types.h`](https://android.googlesource.com/kernel/msm/%2B/f5996ba85abd9d67bdb9506421177a9625ce29c4/drivers/gpu/msm/adreno_pm4types.h) and
+  [`adreno_ringbuffer.c`](https://android.googlesource.com/kernel/msm/%2B/037b70a47d04f86b930d349f38a8dcfd7fd07944/drivers/gpu/msm/adreno_ringbuffer.c).
+  `ready()` remains false and user submissions are disabled. This write stage has not been run on
+  the phone.
 
 ## Polaris hardware facts
 
@@ -566,14 +576,15 @@ bring-up and a bounded test submission.
    validated from runtime DT; an explicit read-only step 8 inspects the TCS and CX/GFX ARC tables.
    The A630 GMU/HFI bootstrap, temporary startup DDR TCS vote, `PERF_TBL`, `BW_VOTE_TBL`, initial
    boot-rail OOB, and default DCVS stages are implemented behind explicit `adreno=12`/`adreno=13`/
-   `adreno=14`, but none has been run on hardware. Steps 17–20 now add the A630 GMU GPU OOB
-   request, GX/GFX3D verification, core HWCG/VBIF/UCHE defaults, CP register protection, and a
-   bounded SQE/`CP_ME_INIT` startup, PAS ZAP authentication before SQE release, and the
-   `CP_SET_SECURE_MODE(0)` transition with idle/error readbacks; none of these write stages has
-   been run. Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior, GX sequencing,
-   core readbacks, CP idle/error status and PAS cleanup against Polaris before proceeding. Keep
-   step 7 limited to PAS staging and shutdown. Next implement production ring/fence management and
-   recoverable power-down before accepting submissions.
+   `adreno=14`, but none has been run on hardware. Steps 17–21 now add the A630 GMU GPU OOB
+   request, GX/GFX3D verification, core HWCG/VBIF/UCHE defaults, CP register protection, bounded
+   SQE/`CP_ME_INIT` startup, PAS ZAP authentication before SQE release, the
+   `CP_SET_SECURE_MODE(0)` transition, and a kernel-owned CP memory-write fence smoke test. None
+   of these write stages has been run. Verify the Apps RSC transaction, sustained bandwidth/DCVS
+   behavior, GX sequencing, core readbacks, CP idle/error status, fence visibility and PAS cleanup
+   against Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. Next
+   implement production ring/fence management and recoverable power-down before accepting
+   submissions.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -587,8 +598,9 @@ bring-up and a bounded test submission.
    any SMMU write stage has
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
-   verify steps 19–20's bounded SQE/CP bootstrap, ZAP authentication and secure-mode transition,
-   production register protection, ring/fence mappings and mapper behavior. Qualcomm's
+   verify steps 19–21's bounded SQE/CP bootstrap, ZAP authentication, secure-mode transition and
+   kernel fence write, then validate production register protection, ring/fence mappings and mapper
+   behavior. Qualcomm's
    A630 KGSL path sets the SQE base and authenticates ZAP through PIL before releasing SQE halt,
    submits `CP_ME_INIT`, then uses `CP_SET_SECURE_MODE(0)` to leave secure mode
    ([`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c),
