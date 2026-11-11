@@ -1,13 +1,14 @@
 /*
- * Read-only bring-up probes for the Adreno 630 of the Xiaomi MIX 2S (Polaris, SDM845).
+ * Bring-up and firmware loading for the Adreno 630 of the Xiaomi MIX 2S (Polaris, SDM845).
  * This is deliberately a separate backend from the Redwood/SC7280 Adreno 642L driver: the
  * GPUCC and KGSL SMMU are different blocks, and the latter is SMMUv2 rather than SMMUv500.
  *
- * Only adreno=1..6 runs diagnostics. Steps 1..5 only read registers or staged files; step 6 only
- * queries TrustZone call availability/PAS support and never hands it an image. The backend also
- * has dormant SMMUv2 translation operations, but they cannot attach a context or start rendering;
- * `ready()` remains false until the A630 firmware, power sequence, live SMMU route, command
- * processor and shared HakiosGPU path are implemented and exercised.
+ * adreno=1..6 performs read-only probes. Explicit adreno=7 exercises PAS metadata setup, segment
+ * staging, and shutdown after runtime DT, firmware, capability, and powered CX/GX preconditions
+ * match. It does not authenticate/start ZAP until the secure GPU SMMU route is verified. The
+ * backend's dormant SMMUv2 operations cannot attach a context or start rendering; `ready()` stays
+ * false until the A630 GMU, power sequence, live SMMU route, command processor, and shared
+ * HakiosGPU path are implemented and exercised.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
  *   qcom,gpucc@5090000 (qcom,gpucc-sdm845-v2)
@@ -33,6 +34,7 @@
 #include "hakios.gpu_backend.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
@@ -51,7 +53,14 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_GMU_DT_PATH             "/soc/qcom,gmu"
 #define POLARIS_GPUCC_DT_PATH           "/soc/qcom,gpucc@5090000"
 #define POLARIS_SMMU_DT_PATH            "/soc/arm,smmu-kgsl@5040000"
+#define POLARIS_PIL_GPU_DT_PATH         "/soc/qcom,kgsl-hyp"
+#define POLARIS_GPU_MEMORY_DT_PATH      "/reserved-memory/gpu_region@0x8c415000"
 #define POLARIS_GPU_CHIP_ID             0x06030001u
+#define A630_MDT_MAX_SEGMENTS           16u
+#define A630_MDT_MAX_BYTES              0x10000u
+#define A630_MDT_HASH(flags)            ((((flags) >> 24) & 7u) == 2u)
+#define A630_MDT_RELOCATABLE            (1u << 27)
+#define POLARIS_PAS_GPU                 13u
 
 /*
  * SDM845 GCC GPU clock branches share the GPU register window's prerequisites:
@@ -198,6 +207,35 @@ static uint32_t polaris_smmu_core_context;
 static uint32_t polaris_smmu_core_asid;
 static uint32_t polaris_smmu_stream_ids[POLARIS_SMMU_MAX_STREAM_IDS];
 static uint32_t polaris_smmu_stream_count;
+struct polaris_zap_segment {
+	uint32_t paddr;
+	uint32_t file_size;
+	uint32_t memory_size;
+	uint32_t flags;
+	const uint8_t *data;
+};
+static struct polaris_zap_segment polaris_zap_segments[A630_MDT_MAX_SEGMENTS];
+static uint32_t polaris_zap_segment_count;
+static const uint8_t *polaris_zap_mdt;
+static const uint8_t *polaris_zap_hash;
+static uint64_t polaris_zap_mdt_size;
+static uint32_t polaris_zap_header_size;
+static uint32_t polaris_zap_hash_size;
+static uint32_t polaris_zap_min_address;
+static uint32_t polaris_zap_memory_setup_size;
+static uint64_t polaris_zap_memory_phys;
+static uint64_t polaris_zap_memory_size;
+static vm_offset_t polaris_zap_memory_virtual;
+static vm_offset_t polaris_pas_metadata_virtual;
+static vm_size_t polaris_pas_metadata_allocation;
+static uint64_t polaris_pas_metadata_physical;
+static bool polaris_zap_manifest_valid;
+static bool polaris_pas_calls_ready;
+static bool polaris_pas_gpu_supported;
+static bool polaris_pas_image_active;
+static uint64_t polaris_pas_scm_width;
+static bool polaris_gmu_domain_ready;
+static bool polaris_gpu_core_ready;
 static bool polaris_smmu_core_context_active;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
@@ -343,6 +381,7 @@ static bool sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only);
 static void sdm845_gpu_mapped(void);
 static void sdm845_gpu_unmap(uint64_t address, uint64_t size);
 static void sdm845_gpu_to_memory(void *start, uint64_t size);
+static void sdm845_gpu_stop(void);
 
 static bool
 sdm845_gpu_ready(void)
@@ -359,6 +398,7 @@ const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
 	.mapped = sdm845_gpu_mapped,
 	.unmap = sdm845_gpu_unmap,
 	.to_memory = sdm845_gpu_to_memory,
+	.stop = sdm845_gpu_stop,
 	/* SMMU translations are software-only until a verified context and stream are attached. */
 };
 
@@ -438,6 +478,39 @@ polaris_dt_get_u32(DTEntry node, const char *name, uint32_t *value)
 	}
 	*value = polaris_dt_be32(property);
 	return true;
+}
+
+static bool
+polaris_dt_string_equals(DTEntry node, const char *name, const char *expected)
+{
+	const uint8_t *property;
+	unsigned int size = 0;
+	size_t expected_size = strlen(expected) + 1;
+
+	return SecureDTGetProperty(node, name, (const void **)&property, &size) == kSuccess && property != NULL &&
+	    size == expected_size && memcmp(property, expected, expected_size) == 0;
+}
+
+static bool
+polaris_dt_has_reg64(DTEntry node, uint64_t address, uint64_t length)
+{
+	const uint8_t *reg;
+	unsigned int size = 0;
+
+	/* The Polaris reserved-memory parent uses two address cells and two size cells. */
+	if (SecureDTGetProperty(node, "reg", (const void **)&reg, &size) != kSuccess || reg == NULL || size == 0 ||
+	    (size & 15u) != 0) {
+		return false;
+	}
+	for (unsigned int offset = 0; offset < size; offset += 16) {
+		uint64_t start = (uint64_t)polaris_dt_be32(reg + offset) << 32 | polaris_dt_be32(reg + offset + 4);
+		uint64_t bytes = (uint64_t)polaris_dt_be32(reg + offset + 8) << 32 | polaris_dt_be32(reg + offset + 12);
+
+		if (start == address && bytes == length) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static bool
@@ -531,6 +604,39 @@ polaris_runtime_iommu_validate(DTEntry smmu_node, uint32_t smmu_phandle)
 		printf(" %u", polaris_smmu_stream_ids[i]);
 	}
 	printf("; gfx3d_user GPU offset=%#x; three-level SMMU tables required\n", gpu_offset);
+	return true;
+}
+
+static bool
+polaris_runtime_pas_validate(void)
+{
+	DTEntry pil_node = NULL, memory_node = NULL;
+	uint32_t pas_id, region_phandle, memory_phandle;
+	const uint8_t *memory_region;
+	unsigned int memory_region_size = 0;
+	uint64_t memory_phys = 0x8c415000ull, memory_size = 0x2000ull;
+
+	if (SecureDTLookupEntry(NULL, POLARIS_PIL_GPU_DT_PATH, &pil_node) != kSuccess || pil_node == NULL ||
+	    !polaris_dt_has_compatible(pil_node, "qcom,pil-tz-generic") ||
+	    !polaris_dt_get_u32(pil_node, "qcom,pas-id", &pas_id) || pas_id != POLARIS_PAS_GPU ||
+	    !polaris_dt_string_equals(pil_node, "qcom,firmware-name", "a630_zap") ||
+	    SecureDTGetProperty(pil_node, "memory-region", (const void **)&memory_region, &memory_region_size) != kSuccess ||
+	    memory_region == NULL || memory_region_size != 4) {
+		printf("adreno-sdm845: runtime DT has no valid A630 PAS 13 firmware/memory-region description\n");
+		return false;
+	}
+	region_phandle = polaris_dt_be32(memory_region);
+	if (SecureDTLookupEntry(NULL, POLARIS_GPU_MEMORY_DT_PATH, &memory_node) != kSuccess || memory_node == NULL ||
+	    !polaris_dt_get_u32(memory_node, "phandle", &memory_phandle) || memory_phandle != region_phandle ||
+	    !polaris_dt_has_empty_property(memory_node, "no-map") ||
+	    !polaris_dt_has_reg64(memory_node, memory_phys, memory_size)) {
+		printf("adreno-sdm845: runtime GPU PAS memory-region does not resolve to the expected no-map 8-KiB range\n");
+		return false;
+	}
+	polaris_zap_memory_phys = memory_phys;
+	polaris_zap_memory_size = memory_size;
+	printf("adreno-sdm845: runtime DT PAS %u firmware a630_zap maps reserved GPU memory %#llx/%#llx bytes\n",
+	    pas_id, memory_phys, memory_size);
 	return true;
 }
 
@@ -1080,6 +1186,7 @@ probe_gmu(void)
 	uint32_t high1 = 0, high2 = 0, low = 0, init_result, hfi_version;
 	bool counter_stable = false;
 
+	polaris_gmu_domain_ready = false;
 	if (!probe_gpucc_bus("step 3") || !map_block(&gpucc)) {
 		return false;
 	}
@@ -1094,6 +1201,7 @@ probe_gmu(void)
 		    clock);
 		return true;
 	}
+	polaris_gmu_domain_ready = true;
 	if (!map_block(&gmu)) {
 		return false;
 	}
@@ -1125,6 +1233,7 @@ probe_core(void)
 	uint32_t gx, clock;
 	uint32_t status, interrupts, fault;
 
+	polaris_gpu_core_ready = false;
 	if (!probe_gpucc_bus("step 4") || !map_block(&gpucc)) {
 		return false;
 	}
@@ -1139,6 +1248,7 @@ probe_core(void)
 		    clock);
 		return true;
 	}
+	polaris_gpu_core_ready = true;
 	if (!map_block(&gpu)) {
 		return false;
 	}
@@ -1151,9 +1261,6 @@ probe_core(void)
 	return true;
 }
 
-#define A630_MDT_MAX_SEGMENTS 16u
-#define A630_MDT_HASH(flags)  ((((flags) >> 24) & 7u) == 2u)
-
 #define POLARIS_SCM_FAST              (1ull << 31)
 #define POLARIS_SCM_64                (1ull << 30)
 #define POLARIS_SCM_SIP               (2ull << 24)
@@ -1165,8 +1272,9 @@ probe_core(void)
 #define POLARIS_SCM_PAS_SHUTDOWN      POLARIS_SCM_CALL(2, 6)
 #define POLARIS_SCM_PAS_IS_SUPPORTED  POLARIS_SCM_CALL(2, 7)
 #define POLARIS_SCM_ONE_VALUE         1u
+#define POLARIS_SCM_VALUE_AND_BUFFER  (2u | 2u << 6)
+#define POLARIS_SCM_THREE_VALUES      3u
 #define POLARIS_SCM_INTERRUPTED       1u
-#define POLARIS_PAS_GPU               13u
 
 static uint16_t
 read_le16(const uint8_t *data)
@@ -1183,39 +1291,59 @@ read_le32(const uint8_t *data)
 static bool
 probe_zap_mdt(const uint8_t *header, uint64_t size)
 {
-	uint32_t phoff, hashes = 0, loadable = 0, hash_segments = 0;
+	uint32_t phoff, hash_index = UINT32_MAX, loadable = 0, header_size;
+	uint32_t min_address = UINT32_MAX;
 	uint16_t phentsize, phnum;
-	uint64_t table_end;
+	uint64_t table_end, hash_size = 0, max_address = 0;
+	bool relocatable = false;
+	const uint8_t *hash_data;
+	char name[32];
+	uint64_t file_size = 0;
 
-	if (size < 52 || size > PAGE_SIZE || memcmp(header, "\177ELF\1\1\1", 7) != 0 ||
-	    read_le16(header + 18) != 164) {
+	polaris_zap_manifest_valid = false;
+	polaris_zap_segment_count = 0;
+	polaris_zap_mdt = NULL;
+	polaris_zap_hash = NULL;
+	polaris_zap_mdt_size = 0;
+	polaris_zap_header_size = 0;
+	polaris_zap_hash_size = 0;
+	polaris_zap_memory_setup_size = 0;
+	if (header == NULL || size < 52 || size > A630_MDT_MAX_BYTES ||
+	    memcmp(header, "\177ELF\1\1\1", 7) != 0 || read_le16(header + 16) != 2 ||
+	    read_le16(header + 18) != 164 || read_le16(header + 40) != 52) {
 		printf("adreno-sdm845: ZAP MDT is not a bounded little-endian Qualcomm DSP ELF header (%llu bytes)\n", size);
 		return false;
 	}
 	phoff = read_le32(header + 28);
 	phentsize = read_le16(header + 42);
 	phnum = read_le16(header + 44);
-	if (phoff < 52 || phentsize != 32 || phnum < 2 || phnum > A630_MDT_MAX_SEGMENTS ||
+	if (phoff != 52 || phentsize != 32 || phnum < 2 || phnum > A630_MDT_MAX_SEGMENTS ||
 	    (uint64_t)phoff + (uint64_t)phentsize * phnum > size) {
 		printf("adreno-sdm845: ZAP MDT has invalid program-header bounds (offset=%#x entry=%u count=%u size=%llu)\n",
 		    phoff, phentsize, phnum, size);
 		return false;
 	}
 	table_end = (uint64_t)phoff + (uint64_t)phentsize * phnum;
+	header_size = read_le32(header + phoff + 16);
+	if (read_le32(header + phoff) == 1 || header_size < table_end || header_size > size) {
+		printf("adreno-sdm845: ZAP MDT first program header does not describe its complete ELF header\n");
+		return false;
+	}
 	for (uint32_t i = 0; i < phnum; i++) {
 		const uint8_t *ph = header + phoff + (uint64_t)i * phentsize;
 		uint32_t type = read_le32(ph);
+		uint32_t address = read_le32(ph + 12);
 		uint32_t file_size = read_le32(ph + 16);
 		uint32_t memory_size = read_le32(ph + 20);
 		uint32_t flags = read_le32(ph + 24);
 
 		if (A630_MDT_HASH(flags)) {
-			if (hashes != 0 || file_size == 0) {
+			if (type == 1 || hash_index != UINT32_MAX || file_size == 0) {
 				printf("adreno-sdm845: ZAP MDT has duplicate or empty hash metadata\n");
 				return false;
 			}
-			hashes = file_size;
-			hash_segments++;
+			hash_index = i;
+			hash_size = file_size;
 			continue;
 		}
 		if (type != 1 || memory_size == 0) {
@@ -1225,30 +1353,94 @@ probe_zap_mdt(const uint8_t *header, uint64_t size)
 			printf("adreno-sdm845: ZAP loadable segment %u has filesz %#x > memsz %#x\n", i, file_size, memory_size);
 			return false;
 		}
+		if ((uint64_t)address + memory_size > UINT32_MAX + 1ull ||
+		    polaris_zap_segment_count == A630_MDT_MAX_SEGMENTS) {
+			printf("adreno-sdm845: ZAP loadable segment %u has an invalid physical range\n", i);
+			return false;
+		}
+		if (address < min_address) {
+			min_address = address;
+		}
+		uint64_t segment_end = (uint64_t)address + memory_size;
+		uint64_t aligned_end = (segment_end + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+		if (aligned_end < segment_end) {
+			printf("adreno-sdm845: ZAP loadable segment %u page-alignment overflows\n", i);
+			return false;
+		}
+		if (aligned_end > max_address) {
+			max_address = aligned_end;
+		}
+		if (flags & A630_MDT_RELOCATABLE) {
+			relocatable = true;
+		}
+		const uint8_t *segment = NULL;
 		if (file_size != 0) {
-			char name[32];
-			uint64_t segment_size = 0;
-			const uint8_t *segment;
-
 			snprintf(name, sizeof(name), "a630_zap.b%02u", i);
-			segment = hakios_image_file("fw", name, &segment_size, NULL);
-			if (segment == NULL || segment_size != file_size) {
+			segment = hakios_image_file("fw", name, &file_size, NULL);
+			if (segment == NULL || file_size != read_le32(ph + 16)) {
 				printf("adreno-sdm845: ZAP segment %u expects fw/%s (%#x bytes), found %llu\n",
-				    i, name, file_size, segment_size);
+				    i, name, read_le32(ph + 16), file_size);
 				return false;
 			}
 			printf("adreno-sdm845: ZAP loadable segment %u: fw/%s, %u bytes at %#x, memory %#x\n",
-			    i, name, file_size, read_le32(ph + 12), memory_size);
+			    i, name, read_le32(ph + 16), address, memory_size);
 		}
+		struct polaris_zap_segment *loaded = &polaris_zap_segments[polaris_zap_segment_count++];
+		loaded->paddr = address;
+		loaded->file_size = read_le32(ph + 16);
+		loaded->memory_size = memory_size;
+		loaded->flags = flags;
+		loaded->data = segment;
 		loadable++;
 	}
-	if (hash_segments != 1 || loadable == 0 || table_end + hashes != size) {
-		printf("adreno-sdm845: ZAP MDT hash/header size mismatch (table=%llu hash=%u file=%llu, hashes=%u, loadable=%u)\n",
-		    table_end, hashes, size, hash_segments, loadable);
+	if (hash_index == UINT32_MAX || loadable == 0 || hash_size > A630_MDT_MAX_BYTES ||
+	    (uint64_t)header_size + hash_size > A630_MDT_MAX_BYTES ||
+	    (size != header_size && size != (uint64_t)header_size + hash_size) ||
+	    min_address == UINT32_MAX || max_address <= min_address || !relocatable ||
+	    max_address - min_address > polaris_zap_memory_size || max_address - min_address > UINT32_MAX) {
+		printf("adreno-sdm845: ZAP MDT header/hash/load map does not fit the validated PAS memory-region\n");
 		return false;
 	}
-	printf("adreno-sdm845: ZAP MDT: %u program headers, %u loadable segment(s), %u signed-hash bytes\n",
-	    phnum, loadable, hashes);
+	snprintf(name, sizeof(name), "a630_zap.b%02u", hash_index);
+	hash_data = hakios_image_file("fw", name, &file_size, NULL);
+	if (hash_data == NULL || file_size != hash_size ||
+	    (size == (uint64_t)header_size + hash_size && memcmp(header + header_size, hash_data, hash_size) != 0)) {
+		printf("adreno-sdm845: ZAP signed metadata expects fw/%s (%llu bytes); staged copy is missing, truncated or differs\n",
+		    name, hash_size);
+		return false;
+	}
+	uint32_t entry = read_le32(header + 24);
+	bool entry_found = false;
+	for (uint32_t i = 0; i < polaris_zap_segment_count; i++) {
+		const struct polaris_zap_segment *segment = &polaris_zap_segments[i];
+		uint64_t end = (uint64_t)segment->paddr + segment->memory_size;
+		if (entry >= segment->paddr && (uint64_t)entry < end) {
+			entry_found = true;
+		}
+		for (uint32_t j = i + 1; j < polaris_zap_segment_count; j++) {
+			const struct polaris_zap_segment *other = &polaris_zap_segments[j];
+			uint64_t other_end = (uint64_t)other->paddr + other->memory_size;
+			if ((uint64_t)segment->paddr < other_end && (uint64_t)other->paddr < end) {
+				printf("adreno-sdm845: ZAP loadable segments %u and %u overlap\n", i, j);
+				return false;
+			}
+		}
+	}
+	if (!entry_found) {
+		printf("adreno-sdm845: ZAP ELF entry point %#x is outside its loadable segments\n", entry);
+		return false;
+	}
+	polaris_zap_mdt = header;
+	polaris_zap_hash = hash_data;
+	polaris_zap_mdt_size = size;
+	polaris_zap_header_size = header_size;
+	polaris_zap_hash_size = (uint32_t)hash_size;
+	polaris_zap_min_address = min_address;
+	polaris_zap_memory_setup_size = (uint32_t)(max_address - min_address);
+	polaris_zap_manifest_valid = true;
+	printf("adreno-sdm845: ZAP MDT: %u program headers, %u PT_LOAD segment(s), metadata=%u+%u bytes, "
+	    "PAS memory=%#llx/%#x bytes at relocatable base %#x\n", phnum, loadable, header_size,
+	    (uint32_t)hash_size, polaris_zap_memory_phys, polaris_zap_memory_setup_size, min_address);
 	return true;
 }
 
@@ -1260,7 +1452,11 @@ probe_firmware(void)
 	uint32_t sqe_word0;
 	bool sqe_safe = false, valid = true;
 
-	printf("adreno-sdm845: step 5: inspect staged A630 firmware (no hardware writes)\n");
+	polaris_sqe_safe = false;
+	printf("adreno-sdm845: step 5: inspect staged A630 firmware and validate the runtime PAS memory region\n");
+	if (!polaris_runtime_pas_validate()) {
+		return false;
+	}
 	gmu_firmware = hakios_image_file("fw", "a630_gmu.bin", &gmu_size, NULL);
 	sqe_firmware = hakios_image_file("fw", "a630_sqe.fw", &sqe_size, NULL);
 	zap_header = hakios_image_file("fw", "a630_zap.mdt", &zap_size, NULL);
@@ -1363,6 +1559,9 @@ probe_pas_capabilities(void)
 	int32_t status;
 	uint64_t answer = 0;
 
+	polaris_pas_calls_ready = false;
+	polaris_pas_gpu_supported = false;
+	polaris_pas_scm_width = 0;
 	printf("adreno-sdm845: step 6: query TrustZone PAS capabilities (no image handoff or GPU writes)\n");
 	if (!polaris_scm_call_available(convention, POLARIS_SCM_IS_CALL_AVAILABLE, "IS_CALL_AVAILABLE",
 	    &query_available)) {
@@ -1370,6 +1569,7 @@ probe_pas_capabilities(void)
 	}
 	if (!query_available) {
 		convention = POLARIS_SCM_FAST | POLARIS_SCM_SIP;
+		polaris_pas_scm_width = 0;
 		if (!polaris_scm_call_available(convention, POLARIS_SCM_IS_CALL_AVAILABLE, "IS_CALL_AVAILABLE (32-bit)",
 		    &query_available)) {
 			return false;
@@ -1379,22 +1579,188 @@ probe_pas_capabilities(void)
 		printf("adreno-sdm845: this TrustZone does not expose the Linux SCM availability query\n");
 		return true;
 	}
+	if (convention & POLARIS_SCM_64) {
+		polaris_pas_scm_width = POLARIS_SCM_64;
+	}
 	for (uint32_t i = 0; i < sizeof(pas_calls) / sizeof(pas_calls[0]); i++) {
 		if (!polaris_scm_call_available(convention, pas_calls[i].function, pas_calls[i].name, &calls[i])) {
 			return false;
 		}
 	}
+	polaris_pas_calls_ready = calls[0] && calls[1] && calls[2] && calls[3];
 	if (calls[4]) {
 		if (!polaris_scm_call(convention | POLARIS_SCM_PAS_IS_SUPPORTED, POLARIS_SCM_ONE_VALUE,
 		    POLARIS_PAS_GPU, 0, 0, &status, &answer)) {
 			printf("adreno-sdm845: PAS_IS_SUPPORTED for image 13 stayed interrupted\n");
 			return false;
 		}
+		polaris_pas_gpu_supported = status == 0 && answer != 0;
 		printf("adreno-sdm845: TrustZone PAS image 13 (GPU ZAP): status=%d supported=%s (answer=%#llx)\n",
 		    status, status == 0 && answer != 0 ? "yes" : "no", answer);
 	}
-	printf("adreno-sdm845: capability queries only; no PAS_INIT_IMAGE, PAS_MEM_SETUP or PAS_AUTH_AND_RESET was issued\n");
+	printf("adreno-sdm845: capability queries only; no PAS_INIT_IMAGE, PAS_MEM_SETUP or PAS_AUTH_AND_RESET was issued; "
+	    "loader calls=%s\n", polaris_pas_calls_ready ? "available" : "incomplete");
 	return true;
+}
+
+static bool
+polaris_pas_command(const char *name, uint64_t command, uint64_t arguments, uint64_t first, uint64_t second,
+	uint64_t third)
+{
+	int32_t status = 0;
+	uint64_t answer = ~0ull;
+	uint64_t function = POLARIS_SCM_SIP | polaris_pas_scm_width | command;
+
+	if (!polaris_scm_call(function, arguments, first, second, third, &status, &answer)) {
+		printf("adreno-sdm845: TrustZone PAS %s remained interrupted\n", name);
+		return false;
+	}
+	printf("adreno-sdm845: TrustZone PAS %s returned status=%d answer=%#llx\n", name, status, answer);
+	return status == 0 && answer == 0;
+}
+
+static void
+polaris_pas_metadata_free(void)
+{
+	if (polaris_pas_metadata_virtual != 0 && polaris_pas_metadata_allocation != 0) {
+		kmem_free(kernel_map, polaris_pas_metadata_virtual, polaris_pas_metadata_allocation);
+	}
+	polaris_pas_metadata_virtual = 0;
+	polaris_pas_metadata_allocation = 0;
+	polaris_pas_metadata_physical = 0;
+}
+
+static bool
+polaris_pas_shutdown(void)
+{
+	if (!polaris_pas_command("PAS_SHUTDOWN", POLARIS_SCM_PAS_SHUTDOWN, POLARIS_SCM_ONE_VALUE,
+	    POLARIS_PAS_GPU, 0, 0)) {
+		return false;
+	}
+	polaris_pas_image_active = false;
+	polaris_pas_metadata_free();
+	return true;
+}
+
+static bool
+stage_zap_shader(void)
+{
+	uint64_t metadata_size = (uint64_t)polaris_zap_header_size + polaris_zap_hash_size;
+	vm_size_t metadata_allocation;
+	vm_offset_t metadata = 0;
+	uint64_t metadata_phys;
+	volatile uint8_t *memory;
+
+	printf("adreno-sdm845: step 7: stage A630 ZAP metadata/segment through PAS, then shut it down (explicit PAS writes)\n");
+	if (!polaris_zap_manifest_valid || !polaris_pas_calls_ready || !polaris_pas_gpu_supported ||
+	    polaris_zap_memory_phys == 0 || polaris_zap_memory_size == 0 || polaris_zap_memory_setup_size == 0) {
+		printf("adreno-sdm845: step 7 refused: firmware manifest, PAS 13 support/calls, or reserved memory is not verified\n");
+		return false;
+	}
+	if (!polaris_gmu_domain_ready || !polaris_gpu_core_ready) {
+		printf("adreno-sdm845: step 7 refused: CX/GMU clock and GX/GFX3D clock must already be on; this step does not power them\n");
+		return false;
+	}
+	if (metadata_size == 0 || metadata_size > A630_MDT_MAX_BYTES ||
+	    polaris_zap_memory_setup_size > polaris_zap_memory_size) {
+		printf("adreno-sdm845: step 7 refused: PAS metadata or relocated image span exceeds validated bounds\n");
+		return false;
+	}
+	for (uint32_t i = 0; i < polaris_zap_segment_count; i++) {
+		const struct polaris_zap_segment *segment = &polaris_zap_segments[i];
+		uint64_t offset = (uint64_t)segment->paddr - polaris_zap_min_address;
+
+		if (segment->paddr < polaris_zap_min_address || offset + segment->memory_size > polaris_zap_memory_setup_size ||
+		    segment->file_size > segment->memory_size || (segment->file_size != 0 && segment->data == NULL)) {
+			printf("adreno-sdm845: step 7 refused: ZAP segment %u escaped the validated memory manifest\n", i);
+			return false;
+		}
+	}
+	if (!polaris_pas_shutdown()) {
+		printf("adreno-sdm845: step 7 refused: TrustZone did not release any previous GPU PAS image\n");
+		return false;
+	}
+	metadata_allocation = (vm_size_t)round_page(metadata_size);
+	if (metadata_allocation < metadata_size ||
+	    kmem_alloc_contig(kernel_map, &metadata, metadata_allocation, PAGE_MASK, 0, 0,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("adreno-sdm845: step 7 could not allocate physically contiguous PAS metadata (%llu bytes)\n", metadata_size);
+		return false;
+	}
+	metadata_phys = kvtophys(metadata);
+	if ((metadata_phys & PAGE_MASK) != 0) {
+		kmem_free(kernel_map, metadata, metadata_allocation);
+		printf("adreno-sdm845: step 7 PAS metadata is not 4-KiB aligned\n");
+		return false;
+	}
+	if (polaris_pas_scm_width == 0 &&
+	    (metadata_phys > UINT32_MAX || polaris_zap_memory_phys > UINT32_MAX ||
+	    polaris_zap_memory_setup_size > UINT32_MAX - polaris_zap_memory_phys + 1ull)) {
+		kmem_free(kernel_map, metadata, metadata_allocation);
+		printf("adreno-sdm845: step 7 refuses 32-bit SCM addresses that do not fit\n");
+		return false;
+	}
+	for (vm_size_t offset = PAGE_SIZE; offset < metadata_allocation; offset += PAGE_SIZE) {
+		if (kvtophys(metadata + offset) != metadata_phys + offset) {
+			kmem_free(kernel_map, metadata, metadata_allocation);
+			printf("adreno-sdm845: step 7 PAS metadata allocation is not physically contiguous\n");
+			return false;
+		}
+	}
+	memcpy((void *)metadata, polaris_zap_mdt, polaris_zap_header_size);
+	memcpy((void *)(metadata + polaris_zap_header_size), polaris_zap_hash, polaris_zap_hash_size);
+	polaris_cache_lines(metadata, metadata_allocation);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	polaris_pas_metadata_virtual = metadata;
+	polaris_pas_metadata_allocation = metadata_allocation;
+	polaris_pas_metadata_physical = metadata_phys;
+	polaris_pas_image_active = true;
+	if (!polaris_pas_command("PAS_INIT_IMAGE", POLARIS_SCM_PAS_INIT_IMAGE,
+	    POLARIS_SCM_VALUE_AND_BUFFER, POLARIS_PAS_GPU, metadata_phys, 0)) {
+		(void)polaris_pas_shutdown();
+		return false;
+	}
+	if (!polaris_pas_command("PAS_MEM_SETUP", POLARIS_SCM_PAS_MEM_SETUP,
+	    POLARIS_SCM_THREE_VALUES, POLARIS_PAS_GPU, polaris_zap_memory_phys, polaris_zap_memory_setup_size)) {
+		(void)polaris_pas_shutdown();
+		return false;
+	}
+	if (polaris_zap_memory_virtual == 0) {
+		polaris_zap_memory_virtual = ml_io_map_wcomb((vm_offset_t)polaris_zap_memory_phys,
+		    (vm_size_t)polaris_zap_memory_size);
+	}
+	if (polaris_zap_memory_virtual == 0) {
+		printf("adreno-sdm845: step 7 could not map the DT-reserved ZAP memory after PAS_MEM_SETUP\n");
+		(void)polaris_pas_shutdown();
+		return false;
+	}
+	memory = (volatile uint8_t *)polaris_zap_memory_virtual;
+	for (uint32_t offset = 0; offset < polaris_zap_memory_setup_size; offset++) {
+		memory[offset] = 0;
+	}
+	for (uint32_t i = 0; i < polaris_zap_segment_count; i++) {
+		const struct polaris_zap_segment *segment = &polaris_zap_segments[i];
+		uint32_t offset = segment->paddr - polaris_zap_min_address;
+
+		for (uint32_t byte = 0; byte < segment->memory_size; byte++) {
+			memory[offset + byte] = byte < segment->file_size ? segment->data[byte] : 0;
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!polaris_pas_shutdown()) {
+		printf("adreno-sdm845: step 7 could not release the staged PAS image; it remains active for stop-time cleanup\n");
+		return false;
+	}
+	printf("adreno-sdm845: PAS accepted and released the A630 ZAP staging area; AUTH_AND_RESET is deferred until the secure SMMU route is verified\n");
+	return true;
+}
+
+static void
+sdm845_gpu_stop(void)
+{
+	if (polaris_pas_image_active && !polaris_pas_shutdown()) {
+		printf("adreno-sdm845: GPU stop could not shut down PAS image 13; metadata remains allocated\n");
+	}
 }
 
 void
@@ -1403,7 +1769,7 @@ hakios_adreno_sdm845_init(void)
 	uint32_t last_step = 0, gpu_enabled = 0;
 	bool requested_probe;
 	static bool (*const probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core, probe_firmware,
-	    probe_pas_capabilities };
+	    probe_pas_capabilities, stage_zap_shader };
 
 	if (pe_arm_get_soc_base_phys() != SDM845_SOC_BASE) {
 		return;
@@ -1421,16 +1787,22 @@ hakios_adreno_sdm845_init(void)
 		return;
 	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: only read-only steps 1..%zu are available; requested step %u is capped\n",
-		    sizeof(probes) / sizeof(probes[0]), last_step);
+		printf("adreno-sdm845: steps 1..6 are read-only and step 7 is the explicit PAS image loader; "
+		    "requested step %u is capped at %zu\n",
+		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);
 	}
-	printf("adreno-sdm845: Polaris Adreno 630 diagnostic, steps 1..%u (no GPU register writes)\n", last_step);
+	printf("adreno-sdm845: Polaris Adreno 630 bring-up, steps 1..%u; step 7 authenticates ZAP only when explicitly requested\n",
+	    last_step);
 	for (uint32_t i = 0; i < last_step; i++) {
 		if (!probes[i]()) {
 			printf("adreno-sdm845: step %u failed; later steps are not attempted\n", i + 1);
 			return;
 		}
 	}
-	printf("adreno-sdm845: read-only diagnostic finished; no GPU acceleration was started\n");
+	if (last_step >= 7) {
+		printf("adreno-sdm845: ZAP PAS stage finished; GPU acceleration remains disabled\n");
+	} else {
+		printf("adreno-sdm845: read-only diagnostic finished; no GPU acceleration was started\n");
+	}
 }

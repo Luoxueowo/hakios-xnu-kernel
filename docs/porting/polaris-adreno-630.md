@@ -28,9 +28,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   kept allocated for the backend lifetime. The diagnostic's IDR2 read supplies the OAS and 4K
   page-table capability; mapping fails closed until both have been observed. These tables are not
   connected to a live SMMU context or stream, and the backend `ready()` gate remains false.
-- `adreno=5` checks the staged A630 firmware without writing hardware. The local set contains a
-  32 KiB GMU image and a ZAP MDT with three ELF program headers; its single loadable segment
-  matches `a630_zap.b02` at 1,968 bytes, and the embedded signed-hash area matches the MDT size.
+- `adreno=5` checks the staged A630 firmware and PAS memory description without writing hardware.
+  The local set contains a 32 KiB GMU image and a 6,684-byte ZAP MDT with three ELF program
+  headers; its single relocatable `PT_LOAD` segment matches `a630_zap.b02` at 1,968 bytes. The
+  header is 148 bytes and its 6,536-byte signed metadata segment is `a630_zap.b01`; both copies
+  match Qualcomm's split-firmware contract
+  ([`mdt_loader.c`](https://android.googlesource.com/kernel/common/+/d3d009847a119db499094aca61bd8a9935bc94ef/drivers/soc/qcom/mdt_loader.c)).
   The extracted SQE starts with version word `0`, which fails upstream Linux's A630 minimum of
   `0x190` or patched-firmware marker ([`a6xx_gpu.c`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)).
   This SQE must not be started through a user-command path; the full driver remains gated until
@@ -48,6 +51,11 @@ allow it. A successful firmware boot alone is not a completed driver.
   `0x06030001`, and the GPU, GPUCC, GMU and SMMUv2 windows recorded below. KGSL reported
   `Adreno630v2`, a 257 MHz idle clock and available frequencies through 710 MHz. These are
   stock Recovery/Linux observations; the HakiOS diagnostic has not yet run on the device.
+- The live Recovery tree's `/soc/qcom,kgsl-hyp` identifies `qcom,pil-tz-generic`, PAS ID `13`,
+  firmware name `a630_zap`, and a `memory-region` phandle that resolves to the `no-map` GPU region
+  at `0x8c415000/0x2000`. The matching Qualcomm SDM845 GPU DTS declares the same PAS ID, firmware
+  name, and memory-region relationship
+  ([`sdm845-gpu.dtsi`](https://android.googlesource.com/kernel/msm/+/refs/heads/android-msm-baiji-4.9-pie-wear-dr/arch/arm64/boot/dts/qcom/sdm845-gpu.dtsi)).
 - Before an `adreno=` probe or `gpu=1` request maps any block, the SDM845 backend now checks the
   live device tree's Polaris GPU compatible/chip ID, the exact GPU/GPUCC/GMU/SMMUv2 `reg` windows,
   SMMU phandle and 3-level-table flags, `gfx3d_user` GPU offset, and the user/secure/GMU stream
@@ -56,6 +64,12 @@ allow it. A successful firmware boot alone is not a completed driver.
 - `adreno=6` now asks TrustZone whether the SCM availability query and PAS 13 calls are exposed,
   then asks whether GPU image 13 is supported. It does not submit a firmware header or image and
   does not write GPU registers. This query has not yet run under HakiOS on the phone.
+- `adreno=7` now exercises PAS ZAP staging and cleanup: it requires the DT-resolved reserved
+  region, affirmative PAS 13 support, the required SCM calls, and already-powered CX/GMU and
+  GX/GFX3D clocks. It sends the ELF header plus `.b01` hash metadata to `PAS_INIT_IMAGE`, assigns
+  the aligned image span with `PAS_MEM_SETUP`, copies `.b02`, then shuts PAS down. It deliberately
+  defers `PAS_AUTH_AND_RESET` until the secure GPU SMMU route is verified. This write stage has not
+  been invoked on the device; `ready()` remains false.
 
 ## Polaris hardware facts
 
@@ -188,8 +202,10 @@ bring-up and a bounded test submission.
    preconditions and a verified readback.
    **Gate:** repeated read-only runs complete without a hypervisor trap or stale state.
 4. **Power, clocks and secure firmware.** The A630 raw GMU image path and size limit are now
-   source-confirmed, and the local image fits. Implement SDM845 CX/GX sequencing, clocks and
-   required RPMh votes; then validate GMU boot, MDT segments, PAS 13 authentication and ZAP load.
+   source-confirmed, and the local image fits. The signed ZAP metadata/segment loader and PAS 13
+   shutdown path are implemented behind explicit `adreno=7`, gated on live DT and already-on
+   domains. Implement SDM845 CX/GX sequencing, clocks and required RPMh votes; then exercise the
+   PAS stage, verify the secure stream/context, authenticate ZAP, and bring up GMU firmware/HFI.
    Clean up in reverse on every failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
@@ -218,8 +234,10 @@ bring-up and a bounded test submission.
 
 - The live SMMU SMR masks, stream-to-context-bank assignments, and whether the secure/GMU streams
   are accessible to this kernel under the phone's hypervisor. Runtime DT now confirms the IDs.
-- Whether the Qualcomm PAS path requires `a630_zap.b00/.b01/.elf` in addition to `.mdt/.b02`, and
-  the result of the new `adreno=6` capability query on this boot environment.
+- The `adreno=6` PAS capability result and `adreno=7` ZAP authentication result on this boot
+  environment. Qualcomm's MDT loader consumes the `.mdt` ELF header, the indexed `.b01` hash
+  metadata, and `.b02` as the sole `PT_LOAD` segment; `.b00` and the combined `.elf` are not part
+  of that loader path.
 - The local A630 SQE is below upstream's A630 safety floor; find an acceptable firmware version,
   then validate its register protection table and the MSM submission path against the 630's
   GMEM/UBWC configuration.
