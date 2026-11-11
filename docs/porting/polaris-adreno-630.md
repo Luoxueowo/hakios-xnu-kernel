@@ -34,12 +34,28 @@ allow it. A successful firmware boot alone is not a completed driver.
   The extracted SQE starts with version word `0`, which fails upstream Linux's A630 minimum of
   `0x190` or patched-firmware marker ([`a6xx_gpu.c`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)).
   This SQE must not be started through a user-command path; the full driver remains gated until
-  suitable SQE firmware is available. Linux's [`a6xx_gmu.c`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gmu.c)
-  treats raw firmware as a legacy path with a 32 KiB TCM size limit; the Polaris GMU loader mode
-  still needs confirmation.
+  suitable SQE firmware is available. Qualcomm's A6xx KGSL loader explicitly routes A630 through
+  the legacy raw-image path, writes it to GMU ITCM, and caps the image at `0x8000` bytes
+  ([`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm-modules/graphics/%2B/refs/heads/android-msm-p11-5.15-tm-wear-kr3-dr-p11/adreno_a6xx_gmu.c)).
+  The device's 32 KiB `a630_gmu.bin` matches that contract; actual HakiOS GMU startup still needs
+  a controlled device run.
 - Firmware has been extracted read-only from the Polaris Recovery vendor partition. The local
   `fw-gpu/` directory is ignored by Git; the blobs must stay out of the repository and be staged
   into the image only by the existing firmware packaging path.
+- On 2026-11-11, the connected MIX 2S was in Recovery with its vendor partition mounted
+  `ro,noload`. SHA-256 hashes for all seven A630 firmware files matched `fw-gpu/SHA256SUMS`.
+  Its live device tree reported model `Xiaomi Technologies, Inc. Polaris MP v2.1`, chip ID
+  `0x06030001`, and the GPU, GPUCC, GMU and SMMUv2 windows recorded below. KGSL reported
+  `Adreno630v2`, a 257 MHz idle clock and available frequencies through 710 MHz. These are
+  stock Recovery/Linux observations; the HakiOS diagnostic has not yet run on the device.
+- Before an `adreno=` probe or `gpu=1` request maps any block, the SDM845 backend now checks the
+  live device tree's Polaris GPU compatible/chip ID, the exact GPU/GPUCC/GMU/SMMUv2 `reg` windows,
+  SMMU phandle and 3-level-table flags, `gfx3d_user` GPU offset, and the user/secure/GMU stream
+  tuples. Missing or mismatched entries abort the request before GPU MMIO access. The SMMU probe
+  uses the validated runtime stream IDs when hardware reports indexed stream routing.
+- `adreno=6` now asks TrustZone whether the SCM availability query and PAS 13 calls are exposed,
+  then asks whether GPU image 13 is supported. It does not submit a firmware header or image and
+  does not write GPU registers. This query has not yet run under HakiOS on the phone.
 
 ## Polaris hardware facts
 
@@ -144,7 +160,8 @@ The Polaris probe uses SMMUv2 IDR2 to confirm 4K support and decode OAS using up
 [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
 The operations table includes software map, commit, unmap, cache-maintenance and bounded ASID
 invalidation callbacks; ASID invalidation is reachable only after a later bring-up stage marks a
-verified context active.
+verified context active. The runtime SMMU probe now reads its stream IDs from the validated DT
+tuples instead of relying on a duplicate hardcoded list.
 
 The backend boundary must carry at least: SoC/GPU identity, firmware file set, MMIO resources,
 GMEM and frequency capabilities, SMMU implementation and stream/context assignments, startup and
@@ -160,18 +177,20 @@ bring-up and a bounded test submission.
    SDM845 GPUCC/GCC sequencing and A630 GMU/CP data from primary Linux and vendor sources.
    **Gate:** every address, clock, stream, context, firmware segment and chip value has a source.
 2. **Separate the backends.** Extract a small shared backend contract and retain Redwood as an
-   unchanged profile. The initial dispatcher selects the read-only SDM845 probe from the SoC
-   peripheral base (`0x00100000`) and rejects unknown bases before any Redwood GPU access. Before
-   enabling writes, also validate the Polaris GPU identity against the runtime DT/hardware.
+   unchanged profile. The initial dispatcher selects the SDM845 backend from the SoC peripheral
+   base (`0x00100000`) and rejects unknown bases before any Redwood GPU access. The diagnostic now
+   validates the runtime device tree's A630 chip ID, GPU/GPUCC/GMU/SMMU resource windows, and
+   IOMMU stream tuples before MMIO; still verify the powered GPU's hardware identity before writes.
    **Gate:** both profiles build; selecting an unknown SoC touches no GPU register.
 3. **Read-only bring-up.** The initial A630-specific, boot-argument-gated reads are in place.
    Refine them against hardware logs and add any required clock/precondition checks before adding
    writes. Keep reads and writes in separate gates, with each write preceded by logged
    preconditions and a verified readback.
    **Gate:** repeated read-only runs complete without a hypervisor trap or stale state.
-4. **Power, clocks and secure firmware.** Implement SDM845 CX/GX sequencing, clocks and required
-   RPMh votes; then validate the A630 GMU firmware, MDT segments, PAS 13 authentication and zap
-   load. Clean up in reverse on every failure.
+4. **Power, clocks and secure firmware.** The A630 raw GMU image path and size limit are now
+   source-confirmed, and the local image fits. Implement SDM845 CX/GX sequencing, clocks and
+   required RPMh votes; then validate GMU boot, MDT segments, PAS 13 authentication and ZAP load.
+   Clean up in reverse on every failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -197,11 +216,10 @@ bring-up and a bounded test submission.
 
 ## Explicitly unresolved
 
-- The Polaris SMMU's assigned stream IDs/masks and whether secure/GMU streams are accessible to
-  this kernel under the phone's hypervisor.
-- Whether the A630 GMU's device-specific loader uses the legacy raw 32 KiB image contract in this
-  boot environment, and whether `a630_zap.b00/.b01/.elf` are needed by the kernel's package or PAS
-  path in addition to `.mdt/.b02`.
+- The live SMMU SMR masks, stream-to-context-bank assignments, and whether the secure/GMU streams
+  are accessible to this kernel under the phone's hypervisor. Runtime DT now confirms the IDs.
+- Whether the Qualcomm PAS path requires `a630_zap.b00/.b01/.elf` in addition to `.mdt/.b02`, and
+  the result of the new `adreno=6` capability query on this boot environment.
 - The local A630 SQE is below upstream's A630 safety floor; find an acceptable firmware version,
   then validate its register protection table and the MSM submission path against the 630's
   GMEM/UBWC configuration.

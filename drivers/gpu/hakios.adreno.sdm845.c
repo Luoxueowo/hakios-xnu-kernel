@@ -3,8 +3,9 @@
  * This is deliberately a separate backend from the Redwood/SC7280 Adreno 642L driver: the
  * GPUCC and KGSL SMMU are different blocks, and the latter is SMMUv2 rather than SMMUv500.
  *
- * Only adreno=1..5 runs the diagnostic reads, which do not write registers. The backend also has
- * dormant SMMUv2 translation operations, but they cannot attach a context or start rendering;
+ * Only adreno=1..6 runs diagnostics. Steps 1..5 only read registers or staged files; step 6 only
+ * queries TrustZone call availability/PAS support and never hands it an image. The backend also
+ * has dormant SMMUv2 translation operations, but they cannot attach a context or start rendering;
  * `ready()` remains false until the A630 firmware, power sequence, live SMMU route, command
  * processor and shared HakiosGPU path are implemented and exercised.
  *
@@ -24,6 +25,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -44,6 +46,12 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_SMMU_SIZE               0x00010000ul
 #define POLARIS_GPU_PHYS                0x05000000ul
 #define POLARIS_GPU_SIZE                0x00040000ul
+
+#define POLARIS_GPU_DT_PATH             "/soc/qcom,kgsl-3d0@5000000"
+#define POLARIS_GMU_DT_PATH             "/soc/qcom,gmu"
+#define POLARIS_GPUCC_DT_PATH           "/soc/qcom,gpucc@5090000"
+#define POLARIS_SMMU_DT_PATH            "/soc/arm,smmu-kgsl@5040000"
+#define POLARIS_GPU_CHIP_ID             0x06030001u
 
 /*
  * SDM845 GCC GPU clock branches share the GPU register window's prerequisites:
@@ -136,6 +144,7 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_GPU_VA_GRANULES          ((POLARIS_GPU_VA_END - POLARIS_GPU_VA_START) / POLARIS_GPU_VA_ALIGN)
 #define POLARIS_GPU_VA_MAX_RANGES        ((POLARIS_GPU_VA_GRANULES + 1) / 2)
 #define POLARIS_GPU_VA_MAX_ALLOCS        POLARIS_GPU_VA_GRANULES
+#define POLARIS_SMMU_MAX_STREAM_IDS      8u
 #define POLARIS_SMMU_TABLE_BYTES         4096u
 #define POLARIS_SMMU_MAX_TABLES          2053u /* one L1, four L2, 2048 L3 tables cover 4 GiB */
 #define POLARIS_SMMU_PTE_TABLE           3ull
@@ -187,9 +196,12 @@ static uint32_t polaris_smmu_context_base;
 static uint32_t polaris_smmu_context_bank_count;
 static uint32_t polaris_smmu_core_context;
 static uint32_t polaris_smmu_core_asid;
+static uint32_t polaris_smmu_stream_ids[POLARIS_SMMU_MAX_STREAM_IDS];
+static uint32_t polaris_smmu_stream_count;
 static bool polaris_smmu_core_context_active;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
+static bool polaris_sqe_safe;
 
 static void
 polaris_gpu_va_init(void)
@@ -335,7 +347,7 @@ static void sdm845_gpu_to_memory(void *start, uint64_t size);
 static bool
 sdm845_gpu_ready(void)
 {
-	return polaris_smmu_backend_enabled && !polaris_smmu_backend_faulted;
+	return polaris_smmu_backend_enabled && !polaris_smmu_backend_faulted && polaris_sqe_safe;
 }
 
 const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
@@ -361,6 +373,220 @@ map_block(struct probe_block *block)
 		    (uint64_t)block->physical, (uint64_t)block->size);
 		return false;
 	}
+	return true;
+}
+
+/* Flattened device-tree cells are big-endian, including on the little-endian SDM845 CPU. */
+static uint32_t
+polaris_dt_be32(const uint8_t *data)
+{
+	return (uint32_t)data[0] << 24 | (uint32_t)data[1] << 16 | (uint32_t)data[2] << 8 | data[3];
+}
+
+static bool
+polaris_dt_has_compatible(DTEntry node, const char *expected)
+{
+	const uint8_t *strings;
+	unsigned int size = 0, offset = 0;
+	size_t expected_size = strlen(expected);
+
+	if (SecureDTGetProperty(node, "compatible", (const void **)&strings, &size) != kSuccess || strings == NULL) {
+		return false;
+	}
+	while (offset < size) {
+		const uint8_t *terminator = memchr(strings + offset, '\0', size - offset);
+		unsigned int string_size;
+
+		if (terminator == NULL) {
+			return false;
+		}
+		string_size = (unsigned int)(terminator - (strings + offset));
+		if (string_size == expected_size && memcmp(strings + offset, expected, expected_size) == 0) {
+			return true;
+		}
+		offset += string_size + 1;
+	}
+	return false;
+}
+
+static bool
+polaris_dt_has_reg(DTEntry node, uint32_t address, uint32_t length)
+{
+	const uint8_t *reg;
+	unsigned int size = 0;
+
+	if (SecureDTGetProperty(node, "reg", (const void **)&reg, &size) != kSuccess || reg == NULL || size == 0 ||
+	    (size & 7u) != 0) {
+		return false;
+	}
+	for (unsigned int offset = 0; offset < size; offset += 8) {
+		if (polaris_dt_be32(reg + offset) == address && polaris_dt_be32(reg + offset + 4) == length) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+polaris_dt_get_u32(DTEntry node, const char *name, uint32_t *value)
+{
+	const uint8_t *property;
+	unsigned int size = 0;
+
+	if (SecureDTGetProperty(node, name, (const void **)&property, &size) != kSuccess || property == NULL || size != 4) {
+		return false;
+	}
+	*value = polaris_dt_be32(property);
+	return true;
+}
+
+static bool
+polaris_dt_has_empty_property(DTEntry node, const char *name)
+{
+	const void *property = NULL;
+	unsigned int size = 0;
+
+	return SecureDTGetProperty(node, name, &property, &size) == kSuccess && size == 0;
+}
+
+static bool
+polaris_dt_iommu_streams_match(const char *path, uint32_t smmu_phandle, const uint32_t *expected_ids,
+	uint32_t expected_count)
+{
+	DTEntry node = NULL;
+	const uint8_t *iommus;
+	unsigned int size = 0;
+
+	if (SecureDTLookupEntry(NULL, path, &node) != kSuccess || node == NULL ||
+	    SecureDTGetProperty(node, "iommus", (const void **)&iommus, &size) != kSuccess || iommus == NULL ||
+	    size != expected_count * 8u) {
+		printf("adreno-sdm845: runtime device tree has invalid iommus on %s\n", path);
+		return false;
+	}
+	for (uint32_t i = 0; i < expected_count; i++) {
+		uint32_t phandle = polaris_dt_be32(iommus + i * 8u);
+		uint32_t stream_id = polaris_dt_be32(iommus + i * 8u + 4u);
+		bool seen = false;
+
+		if (phandle != smmu_phandle || stream_id != expected_ids[i]) {
+			printf("adreno-sdm845: runtime iommus on %s entry %u is phandle=%#x SID=%u; expected %#x/%u\n",
+			    path, i, phandle, stream_id, smmu_phandle, expected_ids[i]);
+			return false;
+		}
+		for (uint32_t j = 0; j < polaris_smmu_stream_count; j++) {
+			if (polaris_smmu_stream_ids[j] == stream_id) {
+				seen = true;
+				break;
+			}
+		}
+		if (!seen) {
+			if (polaris_smmu_stream_count == POLARIS_SMMU_MAX_STREAM_IDS) {
+				return false;
+			}
+			polaris_smmu_stream_ids[polaris_smmu_stream_count++] = stream_id;
+		}
+	}
+	return true;
+}
+
+static bool
+polaris_runtime_iommu_validate(DTEntry smmu_node, uint32_t smmu_phandle)
+{
+	static const uint32_t gfx3d_user_ids[] = { 0 };
+	static const uint32_t gfx3d_secure_ids[] = { 2, 1 };
+	static const uint32_t gmu_kernel_ids[] = { 5 };
+	static const uint32_t gmu_user_ids[] = { 4 };
+	DTEntry kgsl_iommu_node = NULL, gfx3d_user_node = NULL;
+	uint32_t gpu_offset;
+
+	if (!polaris_dt_has_empty_property(smmu_node, "qcom,dynamic") ||
+	    !polaris_dt_has_empty_property(smmu_node, "qcom,use-3-lvl-tables") ||
+	    SecureDTLookupEntry(NULL, "/soc/qcom,kgsl-iommu", &kgsl_iommu_node) != kSuccess || kgsl_iommu_node == NULL ||
+	    !polaris_dt_has_compatible(kgsl_iommu_node, "qcom,kgsl-smmu-v2") ||
+	    SecureDTLookupEntry(NULL, "/soc/qcom,kgsl-iommu/gfx3d_user", &gfx3d_user_node) != kSuccess ||
+	    gfx3d_user_node == NULL || !polaris_dt_get_u32(gfx3d_user_node, "qcom,gpu-offset", &gpu_offset) ||
+	    gpu_offset != 0x48000u ||
+	    !polaris_dt_iommu_streams_match("/soc/qcom,kgsl-iommu/gfx3d_user", smmu_phandle,
+	    gfx3d_user_ids, sizeof(gfx3d_user_ids) / sizeof(gfx3d_user_ids[0])) ||
+	    !polaris_dt_iommu_streams_match("/soc/qcom,kgsl-iommu/gfx3d_secure", smmu_phandle,
+	    gfx3d_secure_ids, sizeof(gfx3d_secure_ids) / sizeof(gfx3d_secure_ids[0])) ||
+	    !polaris_dt_iommu_streams_match("/soc/qcom,gmu/gmu_kernel", smmu_phandle,
+	    gmu_kernel_ids, sizeof(gmu_kernel_ids) / sizeof(gmu_kernel_ids[0])) ||
+	    !polaris_dt_iommu_streams_match("/soc/qcom,gmu/gmu_user", smmu_phandle,
+	    gmu_user_ids, sizeof(gmu_user_ids) / sizeof(gmu_user_ids[0]))) {
+		printf("adreno-sdm845: runtime SMMUv2 stream/context description is incomplete or differs from Polaris; probe refused\n");
+		return false;
+	}
+	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
+		for (uint32_t j = i + 1; j < polaris_smmu_stream_count; j++) {
+			if (polaris_smmu_stream_ids[j] < polaris_smmu_stream_ids[i]) {
+				uint32_t temporary = polaris_smmu_stream_ids[i];
+				polaris_smmu_stream_ids[i] = polaris_smmu_stream_ids[j];
+				polaris_smmu_stream_ids[j] = temporary;
+			}
+		}
+	}
+	printf("adreno-sdm845: runtime DT KGSL/GMU stream IDs:");
+	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
+		printf(" %u", polaris_smmu_stream_ids[i]);
+	}
+	printf("; gfx3d_user GPU offset=%#x; three-level SMMU tables required\n", gpu_offset);
+	return true;
+}
+
+static bool
+polaris_dt_node_matches(const char *path, const char *compatible, uint32_t address, uint32_t length)
+{
+	DTEntry node = NULL;
+
+	if (SecureDTLookupEntry(NULL, path, &node) != kSuccess || node == NULL) {
+		printf("adreno-sdm845: runtime device tree is missing %s\n", path);
+		return false;
+	}
+	if (!polaris_dt_has_compatible(node, compatible)) {
+		printf("adreno-sdm845: runtime device tree %s lacks compatible %s\n", path, compatible);
+		return false;
+	}
+	if (!polaris_dt_has_reg(node, address, length)) {
+		printf("adreno-sdm845: runtime device tree %s has no reg entry for %#x/%#x\n", path, address, length);
+		return false;
+	}
+	return true;
+}
+
+static bool
+polaris_runtime_dt_validate(void)
+{
+	DTEntry gpu_node = NULL, smmu_node = NULL;
+	const uint8_t *chip_id;
+	unsigned int chip_id_size = 0;
+	uint32_t actual_chip_id, smmu_phandle;
+
+	if (!polaris_dt_node_matches(POLARIS_GPU_DT_PATH, "qcom,kgsl-3d0", POLARIS_GPU_PHYS, POLARIS_GPU_SIZE) ||
+	    !polaris_dt_node_matches(POLARIS_GMU_DT_PATH, "qcom,gpu-gmu", POLARIS_GMU_PHYS, POLARIS_GMU_SIZE) ||
+	    !polaris_dt_node_matches(POLARIS_GPUCC_DT_PATH, "qcom,gpucc-sdm845-v2", POLARIS_GPUCC_PHYS,
+	    POLARIS_GPUCC_SIZE) ||
+	    !polaris_dt_node_matches(POLARIS_SMMU_DT_PATH, "qcom,smmu-v2", POLARIS_SMMU_PHYS, POLARIS_SMMU_SIZE) ||
+	    SecureDTLookupEntry(NULL, POLARIS_GPU_DT_PATH, &gpu_node) != kSuccess || gpu_node == NULL ||
+	    SecureDTGetProperty(gpu_node, "qcom,chipid", (const void **)&chip_id, &chip_id_size) != kSuccess ||
+	    chip_id == NULL || chip_id_size != 4 ||
+	    SecureDTLookupEntry(NULL, POLARIS_SMMU_DT_PATH, &smmu_node) != kSuccess || smmu_node == NULL ||
+	    !polaris_dt_get_u32(smmu_node, "phandle", &smmu_phandle)) {
+		printf("adreno-sdm845: runtime device-tree validation failed; no GPU MMIO was accessed\n");
+		return false;
+	}
+	actual_chip_id = polaris_dt_be32(chip_id);
+	if (actual_chip_id != POLARIS_GPU_CHIP_ID) {
+		printf("adreno-sdm845: runtime GPU chip ID is %#x, expected Polaris A630 %#x; probe refused\n",
+		    actual_chip_id, POLARIS_GPU_CHIP_ID);
+		return false;
+	}
+	polaris_smmu_stream_count = 0;
+	if (!polaris_runtime_iommu_validate(smmu_node, smmu_phandle)) {
+		return false;
+	}
+	printf("adreno-sdm845: runtime device tree identifies Polaris A630 (%#x); GPU, GPUCC, GMU and SMMUv2 windows match\n",
+	    actual_chip_id);
 	return true;
 }
 
@@ -756,7 +982,6 @@ smmu_id_size_to_bits(uint32_t encoding)
 static bool
 probe_smmu(void)
 {
-	static const uint32_t kgsl_stream_ids[] = { 0, 1, 2, 4, 5 };
 	uint32_t cx, memnoc, idr0, idr1, idr2, idr7;
 	uint32_t stream_groups, context_banks, s2_context_banks, sid_bits;
 	uint32_t page_shift, major, minor;
@@ -832,8 +1057,8 @@ probe_smmu(void)
 	} else if (sid_bits <= 16) {
 		uint32_t sid_limit = 1u << sid_bits;
 
-		for (uint32_t i = 0; i < sizeof(kgsl_stream_ids) / sizeof(kgsl_stream_ids[0]); i++) {
-			uint32_t sid = kgsl_stream_ids[i];
+		for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
+			uint32_t sid = polaris_smmu_stream_ids[i];
 			uint32_t s2cr;
 
 			if (sid >= sid_limit) {
@@ -929,6 +1154,20 @@ probe_core(void)
 #define A630_MDT_MAX_SEGMENTS 16u
 #define A630_MDT_HASH(flags)  ((((flags) >> 24) & 7u) == 2u)
 
+#define POLARIS_SCM_FAST              (1ull << 31)
+#define POLARIS_SCM_64                (1ull << 30)
+#define POLARIS_SCM_SIP               (2ull << 24)
+#define POLARIS_SCM_CALL(service, command) ((uint64_t)(service) << 8 | (command))
+#define POLARIS_SCM_IS_CALL_AVAILABLE POLARIS_SCM_CALL(6, 1)
+#define POLARIS_SCM_PAS_INIT_IMAGE    POLARIS_SCM_CALL(2, 1)
+#define POLARIS_SCM_PAS_MEM_SETUP     POLARIS_SCM_CALL(2, 2)
+#define POLARIS_SCM_PAS_AUTH_RESET    POLARIS_SCM_CALL(2, 5)
+#define POLARIS_SCM_PAS_SHUTDOWN      POLARIS_SCM_CALL(2, 6)
+#define POLARIS_SCM_PAS_IS_SUPPORTED  POLARIS_SCM_CALL(2, 7)
+#define POLARIS_SCM_ONE_VALUE         1u
+#define POLARIS_SCM_INTERRUPTED       1u
+#define POLARIS_PAS_GPU               13u
+
 static uint16_t
 read_le16(const uint8_t *data)
 {
@@ -1019,7 +1258,7 @@ probe_firmware(void)
 	uint64_t gmu_size = 0, sqe_size = 0, zap_size = 0;
 	const uint8_t *gmu_firmware, *sqe_firmware, *zap_header;
 	uint32_t sqe_word0;
-	bool sqe_safe, valid = true;
+	bool sqe_safe = false, valid = true;
 
 	printf("adreno-sdm845: step 5: inspect staged A630 firmware (no hardware writes)\n");
 	gmu_firmware = hakios_image_file("fw", "a630_gmu.bin", &gmu_size, NULL);
@@ -1045,19 +1284,117 @@ probe_firmware(void)
 		/* Match Linux a6xx_ucode_check_version()'s A630 security and WHERE_AM_I floor. */
 		sqe_safe = ((((sqe_word0 & 0xfu) == 0xau) && ((read_le32(sqe_firmware + 8) & 0xfu) >= 1u)) ||
 		    ((sqe_word0 & 0xfffu) >= 0x190u));
+		polaris_sqe_safe = sqe_safe;
 		printf("adreno-sdm845: A630 SQE first word=%#x; upstream safety floor %s\n", sqe_word0,
 		    sqe_safe ? "passes" : "FAILS (need version >= 0x190 or the patched marker)");
-		if (!sqe_safe) {
-			valid = false;
-		}
 	}
 	if (!probe_zap_mdt(zap_header, zap_size)) {
 		valid = false;
 	}
 	if (!valid) {
-		printf("adreno-sdm845: firmware validation failed; GMU and CP startup remain forbidden\n");
+		printf("adreno-sdm845: firmware structure validation failed; startup remains forbidden\n");
+	} else if (!polaris_sqe_safe) {
+		printf("adreno-sdm845: GMU/ZAP files are structurally valid, but this SQE cannot be used for user commands\n");
 	}
 	return valid;
+}
+
+/* A bounded copy of the Qualcomm SCM call convention used by this kernel's other PAS drivers. */
+static bool
+polaris_scm_call(uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+	int32_t *status, uint64_t *answer)
+{
+	uint64_t session = 0;
+
+	for (uint32_t retry = 0; retry < 100; retry++) {
+		register uint64_t x0 __asm__("x0") = retry == 0 ? function : POLARIS_SCM_INTERRUPTED;
+		register uint64_t x1 __asm__("x1") = arguments;
+		register uint64_t x2 __asm__("x2") = first;
+		register uint64_t x3 __asm__("x3") = second;
+		register uint64_t x4 __asm__("x4") = third;
+		register uint64_t x5 __asm__("x5") = 0;
+		register uint64_t x6 __asm__("x6") = session;
+		register uint64_t x7 __asm__("x7") = 0;
+
+		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
+		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+		session = x6;
+		if (x0 != POLARIS_SCM_INTERRUPTED) {
+			*status = (int32_t)x0;
+			*answer = x1;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+polaris_scm_call_available(uint64_t convention, uint64_t call, const char *name, bool *available)
+{
+	int32_t status;
+	uint64_t answer = 0;
+
+	if (!polaris_scm_call(convention | POLARIS_SCM_IS_CALL_AVAILABLE, POLARIS_SCM_ONE_VALUE,
+	    POLARIS_SCM_SIP | call, 0, 0, &status, &answer)) {
+		printf("adreno-sdm845: TrustZone availability query for %s stayed interrupted\n", name);
+		return false;
+	}
+	*available = status == 0 && answer == 1;
+	printf("adreno-sdm845: TrustZone call %-22s: status=%d answer=%#llx available=%s\n", name, status, answer,
+	    *available ? "yes" : "no");
+	return true;
+}
+
+static bool
+probe_pas_capabilities(void)
+{
+	static const struct {
+		uint64_t function;
+		const char *name;
+	} pas_calls[] = {
+		{ POLARIS_SCM_PAS_INIT_IMAGE, "PAS_INIT_IMAGE" },
+		{ POLARIS_SCM_PAS_MEM_SETUP, "PAS_MEM_SETUP" },
+		{ POLARIS_SCM_PAS_AUTH_RESET, "PAS_AUTH_AND_RESET" },
+		{ POLARIS_SCM_PAS_SHUTDOWN, "PAS_SHUTDOWN" },
+		{ POLARIS_SCM_PAS_IS_SUPPORTED, "PAS_IS_SUPPORTED" },
+	};
+	uint64_t convention = POLARIS_SCM_FAST | POLARIS_SCM_64 | POLARIS_SCM_SIP;
+	bool query_available = false, calls[sizeof(pas_calls) / sizeof(pas_calls[0])] = { false };
+	int32_t status;
+	uint64_t answer = 0;
+
+	printf("adreno-sdm845: step 6: query TrustZone PAS capabilities (no image handoff or GPU writes)\n");
+	if (!polaris_scm_call_available(convention, POLARIS_SCM_IS_CALL_AVAILABLE, "IS_CALL_AVAILABLE",
+	    &query_available)) {
+		return false;
+	}
+	if (!query_available) {
+		convention = POLARIS_SCM_FAST | POLARIS_SCM_SIP;
+		if (!polaris_scm_call_available(convention, POLARIS_SCM_IS_CALL_AVAILABLE, "IS_CALL_AVAILABLE (32-bit)",
+		    &query_available)) {
+			return false;
+		}
+	}
+	if (!query_available) {
+		printf("adreno-sdm845: this TrustZone does not expose the Linux SCM availability query\n");
+		return true;
+	}
+	for (uint32_t i = 0; i < sizeof(pas_calls) / sizeof(pas_calls[0]); i++) {
+		if (!polaris_scm_call_available(convention, pas_calls[i].function, pas_calls[i].name, &calls[i])) {
+			return false;
+		}
+	}
+	if (calls[4]) {
+		if (!polaris_scm_call(convention | POLARIS_SCM_PAS_IS_SUPPORTED, POLARIS_SCM_ONE_VALUE,
+		    POLARIS_PAS_GPU, 0, 0, &status, &answer)) {
+			printf("adreno-sdm845: PAS_IS_SUPPORTED for image 13 stayed interrupted\n");
+			return false;
+		}
+		printf("adreno-sdm845: TrustZone PAS image 13 (GPU ZAP): status=%d supported=%s (answer=%#llx)\n",
+		    status, status == 0 && answer != 0 ? "yes" : "no", answer);
+	}
+	printf("adreno-sdm845: capability queries only; no PAS_INIT_IMAGE, PAS_MEM_SETUP or PAS_AUTH_AND_RESET was issued\n");
+	return true;
 }
 
 void
@@ -1065,7 +1402,8 @@ hakios_adreno_sdm845_init(void)
 {
 	uint32_t last_step = 0, gpu_enabled = 0;
 	bool requested_probe;
-	static bool (*const probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core, probe_firmware };
+	static bool (*const probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core, probe_firmware,
+	    probe_pas_capabilities };
 
 	if (pe_arm_get_soc_base_phys() != SDM845_SOC_BASE) {
 		return;
@@ -1073,6 +1411,9 @@ hakios_adreno_sdm845_init(void)
 	polaris_gpu_va_init();
 	requested_probe = PE_parse_boot_argn("adreno", &last_step, sizeof(last_step)) && last_step != 0;
 	PE_parse_boot_argn("gpu", &gpu_enabled, sizeof(gpu_enabled));
+	if ((requested_probe || gpu_enabled) && !polaris_runtime_dt_validate()) {
+		return;
+	}
 	if (!requested_probe) {
 		if (gpu_enabled) {
 			printf("adreno-sdm845: GPU rendering is not enabled: the A630 backend is at read-only bring-up stage\n");
@@ -1084,7 +1425,7 @@ hakios_adreno_sdm845_init(void)
 		    sizeof(probes) / sizeof(probes[0]), last_step);
 		last_step = sizeof(probes) / sizeof(probes[0]);
 	}
-	printf("adreno-sdm845: Polaris Adreno 630 diagnostic, steps 1..%u, all reads and no writes\n", last_step);
+	printf("adreno-sdm845: Polaris Adreno 630 diagnostic, steps 1..%u (no GPU register writes)\n", last_step);
 	for (uint32_t i = 0; i < last_step; i++) {
 		if (!probes[i]()) {
 			printf("adreno-sdm845: step %u failed; later steps are not attempted\n", i + 1);
