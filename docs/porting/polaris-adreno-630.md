@@ -205,7 +205,7 @@ allow it. A successful firmware boot alone is not a completed driver.
   ([`kgsl.h`](https://android.googlesource.com/kernel/msm.git/%2B/a11d0d49d2b949d401f8899369db331102d23cc3/drivers/gpu/msm/kgsl.h),
   [`adreno_ringbuffer.h`](https://android.googlesource.com/kernel/msm/%2B/7a5cb50be049b0de03e13c98b65cb3770ad15481/drivers/gpu/msm/adreno_ringbuffer.h));
   this stage has not been run under HakiOS on the phone.
-- `adreno=17` is the next explicit hardware stage. It requires the GPU core initially off and
+- `adreno=17` is an explicit hardware stage. It requires the GPU core initially off and
   SID0 detached, prepares the step 16 SQE/ring/RPTR mappings, starts the GMU/HFI with its separate
   SID5/SID4 contexts, sends and verifies `PERF_TBL`, `BW_VOTE_TBL`, `HFI_TEST`, and initial DCVS,
   then releases the temporary host DDR vote. With those prerequisites satisfied, it attaches the
@@ -216,6 +216,19 @@ allow it. A successful firmware boot alone is not a completed driver.
   ordering follow Qualcomm's A630 KGSL [`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c)
   and [`adreno.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno.c).
   This stage adds hardware writes but has not been run on the phone; `ready()` remains false.
+- `adreno=18` repeats the guarded GMU/HFI, SID0 and GX startup, then ports Qualcomm's A630 core
+  baseline: the full HWCG table and GMU SPTPRAC ordering, A630 VBIF settings, GPU busy counter,
+  UCHE trap/write-through/1-MiB GMEM ranges, CP thresholds and pool size, address-mode attributes
+  derived from the runtime `highest-bank-bit`, `min-access-length` and `ubwc-mode`, hang detection,
+  and the A630 CP register-protection table. It also converts Polaris's validated
+  `qcom,protect = <0x40000 0xc000>` aperture using KGSL's IOMMU encoding and adds its SMMU range
+  to the 27 fixed A630 protection groups, for 28 of the 32 available descriptors. Selected core,
+  VBIF, UCHE, CP and protection registers are read back; a mismatch faults the backend and leaves
+  GPU OOB asserted for diagnosis. The register sequence follows Qualcomm's A630
+  [`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c)
+  and [`kgsl_iommu.c`](https://android.googlesource.com/kernel/msm/%2B/f39cb888297d4560766734fe0c42177714f8f9d5/drivers/gpu/msm/kgsl_iommu.c).
+  It stops before SQE/ring register programming, `CP_ME_INIT`, ZAP authentication or submission.
+  This write stage has not been run on the phone; `ready()` remains false.
 
 ## Polaris hardware facts
 
@@ -534,12 +547,13 @@ bring-up and a bounded test submission.
    validated from runtime DT; an explicit read-only step 8 inspects the TCS and CX/GFX ARC tables.
    The A630 GMU/HFI bootstrap, temporary startup DDR TCS vote, `PERF_TBL`, `BW_VOTE_TBL`, initial
    boot-rail OOB, and default DCVS stages are implemented behind explicit `adreno=12`/`adreno=13`/
-   `adreno=14`, but none has been run on hardware. Step 17 now adds the A630 GMU GPU OOB request
-   after GMU/HFI table setup and verifies GX/GFX3D power readback; it has not been run either.
-   Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior, and GX sequencing against
-   Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. Next port A630 core
-   initialization, then the bounded SQE/CP ring startup and secure-mode transition before calling
-   `PAS_AUTH_AND_RESET`; verify CP idle and unwind PAS, GMU, GPU OOB and power state on failure.
+   `adreno=14`, but none has been run on hardware. Steps 17 and 18 now add the A630 GMU GPU OOB
+   request, GX/GFX3D verification, core HWCG/VBIF/UCHE defaults and CP register protection; neither
+   write stage has been run. Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior,
+   GX sequencing, and core readbacks against Polaris before proceeding. Keep step 7 limited to PAS
+   staging and shutdown. Next implement bounded SQE/CP ring startup and the secure-mode transition
+   before calling `PAS_AUTH_AND_RESET`; verify CP idle and unwind PAS, GMU, GPU OOB and power state
+   on failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache

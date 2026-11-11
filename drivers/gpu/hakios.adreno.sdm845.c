@@ -12,8 +12,9 @@
  * Explicit adreno=15 only builds the A630 CP_ME_INIT and CP_SET_SECURE_MODE bootstrap packets in
  * local memory for inspection. adreno=16 prepares the SQE, CP ring, and RPTR scratch in the
  * detached GPU SID0 page table; adreno=17 maps those buffers, starts GMU/HFI, then requests GX
- * power through the A630 GPU OOB and verifies the GFX3D clock. Step 17 stops before A6xx core
- * programming, SQE/CP startup, or ZAP authentication.
+ * power through the A630 GPU OOB and verifies the GFX3D clock. Step 18 repeats that guarded startup
+ * then programs A630 HWCG, VBIF, UCHE, CP defaults, and protected-register ranges; SQE/CP startup
+ * and ZAP authentication remain separate later stages.
  * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
  * during this bring-up. ZAP authentication waits for the A6xx SQE/CP initialization and
  * CP_SET_SECURE_MODE transition path; GPU command submission, runtime GPU DCVS,
@@ -319,6 +320,64 @@ extern lck_mtx_t hakios_rsc_lock;
 #define GPU_RBBM_INT_0_STATUS           GPU_WORD(0x0201)
 #define GPU_RBBM_STATUS                 GPU_WORD(0x0210)
 #define GPU_CP_HW_FAULT                 GPU_WORD(0x0821)
+#define GPU_RBBM_CLOCK_CNTL             GPU_WORD(0x00ae)
+#define GPU_RBBM_PERFCTR_GPU_BUSY_MASKED GPU_WORD(0x050b)
+#define GPU_CP_ROQ_THRESHOLDS_1         GPU_WORD(0x08c1)
+#define GPU_CP_ROQ_THRESHOLDS_2         GPU_WORD(0x08c2)
+#define GPU_CP_MEM_POOL_SIZE            GPU_WORD(0x08c3)
+#define GPU_CP_PROTECT_CNTL             GPU_WORD(0x084f)
+#define GPU_CP_PROTECT_REG              GPU_WORD(0x0850)
+#define GPU_CP_AHB_CNTL                 GPU_WORD(0x098d)
+#define GPU_RBBM_PERFCTR_CNTL           GPU_WORD(0x0500)
+#define GPU_RBBM_INTERFACE_HANG_INT_CNTL GPU_WORD(0x001f)
+#define GPU_PC_DBG_ECO_CNTL             GPU_WORD(0x9e00)
+#define GPU_UCHE_MODE_CNTL              GPU_WORD(0x0e01)
+#define GPU_UCHE_WRITE_RANGE_MAX_LO     GPU_WORD(0x0e05)
+#define GPU_UCHE_WRITE_RANGE_MAX_HI     GPU_WORD(0x0e06)
+#define GPU_UCHE_WRITE_THRU_BASE_LO     GPU_WORD(0x0e07)
+#define GPU_UCHE_WRITE_THRU_BASE_HI     GPU_WORD(0x0e08)
+#define GPU_UCHE_TRAP_BASE_LO           GPU_WORD(0x0e09)
+#define GPU_UCHE_TRAP_BASE_HI           GPU_WORD(0x0e0a)
+#define GPU_UCHE_GMEM_RANGE_MIN_LO      GPU_WORD(0x0e0b)
+#define GPU_UCHE_GMEM_RANGE_MIN_HI      GPU_WORD(0x0e0c)
+#define GPU_UCHE_GMEM_RANGE_MAX_LO      GPU_WORD(0x0e0d)
+#define GPU_UCHE_GMEM_RANGE_MAX_HI      GPU_WORD(0x0e0e)
+#define GPU_UCHE_CACHE_WAYS             GPU_WORD(0x0e17)
+#define GPU_UCHE_FILTER_CNTL            GPU_WORD(0x0e18)
+#define GPU_UCHE_CLIENT_PF              GPU_WORD(0x0e19)
+#define GPU_RB_NC_MODE_CNTL             GPU_WORD(0x8e08)
+#define GPU_TPL1_NC_MODE_CNTL           GPU_WORD(0xb604)
+#define GPU_SP_NC_MODE_CNTL             GPU_WORD(0xae02)
+#define GPU_RBBM_VBIF_CLIENT_QOS_CNTL   GPU_WORD(0x0010)
+#define GPU_VBIF_GATE_OFF_WRREQ_EN      GPU_WORD(0x302a)
+#define A630_GMEM_BASE                  0x00100000u
+#define A630_GMEM_SIZE                  0x00100000u
+#define A630_HIGHEST_BANK_BIT           15u
+#define A630_MAX_PROTECTED_REGS         32u
+#define A630_FIXED_PROTECTED_REGS       27u
+#define A630_SMMU_PROTECT_BASE_WORD     0x00010000u
+#define A630_SMMU_PROTECT_RANGE_WORDS   0x00002000u
+#define A630_HWC_GMU_SPTPRAC_WORD       0x0001a880u
+#define A630_GMU_AO_CGC_MODE_WORD       0x00023b09u
+#define A630_GMU_AO_CGC_DELAY_WORD      0x00023b0au
+#define A630_GMU_AO_CGC_HYST_WORD       0x00023b0bu
+#define A630_RBBM_CLOCK_CNTL_ON         0x8aa8aa02u
+
+struct polaris_a630_protected_reg {
+	uint32_t base;
+	uint32_t count;
+	uint32_t read_protect;
+};
+
+static const struct polaris_a630_protected_reg polaris_a630_protected_regs[A630_FIXED_PROTECTED_REGS] = {
+	{ 0x600, 0x51, 0 }, { 0xae50, 0x2, 1 }, { 0x9624, 0x13, 1 }, { 0x8630, 0x8, 1 },
+	{ 0x9e70, 0x1, 1 }, { 0x9e78, 0x187, 1 }, { 0xf000, 0x810, 1 }, { 0xfc00, 0x3, 0 },
+	{ 0x50e, 0x0, 1 }, { 0x50f, 0x0, 0 }, { 0x510, 0x0, 1 }, { 0x0, 0x4f9, 0 },
+	{ 0x501, 0xa, 0 }, { 0x511, 0x44, 0 }, { 0xe00, 0xe, 1 }, { 0x8e00, 0x0, 1 },
+	{ 0x8e50, 0xf, 1 }, { 0xbe02, 0x0, 1 }, { 0xbe20, 0x11f3, 1 }, { 0x800, 0x82, 1 },
+	{ 0x8a0, 0x8, 1 }, { 0x8ab, 0x19, 1 }, { 0x900, 0x4d, 1 }, { 0x98d, 0x76, 1 },
+	{ 0x8d0, 0x23, 0 }, { 0x980, 0x4, 0 }, { 0xa630, 0x0, 1 },
+};
 
 /*
  * A630 advertises a 32-bit GPU VA aperture. Reserve its lower GiB for backend-owned
@@ -570,6 +629,7 @@ static bool polaris_gmu_boot_rail_active;
 static bool polaris_gpu_oob_active;
 static bool polaris_gmu_domain_ready;
 static bool polaris_gpu_core_ready;
+static bool polaris_gpu_core_configured;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
 static bool polaris_sqe_safe;
@@ -5281,6 +5341,7 @@ sdm845_gpu_stop(void)
 		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
 		polaris_gmu_boot_rail_active = false;
 	}
+	polaris_gpu_core_configured = false;
 	if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
 		printf("adreno-sdm845: GPU stop could not confirm release of the temporary Apps RSC DDR vote\n");
 	}
@@ -5297,6 +5358,251 @@ sdm845_gpu_stop(void)
 			printf("adreno-sdm845: GPU stop released detached SQE/CP buffers with the 3D context and core inactive\n");
 		}
 	}
+}
+
+static void
+polaris_a630_hwcg_write_range(uint32_t first_word, uint32_t count, uint32_t value)
+{
+	for (uint32_t i = 0; i < count; i++) {
+		probe_write(&gpu, GPU_WORD(first_word + i), value);
+	}
+}
+
+/* Port of the A630 HWCG table and its GMU SPTPRAC clock sequencing. */
+static bool
+polaris_a630_hwcg_start(void)
+{
+	static const struct { uint32_t word; uint32_t value; } fixed[] = {
+		{ 0x10b, 0x22222222 }, { 0x10c, 0x22222222 }, { 0x10d, 0x22222222 },
+		{ 0x10e, 0x00222222 }, { 0x110, 0x00000004 }, { 0x10f, 0x00000002 },
+		{ 0x104, 0x00022022 }, { 0x105, 0x00005550 }, { 0x106, 0x00010011 },
+		{ 0x107, 0x00445044 }, { 0x108, 0x04222220 }, { 0x114, 0x00202222 },
+		{ 0x111, 0x00002222 }, { 0x10a, 0x00000000 }, { 0x116, 0x04104004 },
+		{ 0x113, 0x00000000 }, { 0x11c, 0x00000000 }, { 0x109, 0x00004000 },
+		{ 0x115, 0x00000200 }, { 0x112, 0x00002222 }, { 0x117, 0x00000002 },
+		{ 0x11b, 0x00002222 }, { 0x118, 0x00000222 }, { 0x119, 0x00000111 },
+		{ 0x11a, 0x00000555 },
+	};
+	uint32_t clock_control, sptprac;
+
+	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_MODE_WORD), 0x00020222u);
+	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_DELAY_WORD), 0x00010111u);
+	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_HYST_WORD), 0x00050555u);
+	clock_control = probe_read(&gpu, GPU_RBBM_CLOCK_CNTL);
+	if (clock_control == A630_RBBM_CLOCK_CNTL_ON) {
+		return true;
+	}
+	sptprac = probe_read(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD));
+	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD), sptprac & ~1u);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t i = 0; i < 4; i++) {
+		polaris_a630_hwcg_write_range(0x0b0u + i, 1u, 0x02222222u);
+		polaris_a630_hwcg_write_range(0x0b4u + i, 1u, 0x02022220u);
+		polaris_a630_hwcg_write_range(0x0b8u + i, 1u, 0x0000f3cfu);
+		polaris_a630_hwcg_write_range(0x0bcu + i, 1u, 0x00000080u);
+		polaris_a630_hwcg_write_range(0x0c0u + i, 1u, 0x02222222u);
+		polaris_a630_hwcg_write_range(0x0c4u + i, 1u, 0x22222222u);
+		polaris_a630_hwcg_write_range(0x0c8u + i, 1u, 0x22222222u);
+		polaris_a630_hwcg_write_range(0x0ccu + i, 1u, 0x00022222u);
+		polaris_a630_hwcg_write_range(0x0e0u + i, 1u, 0x77777777u);
+		polaris_a630_hwcg_write_range(0x0e4u + i, 1u, 0x77777777u);
+		polaris_a630_hwcg_write_range(0x0e8u + i, 1u, 0x07777777u);
+		polaris_a630_hwcg_write_range(0x0ecu + i, 1u, 0x00077777u);
+		polaris_a630_hwcg_write_range(0x0d0u + i, 1u, 0x11111111u);
+		polaris_a630_hwcg_write_range(0x0d4u + i, 1u, 0x11111111u);
+		polaris_a630_hwcg_write_range(0x0d8u + i, 1u, 0x11111111u);
+		polaris_a630_hwcg_write_range(0x0dcu + i, 1u, 0x00011111u);
+		polaris_a630_hwcg_write_range(0x0f0u + i, 1u, 0x22222222u);
+		polaris_a630_hwcg_write_range(0x0f4u + i, 1u, 0x00002222u);
+		polaris_a630_hwcg_write_range(0x0f8u + i, 1u, 0x00000000u);
+		polaris_a630_hwcg_write_range(0x100u + i, 1u, 0x00040f00u);
+	}
+	for (uint32_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+		probe_write(&gpu, GPU_WORD(fixed[i].word), fixed[i].value);
+	}
+	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD), (sptprac & ~1u) | 1u);
+	probe_write(&gpu, GPU_RBBM_CLOCK_CNTL, A630_RBBM_CLOCK_CNTL_ON);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	return probe_read(&gpu, GPU_RBBM_CLOCK_CNTL) == A630_RBBM_CLOCK_CNTL_ON &&
+	    (probe_read(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD)) & 1u) != 0;
+}
+
+static bool
+polaris_a630_gpu_core_initialize(void)
+{
+	DTEntry gpu_node = NULL, iommu_node = NULL;
+	const uint8_t *protect;
+	unsigned int protect_size = 0;
+	uint32_t highest_bank_bit, min_access_length = 32u, ubwc_mode = 0u;
+	uint32_t bank_field, mal_field, rb_mode, tpl1_mode, uche_mode;
+	uint32_t protect_base, protect_words, protect_range, protect_index, value;
+
+	printf("adreno-sdm845: step 18: apply A630 core HWCG, VBIF, UCHE, CP defaults, and register protection\n");
+	if (polaris_gpu_core_configured) {
+		printf("adreno-sdm845: step 18 A630 core defaults are already programmed\n");
+		return true;
+	}
+	if (!polaris_gpu_core_ready || !polaris_gpu_oob_active || !polaris_gmu_hfi_ready ||
+	    !polaris_gmu_hfi_sealed || !polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready ||
+	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active || polaris_smmu_backend_faulted ||
+	    !map_block(&gpu) || !map_block(&gmu) ||
+	    SecureDTLookupEntry(NULL, POLARIS_GPU_DT_PATH, &gpu_node) != kSuccess || gpu_node == NULL ||
+	    !polaris_dt_get_u32(gpu_node, "qcom,highest-bank-bit", &highest_bank_bit) ||
+	    highest_bank_bit != A630_HIGHEST_BANK_BIT) {
+		printf("adreno-sdm845: step 18 requires powered GX/GFX3D, active SID0, the live GMU/HFI handoff, and Polaris A630 DT parameters\n");
+		return false;
+	}
+	if (polaris_dt_has_property(gpu_node, "qcom,min-access-length") &&
+	    !polaris_dt_get_u32(gpu_node, "qcom,min-access-length", &min_access_length)) {
+		printf("adreno-sdm845: step 18 rejected malformed qcom,min-access-length\n");
+		return false;
+	}
+	if (polaris_dt_has_property(gpu_node, "qcom,ubwc-mode") &&
+	    !polaris_dt_get_u32(gpu_node, "qcom,ubwc-mode", &ubwc_mode)) {
+		printf("adreno-sdm845: step 18 rejected malformed qcom,ubwc-mode\n");
+		return false;
+	}
+	if ((min_access_length != 0u && min_access_length != 32u && min_access_length != 64u) || ubwc_mode > 2u ||
+	    SecureDTLookupEntry(NULL, "/soc/qcom,kgsl-iommu", &iommu_node) != kSuccess || iommu_node == NULL ||
+	    SecureDTGetProperty(iommu_node, "qcom,protect", (const void **)&protect, &protect_size) != kSuccess ||
+	    protect == NULL || protect_size != 8u || polaris_dt_be32(protect) != 0x40000u ||
+	    polaris_dt_be32(protect + 4u) != 0xc000u) {
+		printf("adreno-sdm845: step 18 refused unsupported A630 memory attributes or a changed KGSL protect aperture\n");
+		return false;
+	}
+	bank_field = (highest_bank_bit - 13u) & 3u;
+	mal_field = min_access_length == 64u ? 1u : 0u;
+	rb_mode = (mal_field << 3) | (bank_field << 1) | (ubwc_mode == 1u ? 1u : 0u);
+	tpl1_mode = (mal_field << 3) | (bank_field << 1) | (ubwc_mode == 1u ? 1u : 0u);
+	uche_mode = (mal_field << 23) | (bank_field << 21);
+	protect_base = polaris_dt_be32(protect) / sizeof(uint32_t);
+	protect_words = polaris_dt_be32(protect + 4u) / sizeof(uint32_t);
+	protect_range = 1u;
+	while (protect_range <= protect_words / 2u) {
+		protect_range <<= 1;
+	}
+	if (protect_base != A630_SMMU_PROTECT_BASE_WORD || protect_range != A630_SMMU_PROTECT_RANGE_WORDS ||
+	    A630_FIXED_PROTECTED_REGS + 1u > A630_MAX_PROTECTED_REGS) {
+		printf("adreno-sdm845: step 18 refused a qcom,protect range that does not fit the A630 protection table\n");
+		return false;
+	}
+	if (!polaris_a630_hwcg_start()) {
+		goto fault;
+	}
+
+	probe_write(&gpu, GPU_VBIF_GATE_OFF_WRREQ_EN, 0x9u);
+	probe_write(&gpu, GPU_RBBM_VBIF_CLIENT_QOS_CNTL, 0x3u);
+	probe_write(&gpu, GPU_RBBM_PERFCTR_GPU_BUSY_MASKED, UINT32_MAX);
+	probe_write(&gpu, GPU_UCHE_WRITE_RANGE_MAX_LO, 0xffffffc0u);
+	probe_write(&gpu, GPU_UCHE_WRITE_RANGE_MAX_HI, 0x0001ffffu);
+	probe_write(&gpu, GPU_UCHE_TRAP_BASE_LO, 0xfffff000u);
+	probe_write(&gpu, GPU_UCHE_TRAP_BASE_HI, 0x0001ffffu);
+	probe_write(&gpu, GPU_UCHE_WRITE_THRU_BASE_LO, 0xfffff000u);
+	probe_write(&gpu, GPU_UCHE_WRITE_THRU_BASE_HI, 0x0001ffffu);
+	probe_write(&gpu, GPU_UCHE_GMEM_RANGE_MIN_LO, A630_GMEM_BASE);
+	probe_write(&gpu, GPU_UCHE_GMEM_RANGE_MIN_HI, 0u);
+	probe_write(&gpu, GPU_UCHE_GMEM_RANGE_MAX_LO, A630_GMEM_BASE + A630_GMEM_SIZE - 1u);
+	probe_write(&gpu, GPU_UCHE_GMEM_RANGE_MAX_HI, 0u);
+	probe_write(&gpu, GPU_UCHE_FILTER_CNTL, 0x804u);
+	probe_write(&gpu, GPU_UCHE_CACHE_WAYS, 0x4u);
+	probe_write(&gpu, GPU_CP_ROQ_THRESHOLDS_2, 0x010000c0u);
+	probe_write(&gpu, GPU_CP_ROQ_THRESHOLDS_1, 0x8040362cu);
+	probe_write(&gpu, GPU_CP_MEM_POOL_SIZE, 128u);
+	probe_write(&gpu, GPU_PC_DBG_ECO_CNTL, 0x300u << 11);
+	probe_write(&gpu, GPU_CP_AHB_CNTL, 0x1u);
+	probe_write(&gpu, GPU_RBBM_PERFCTR_CNTL, 0x1u);
+	probe_write(&gpu, GPU_RB_NC_MODE_CNTL, rb_mode);
+	probe_write(&gpu, GPU_TPL1_NC_MODE_CNTL, tpl1_mode);
+	probe_write(&gpu, GPU_SP_NC_MODE_CNTL, tpl1_mode);
+	probe_write(&gpu, GPU_UCHE_MODE_CNTL, uche_mode);
+	probe_write(&gpu, GPU_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0x001fffffu);
+	probe_write(&gpu, GPU_UCHE_CLIENT_PF, 0x1u);
+
+	probe_write(&gpu, GPU_CP_PROTECT_CNTL, 0x3u);
+	for (protect_index = 0; protect_index < A630_FIXED_PROTECTED_REGS; protect_index++) {
+		const struct polaris_a630_protected_reg *reg = &polaris_a630_protected_regs[protect_index];
+		value = reg->base | (reg->count << 18) | (reg->read_protect << 31);
+		probe_write(&gpu, GPU_CP_PROTECT_REG + protect_index * sizeof(uint32_t), value);
+	}
+	value = protect_base | ((protect_range - 1u) << 18) | (1u << 31);
+	probe_write(&gpu, GPU_CP_PROTECT_REG + protect_index * sizeof(uint32_t), value);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t i = 0; i <= protect_index; i++) {
+		uint32_t expected;
+
+		if (i < A630_FIXED_PROTECTED_REGS) {
+			const struct polaris_a630_protected_reg *reg = &polaris_a630_protected_regs[i];
+			expected = reg->base | (reg->count << 18) | (reg->read_protect << 31);
+		} else {
+			expected = value;
+		}
+		if (probe_read(&gpu, GPU_CP_PROTECT_REG + i * sizeof(uint32_t)) != expected) {
+			goto fault;
+		}
+	}
+
+	if (probe_read(&gpu, GPU_RBBM_CLOCK_CNTL) != A630_RBBM_CLOCK_CNTL_ON ||
+	    probe_read(&gpu, GPU_VBIF_GATE_OFF_WRREQ_EN) != 0x9u ||
+	    probe_read(&gpu, GPU_RBBM_VBIF_CLIENT_QOS_CNTL) != 0x3u ||
+	    probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MIN_LO) != A630_GMEM_BASE ||
+	    probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MAX_LO) != A630_GMEM_BASE + A630_GMEM_SIZE - 1u ||
+	    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_1) != 0x8040362cu ||
+	    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_2) != 0x010000c0u ||
+	    probe_read(&gpu, GPU_CP_PROTECT_CNTL) != 0x3u ||
+	    probe_read(&gpu, GPU_RBBM_INTERFACE_HANG_INT_CNTL) != ((1u << 30) | 0x001fffffu)) {
+		goto fault;
+	}
+	polaris_gpu_core_configured = true;
+	printf("adreno-sdm845: step 18 programmed A630 HWCG, VBIF, 1-MiB GMEM/UCHE, bank-bit %u, and %u CP-protect descriptors; SQE/CP remain stopped\n",
+	    highest_bank_bit, protect_index + 1u);
+	return true;
+
+fault:
+	polaris_gpu_core_configured = false;
+	polaris_smmu_backend_faulted = true;
+	printf("adreno-sdm845: step 18 A630 core initialization/readback failed after hardware writes; GPU OOB remains asserted and backend is faulted\n");
+	return false;
+}
+
+static bool
+polaris_a630_gpu_domain_start(uint32_t step)
+{
+	static bool (*const step_probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core,
+	    probe_firmware, probe_pas_capabilities };
+
+	for (uint32_t i = 0; i < sizeof(step_probes) / sizeof(step_probes[0]); i++) {
+		if (!step_probes[i]()) {
+			printf("adreno-sdm845: step %u prerequisite %u failed; GMU/GX startup is not attempted\n", step, i + 1u);
+			return false;
+		}
+	}
+	if (polaris_gpu_core_ready || polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    polaris_smmu_backend_faulted || !polaris_gpu_cp_software_prepare()) {
+		printf("adreno-sdm845: step %u requires an off GPU core, detached SID0 context, and prepared A630 CP buffers\n", step);
+		return false;
+	}
+	if (!polaris_gmu_hfi_start_stage(step)) {
+		return false;
+	}
+	if (!polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    !polaris_gmu_hfi_send_perf_table() || !polaris_gmu_hfi_send_bw_vote_table() ||
+	    !polaris_gmu_hfi_send_test() || !polaris_gmu_hfi_set_initial_dcvs() ||
+	    !polaris_gmu_temp_bus_vote_set(false)) {
+		polaris_gmu_hfi_stop_after_failure(step);
+		printf("adreno-sdm845: step %u could not attach SID0 or complete GMU bandwidth/DCVS handoff; GX startup remains disabled\n", step);
+		return false;
+	}
+	if (!polaris_gmu_gpu_oob_request()) {
+		polaris_gmu_hfi_stop_after_failure(step);
+		printf("adreno-sdm845: step %u GPU OOB request failed; no A6xx core or CP registers were written\n", step);
+		return false;
+	}
+	if (!probe_core() || !polaris_gpu_core_ready) {
+		polaris_gmu_hfi_stop_after_failure(step);
+		printf("adreno-sdm845: step %u GMU acknowledged GPU power, but GX/GFX3D readback failed; CP remains stopped\n", step);
+		return false;
+	}
+	return true;
 }
 
 void
@@ -5486,44 +5792,23 @@ hakios_adreno_sdm845_init(void)
 		return;
 	}
 	if (last_step == 17) {
-		printf("adreno-sdm845: step 17 explicitly maps the A630 CP buffers, starts GMU/HFI and requests GX power; it leaves core programming and SQE/CP startup for the next stage\n");
-		for (uint32_t i = 0; i < 6; i++) {
-			if (!probes[i]()) {
-				printf("adreno-sdm845: step %u failed; GMU/GX startup is not attempted\n", i + 1);
-				return;
-			}
-		}
-		if (polaris_gpu_core_ready || polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
-		    polaris_smmu_backend_faulted || !polaris_gpu_cp_software_prepare()) {
-			printf("adreno-sdm845: step 17 requires an off GPU core, detached SID0 context, and prepared A630 CP buffers\n");
-			return;
-		}
-		if (!polaris_gmu_hfi_start_stage(17u)) {
-			return;
-		}
-		if (!polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
-		    !polaris_gmu_hfi_send_perf_table() || !polaris_gmu_hfi_send_bw_vote_table() ||
-		    !polaris_gmu_hfi_send_test() || !polaris_gmu_hfi_set_initial_dcvs() ||
-		    !polaris_gmu_temp_bus_vote_set(false)) {
-			polaris_gmu_hfi_stop_after_failure(17u);
-			printf("adreno-sdm845: step 17 could not attach SID0 or complete GMU bandwidth/DCVS handoff; GX and CP startup remain disabled\n");
-			return;
-		}
-		if (!polaris_gmu_gpu_oob_request()) {
-			polaris_gmu_hfi_stop_after_failure(17u);
-			printf("adreno-sdm845: step 17 GPU OOB request failed; no A6xx core or CP registers were written\n");
-			return;
-		}
-		if (!probe_core() || !polaris_gpu_core_ready) {
-			polaris_gmu_hfi_stop_after_failure(17u);
-			printf("adreno-sdm845: step 17 GMU acknowledged GPU power, but GX/GFX3D readback failed; CP remains stopped\n");
+		printf("adreno-sdm845: step 17 explicitly maps the A630 CP buffers, starts GMU/HFI and requests GX power; A6xx core programming and SQE/CP startup remain disabled\n");
+		if (!polaris_a630_gpu_domain_start(17u)) {
 			return;
 		}
 		printf("adreno-sdm845: step 17 finished; GMU/HFI tables and initial DCVS are acknowledged, SID0 maps the SQE/ring/RPTR buffers, and GX/GFX3D is on; GPU OOB keeps the core awake, but A6xx core setup, SQE/CP, ZAP authentication, and rendering remain disabled\n");
 		return;
 	}
-	if (last_step > 17u) {
-		printf("adreno-sdm845: supported explicit stages end at adreno=17; requested step %u is refused\n", last_step);
+	if (last_step == 18) {
+		printf("adreno-sdm845: step 18 performs guarded GMU/GX startup then applies A630 core initialization and CP register protection; SQE/CP remain stopped\n");
+		if (!polaris_a630_gpu_domain_start(18u) || !polaris_a630_gpu_core_initialize()) {
+			return;
+		}
+		printf("adreno-sdm845: step 18 finished; A630 core defaults and protected-register ranges are programmed, GPU OOB remains asserted, and SQE/CP, ZAP authentication, and rendering remain disabled\n");
+		return;
+	}
+	if (last_step > 18u) {
+		printf("adreno-sdm845: supported explicit stages end at adreno=18; requested step %u is refused\n", last_step);
 		return;
 	}
 	printf("adreno-sdm845: Polaris Adreno 630 bring-up, steps 1..%u; step 7 stages ZAP only when explicitly requested\n",
