@@ -174,8 +174,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   does not yet hand bandwidth ownership to GMU DCVS. If SID0 is not eligible, it leaves that route
   untouched. It does not load or authenticate ZAP, submit HFI
   performance/bandwidth tables or default DCVS, start command processing, or enable rendering. On
-  timeout or an incompatible version after CM3 release, it reasserts reset and marks the backend
-  faulted while leaving GMU SID5/SID4 attached.
+  a post-release failure, cleanup reasserts and verifies reset, attempts to detach GMU SID5/SID4 and
+  any attached SID0, and frees CP buffers only after all routes detach and GX remains off. The
+  backend stays faulted; unresolved routes and HFI memory stay allocated.
   This stage has not been invoked on the phone. The sequence follows Qualcomm's A6xx GMU TCM boot
   and HFI queue setup plus its A630 legacy `GMU_INIT`/`FW_VERSION` path
   ([`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/815ef3fd67546132532651279885563ff35a4605/drivers/gpu/msm/adreno_a6xx_gmu.c),
@@ -220,9 +221,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   Rejection of either table,
   `HFI_TEST`, or initial DCVS invokes failure cleanup. Cleanup verifies CM3 reset before releasing
   the temporary Apps RSC DDR vote; after that readback, it attempts to disconnect the GMU SID4/SID5
-  routes, invalidate the ASIDs, blank the two context banks, and restore the original S2CR values.
-  It leaves the backend faulted if any readback or synchronization fails. If
-  reset cannot be confirmed, it retains HFI/OOB/SMMU state and votes. The GX/MX boot-rail vote stays
+  and any attached SID0 routes, invalidate the ASIDs, blank the context banks, and restore the
+  original S2CR values. It clears `firmware_started` only after verified reset so the detach checks
+  can succeed. It leaves the backend faulted if any readback or synchronization fails. If reset
+  cannot be confirmed, it retains HFI/OOB/SMMU state and votes. The GX/MX boot-rail vote stays
   marked active because this failure path does not perform the normal slumber/power-down sequence.
   This write stage has not been run on the phone.
 - `adreno=15` runs read-only steps 1–6, then builds the A630 `CP_ME_INIT` packet (12 dwords) and

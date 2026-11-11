@@ -5386,7 +5386,8 @@ polaris_gmu_hfi_verify_firmware_version(uint32_t *version)
 	return true;
 }
 
-static bool polaris_gmu_hfi_start(void);
+static bool polaris_gmu_hfi_start(uint32_t step);
+static void polaris_gmu_hfi_stop_after_failure(uint32_t step);
 static bool probe_pas_capabilities(void);
 
 static bool
@@ -5411,14 +5412,23 @@ polaris_gmu_hfi_start_stage(uint32_t step)
 	}
 	if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid || !polaris_smmu_gmu_user_route.valid ||
 	    !polaris_smmu_gmu_kernel_attach() || !polaris_smmu_gmu_user_attach()) {
+		if (!polaris_smmu_backend_faulted) {
+			sdm845_gpu_stop();
+		}
 		printf("adreno-sdm845: step %u could not attach both verified GMU SMMUv2 contexts; GMU remains stopped\n", step);
 		return false;
 	}
 	if (polaris_smmu_gpu_route.valid && !polaris_smmu_gpu_attach()) {
+		if (!polaris_smmu_backend_faulted) {
+			sdm845_gpu_stop();
+		}
 		printf("adreno-sdm845: step %u could not attach the clear 3D SID0/CB0 context; GMU remains stopped\n", step);
 		return false;
 	}
-	if (!polaris_gmu_hfi_start()) {
+	if (!polaris_gmu_hfi_start(step)) {
+		if (!polaris_smmu_backend_faulted) {
+			polaris_gmu_hfi_stop_after_failure(step);
+		}
 		printf("adreno-sdm845: step %u GMU/HFI startup did not complete\n", step);
 		return false;
 	}
@@ -5604,7 +5614,7 @@ polaris_gmu_hfi_stop_after_failure(uint32_t step)
 
 /* Boot GMU/HFI with the host DDR vote; the GMU-user and GMU-kernel contexts are both active. */
 static bool
-polaris_gmu_hfi_start(void)
+polaris_gmu_hfi_start(uint32_t step)
 {
 	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL];
 	const struct polaris_smmu_route_candidate *route = &polaris_smmu_gmu_kernel_route;
@@ -5703,22 +5713,14 @@ polaris_gmu_hfi_start(void)
 	}
 	init_result = probe_read(&gmu, GMU_CM3_FW_INIT_RESULT);
 	if (init_result != A630_GMU_FW_READY) {
-		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
-		__asm__ volatile ("dsb sy" ::: "memory");
-		(void)polaris_gmu_temp_bus_vote_set(false);
-		polaris_smmu_backend_faulted = true;
+		polaris_gmu_hfi_stop_after_failure(step);
 		printf("adreno-sdm845: step 12 GMU boot timed out or reported failure (init=%#x); CM3 was reset and rendering remains disabled\n",
 		    init_result);
 		return false;
 	}
 	polaris_gmu_firmware_started = true;
 	if (!polaris_gmu_boot_rail_request()) {
-		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
-		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
-		__asm__ volatile ("dsb sy" ::: "memory");
-		(void)polaris_gmu_temp_bus_vote_set(false);
-		polaris_gmu_firmware_started = false;
-		polaris_smmu_backend_faulted = true;
+		polaris_gmu_hfi_stop_after_failure(step);
 		return false;
 	}
 	probe_write(&gmu, GMU_HFI_CTRL_INIT, 1u);
@@ -5730,30 +5732,18 @@ polaris_gmu_hfi_start(void)
 		delay(A630_GMU_HFI_POLL_DELAY_US);
 	}
 	if ((probe_read(&gmu, GMU_HFI_CTRL_STATUS) & 1u) == 0) {
-		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
-		polaris_gmu_boot_rail_active = false;
-		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
-		__asm__ volatile ("dsb sy" ::: "memory");
-		(void)polaris_gmu_temp_bus_vote_set(false);
-		polaris_gmu_firmware_started = false;
-		polaris_smmu_backend_faulted = true;
+		polaris_gmu_hfi_stop_after_failure(step);
 		printf("adreno-sdm845: step 12 GMU HFI queue initialization timed out; CM3 was reset\n");
 		return false;
 	}
 	hfi_version = probe_read(&gmu, GMU_HFI_VERSION_INFO);
 	if (((hfi_version >> 28) & 0xfu) != 1u || !polaris_gmu_hfi_send_init() ||
 	    !polaris_gmu_hfi_verify_firmware_version(&firmware_version)) {
-		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
-		polaris_gmu_boot_rail_active = false;
-		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
-		__asm__ volatile ("dsb sy" ::: "memory");
-		(void)polaris_gmu_temp_bus_vote_set(false);
-		polaris_gmu_firmware_started = false;
-		polaris_smmu_backend_faulted = true;
 		if (((hfi_version >> 28) & 0xfu) != 1u) {
 			printf("adreno-sdm845: step 12 expected legacy HFI v1 for A630, register reports %#x; CM3 was reset\n",
 			    hfi_version);
 		}
+		polaris_gmu_hfi_stop_after_failure(step);
 		return false;
 	}
 	polaris_gmu_hfi_ready = true;
@@ -8059,10 +8049,16 @@ hakios_adreno_sdm845_init(void)
 			return;
 		}
 		if (!polaris_smmu_gmu_kernel_attach() || !polaris_smmu_gmu_user_attach()) {
+			if (!polaris_smmu_backend_faulted) {
+				sdm845_gpu_stop();
+			}
 			printf("adreno-sdm845: step 11 did not attach both GMU contexts; HFI and firmware remain stopped\n");
 			return;
 		}
 		if (polaris_smmu_gpu_route.valid && !polaris_smmu_gpu_attach()) {
+			if (!polaris_smmu_backend_faulted) {
+				sdm845_gpu_stop();
+			}
 			printf("adreno-sdm845: step 11 failed to attach the eligible 3D SID0/CB0 context; GMU firmware/HFI remain stopped\n");
 			return;
 		}
@@ -8089,14 +8085,23 @@ hakios_adreno_sdm845_init(void)
 		}
 		if (!probe_smmu() || !polaris_smmu_gmu_kernel_route.valid || !polaris_smmu_gmu_user_route.valid ||
 		    !polaris_smmu_gmu_kernel_attach() || !polaris_smmu_gmu_user_attach()) {
+			if (!polaris_smmu_backend_faulted) {
+				sdm845_gpu_stop();
+			}
 			printf("adreno-sdm845: step 12 could not attach both verified GMU SMMUv2 contexts; GMU remains stopped\n");
 			return;
 		}
 		if (polaris_smmu_gpu_route.valid && !polaris_smmu_gpu_attach()) {
+			if (!polaris_smmu_backend_faulted) {
+				sdm845_gpu_stop();
+			}
 			printf("adreno-sdm845: step 12 could not attach the clear 3D SID0/CB0 context; GMU remains stopped\n");
 			return;
 		}
-		if (!polaris_gmu_hfi_start()) {
+		if (!polaris_gmu_hfi_start(12u)) {
+			if (!polaris_smmu_backend_faulted) {
+				sdm845_gpu_stop();
+			}
 			printf("adreno-sdm845: step 12 GMU/HFI startup did not complete; the A630 backend remains disabled\n");
 			return;
 		}
