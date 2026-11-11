@@ -104,9 +104,12 @@ allow it. A successful firmware boot alone is not a completed driver.
 - `adreno=7` now exercises PAS ZAP staging and cleanup: it requires the DT-resolved reserved
   region, affirmative PAS 13 support, the required SCM calls, and already-powered CX/GMU and
   GX/GFX3D clocks. It sends the ELF header plus `.b01` hash metadata to `PAS_INIT_IMAGE`, assigns
-  the aligned image span with `PAS_MEM_SETUP`, copies `.b02`, then shuts PAS down. It deliberately
-  defers `PAS_AUTH_AND_RESET` until the secure GPU SMMU route is verified. This write stage has not
-  been invoked on the device; `ready()` remains false.
+  the aligned image span with `PAS_MEM_SETUP`, copies `.b02`, then shuts PAS down. It does not call
+  `PAS_AUTH_AND_RESET`: Qualcomm's A6xx startup enables SQE and initializes CP first, then
+  authenticates ZAP, submits `CP_SET_SECURE_MODE(0)`, and waits for CP idle. HakiOS does not yet
+  implement that SQE/CP secure-mode transition path, so a verified SID0 route alone is not enough
+  to make standalone authentication safe. This write stage has not been invoked on the device;
+  `ready()` remains false.
 - `adreno=11` is an explicit SMMUv2 write stage. It runs steps 1–6, prepares detached HFI buffers
   and separate GPU, GMU-kernel, and GMU-user page-table roots, then performs a fresh read-only SMMU
   scan. It proceeds only when the runtime DT allows dynamic non-static routes, the SMMU client
@@ -498,9 +501,10 @@ bring-up and a bounded test submission.
    boot-rail OOB, and default DCVS stages are implemented behind explicit `adreno=12`/`adreno=13`/
    `adreno=14`, but none has been run on hardware. Implement SDM845 CX/GX sequencing and clocks,
    then verify the Apps RSC transaction and sustained bandwidth/DCVS behavior against the Polaris
-   kernel. Exercise the PAS
-   stage, verify the secure stream/context,
-   authenticate ZAP, and bring up GMU firmware/HFI. Clean up in reverse on every failure.
+   kernel. Keep step 7 limited to PAS staging and shutdown. After GMU/HFI and GPU domain sequencing
+   are established, add a bounded SQE/CP bootstrap ring and the A630 secure-mode transition before
+   calling `PAS_AUTH_AND_RESET`; verify the CP idle response and unwind PAS, GMU and power state on
+   failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -513,8 +517,13 @@ bring-up and a bounded test submission.
    any SMMU write stage has
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
-   validate A630 CP register protection, bring up GMU and
-   core mappings, ring and fences, and exercise the mapper on-device. Keep the backend disabled
+   bring up the SQE/CP with a bounded bootstrap ring, authenticate ZAP, send
+   `CP_SET_SECURE_MODE(0)`, and wait for CP idle before ordinary command submission. Qualcomm's
+   A6xx path enables SQE and calls `a6xx_cp_init` before ZAP authentication, then uses the CP packet to leave secure mode
+   ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/68a00586559f5fce3bb163f4618f1b71ef05b4e7/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
+   [`adreno_gpu.c`](https://android.googlesource.com/kernel/common/%2B/19b68814b1cd60c40546f31f7cc5b7895c0b013b/drivers/gpu/drm/msm/adreno/adreno_gpu.c)).
+   Continue with production register protection, ring/fence mappings and mapper validation. Keep
+   the backend disabled
    until those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
    command buffers; bounded test commands complete and write back expected data.
@@ -534,8 +543,9 @@ bring-up and a bounded test submission.
 
 - The live SMMU SMR masks, stream-to-context-bank assignments, and whether the secure/GMU streams
   are accessible to this kernel under the phone's hypervisor. Runtime DT now confirms the IDs.
-- The `adreno=6` PAS capability result and `adreno=7` ZAP authentication result on this boot
-  environment. Qualcomm's MDT loader consumes the `.mdt` ELF header, the indexed `.b01` hash
+- The `adreno=6` PAS capability result and `adreno=7` PAS staging result on this boot environment.
+  ZAP authentication is not implemented until SQE/CP startup and the secure-mode transition are
+  available. Qualcomm's MDT loader consumes the `.mdt` ELF header, the indexed `.b01` hash
   metadata, and `.b02` as the sole `PT_LOAD` segment; `.b00` and the combined `.elf` are not part
   of that loader path.
 - The extracted A630 SQE passes upstream's version floor after the 4-byte file prefix is removed;

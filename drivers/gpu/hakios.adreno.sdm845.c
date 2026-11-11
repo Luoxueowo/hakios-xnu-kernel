@@ -10,7 +10,8 @@
  * adreno=14 sends that table and the reconstructed DDR/CNOC bandwidth table, closes the legacy
  * HFI message phase with HFI_TEST, requests initial DCVS, then releases the temporary host DDR vote.
  * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
- * during this bring-up. ZAP authentication, GPU command submission, runtime GPU DCVS,
+ * during this bring-up. ZAP authentication waits for the A6xx SQE/CP initialization and
+ * CP_SET_SECURE_MODE transition path; GPU command submission, runtime GPU DCVS,
  * and rendering are still unavailable, so `ready()` remains false.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
@@ -4859,7 +4860,7 @@ stage_zap_shader(void)
 	uint64_t metadata_phys;
 	volatile uint8_t *memory;
 
-	printf("adreno-sdm845: step 7: stage A630 ZAP metadata/segment through PAS, then shut it down (explicit PAS writes)\n");
+	printf("adreno-sdm845: step 7: stage A630 ZAP metadata/segment through PAS, then shut it down; no AUTH_AND_RESET (explicit PAS writes)\n");
 	if (!polaris_zap_manifest_valid || !polaris_pas_calls_ready || !polaris_pas_gpu_supported ||
 	    polaris_zap_memory_phys == 0 || polaris_zap_memory_size == 0 || polaris_zap_memory_setup_size == 0) {
 		printf("adreno-sdm845: step 7 refused: firmware manifest, PAS 13 support/calls, or reserved memory is not verified\n");
@@ -4959,7 +4960,7 @@ stage_zap_shader(void)
 		printf("adreno-sdm845: step 7 could not release the staged PAS image; it remains active for stop-time cleanup\n");
 		return false;
 	}
-	printf("adreno-sdm845: PAS accepted and released the A630 ZAP staging area; AUTH_AND_RESET is deferred until the secure SMMU route is verified\n");
+	printf("adreno-sdm845: PAS accepted and released the A630 ZAP staging area; AUTH_AND_RESET waits for the SQE/CP secure-mode transition path\n");
 	return true;
 }
 
