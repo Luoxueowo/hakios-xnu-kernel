@@ -9,6 +9,8 @@
  * before booting the GMU and checking its HFI firmware version. adreno=13 sends the A630 HFI performance table;
  * adreno=14 sends that table and the reconstructed DDR/CNOC bandwidth table, closes the legacy
  * HFI message phase with HFI_TEST, requests initial DCVS, then releases the temporary host DDR vote.
+ * Explicit adreno=15 only builds the A630 CP_ME_INIT and CP_SET_SECURE_MODE bootstrap packets in
+ * local memory for inspection; it does not map SQE/ring buffers or write GPU registers.
  * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
  * during this bring-up. ZAP authentication waits for the A6xx SQE/CP initialization and
  * CP_SET_SECURE_MODE transition path; GPU command submission, runtime GPU DCVS,
@@ -78,6 +80,23 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_MDT_HASH(flags)            ((((flags) >> 24) & 7u) == 2u)
 #define A630_MDT_RELOCATABLE            (1u << 27)
 #define POLARIS_PAS_GPU                 13u
+
+/* A630's legacy KGSL A6xx CP_INIT packet and the secure-mode switch packet. */
+#define A630_CP_ME_INIT                 0x48u
+#define A630_CP_SET_SECURE_MODE         0x66u
+#define A630_CP_INIT_ORDINALS           11u
+#define A630_CP_INIT_MAX_CONTEXT        (1u << 0)
+#define A630_CP_INIT_ERROR_DETECTION    (1u << 1)
+#define A630_CP_INIT_HEADER_DUMP        (1u << 2)
+#define A630_CP_INIT_DEFAULT_RESET      (1u << 3)
+#define A630_CP_INIT_UCODE_WORKAROUNDS  (1u << 5)
+#define A630_CP_INIT_OPERATION_MODE     (1u << 6)
+#define A630_CP_INIT_REG_INIT_LIST      (1u << 7)
+#define A630_CP_INIT_MASK               (A630_CP_INIT_MAX_CONTEXT | A630_CP_INIT_ERROR_DETECTION | \
+	A630_CP_INIT_HEADER_DUMP | A630_CP_INIT_DEFAULT_RESET | A630_CP_INIT_UCODE_WORKAROUNDS | \
+	A630_CP_INIT_OPERATION_MODE | A630_CP_INIT_REG_INIT_LIST)
+#define A630_CP_INIT_PACKET_DWORDS      (1u + A630_CP_INIT_ORDINALS)
+#define A630_CP_SECURE_MODE_DWORDS      2u
 
 /*
  * SDM845 GCC GPU clock branches share the GPU register window's prerequisites:
@@ -536,6 +555,77 @@ static bool polaris_gpu_core_ready;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
 static bool polaris_sqe_safe;
+
+static uint32_t
+polaris_pm4_odd_parity(uint32_t value)
+{
+	uint32_t folded = value ^ (value >> 4) ^ (value >> 8) ^ (value >> 12) ^
+	    (value >> 16) ^ (value >> 20) ^ (value >> 24) ^ (value >> 28);
+
+	return (0x9669u >> (folded & 0xfu)) & 1u;
+}
+
+static uint32_t
+polaris_a630_type7_packet(uint32_t opcode, uint32_t count)
+{
+	if (opcode > 0x7fu || count > 0x3fffu) {
+		return 0;
+	}
+	return 0x70000000u | count | (polaris_pm4_odd_parity(count) << 15) |
+	    (opcode << 16) | (polaris_pm4_odd_parity(opcode) << 23);
+}
+
+static bool
+polaris_a630_cp_bootstrap_packets(uint32_t *cp_init, uint32_t cp_init_capacity,
+	uint32_t *secure_mode, uint32_t secure_mode_capacity)
+{
+	uint32_t offset = 0;
+
+	if (cp_init == NULL || cp_init_capacity < A630_CP_INIT_PACKET_DWORDS ||
+	    secure_mode == NULL || secure_mode_capacity < A630_CP_SECURE_MODE_DWORDS) {
+		return false;
+	}
+	cp_init[offset++] = polaris_a630_type7_packet(A630_CP_ME_INIT, A630_CP_INIT_ORDINALS);
+	cp_init[offset++] = A630_CP_INIT_MASK;
+	cp_init[offset++] = 0x00000003u; /* Allow the 3D and 2D hardware contexts. */
+	cp_init[offset++] = 0x20000000u; /* Enable CP register protection/error detection. */
+	cp_init[offset++] = 0u; /* Reserved header-dump address. */
+	cp_init[offset++] = 0u; /* Header dump disabled. */
+	cp_init[offset++] = 0u; /* No SQE workaround mask. */
+	cp_init[offset++] = 0x00000002u; /* A6xx default operation-mode ordinal. */
+	cp_init[offset++] = 0u; /* No power-up register list. */
+	cp_init[offset++] = 0u;
+	cp_init[offset++] = 0u; /* Register-list size, in dwords. */
+	cp_init[offset++] = 0u; /* Pad to A630's fixed 11-ordinal packet. */
+	if (offset != A630_CP_INIT_PACKET_DWORDS || cp_init[0] == 0) {
+		return false;
+	}
+	secure_mode[0] = polaris_a630_type7_packet(A630_CP_SET_SECURE_MODE, 1u);
+	secure_mode[1] = 0u; /* Leave secure mode after PAS authenticates ZAP. */
+	return secure_mode[0] != 0;
+}
+
+static bool
+prepare_a630_cp_bootstrap_packets(void)
+{
+	uint32_t cp_init[A630_CP_INIT_PACKET_DWORDS];
+	uint32_t secure_mode[A630_CP_SECURE_MODE_DWORDS];
+
+	printf("adreno-sdm845: step 15: build A630 CP_ME_INIT and CP_SET_SECURE_MODE payloads in local memory only\n");
+	if (!polaris_sqe_safe || !polaris_a630_cp_bootstrap_packets(cp_init,
+	    sizeof(cp_init) / sizeof(cp_init[0]), secure_mode,
+	    sizeof(secure_mode) / sizeof(secure_mode[0]))) {
+		printf("adreno-sdm845: step 15 requires the validated A630 SQE image and valid PM4 packet buffers\n");
+		return false;
+	}
+	printf("adreno-sdm845: step 15 CP_ME_INIT[%u dwords]:", A630_CP_INIT_PACKET_DWORDS);
+	for (uint32_t i = 0; i < A630_CP_INIT_PACKET_DWORDS; i++) {
+		printf(" %08x", cp_init[i]);
+	}
+	printf("; CP_SET_SECURE_MODE[%u dwords]: %08x %08x; no GPU/SMMU/PAS register or firmware memory was written\n",
+	    A630_CP_SECURE_MODE_DWORDS, secure_mode[0], secure_mode[1]);
+	return true;
+}
 
 static void
 polaris_gpu_va_init(void)
@@ -5131,8 +5221,23 @@ hakios_adreno_sdm845_init(void)
 		printf("adreno-sdm845: step 14 finished; PERF_TBL, BW_VOTE_TBL, HFI_TEST, and default DCVS are acknowledged, and the temporary host DDR vote is released; the boot rail request remains active for later GPU start, while ZAP authentication, CP submission, and rendering remain disabled\n");
 		return;
 	}
+	if (last_step == 15) {
+		printf("adreno-sdm845: step 15 runs read-only probes 1..6 and constructs A630 CP bootstrap packets in local memory only\n");
+		for (uint32_t i = 0; i < 6; i++) {
+			if (!probes[i]()) {
+				printf("adreno-sdm845: step %u failed; CP bootstrap packets were not prepared\n", i + 1);
+				return;
+			}
+		}
+		if (!prepare_a630_cp_bootstrap_packets()) {
+			printf("adreno-sdm845: step 15 failed; GPU/SMMU/PAS hardware remains untouched\n");
+			return;
+		}
+		printf("adreno-sdm845: step 15 finished; command payloads are prepared for review, but SQE/CP are stopped and rendering remains disabled\n");
+		return;
+	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches GMU SID5/SID4, step 12 boots GMU/HFI with the initial rail vote, step 13 sends PERF_TBL, and step 14 sends both HFI tables, HFI_TEST, and initial DCVS; "
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches GMU SID5/SID4, step 12 boots GMU/HFI with the initial rail vote, step 13 sends PERF_TBL, step 14 sends both HFI tables/HFI_TEST/DCVS, and step 15 builds CP packets without hardware writes; "
 		    "requested step %u is capped at %zu in the sequential probe path\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);

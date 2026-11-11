@@ -187,6 +187,14 @@ allow it. A successful firmware boot alone is not a completed driver.
   stop/thermal handling, and rendering remain unavailable. Rejection of either table,
   `HFI_TEST`, or initial DCVS reasserts CM3 reset and marks the backend faulted. This write stage has
   not been run on the phone.
+- `adreno=15` runs read-only steps 1–6, then builds the A630 `CP_ME_INIT` packet (12 dwords) and
+  the `CP_SET_SECURE_MODE(0)` packet (2 dwords) in local stack buffers and prints them for review.
+  The `CP_ME_INIT` ordinals follow the A630 KGSL 4.9 mask and values; the type-7 headers use
+  Qualcomm's opcode/count parity encoding. It does not map SQE or ring memory, write GPU/SMMU
+  registers, issue PAS calls, or start the CP. This is packet construction only, not proof that the
+  GPU accepts the packets
+  ([`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c),
+  [`adreno_pm4types.h`](https://android.googlesource.com/kernel/msm/%2B/android-8.1.0_r0.78/drivers/gpu/msm/adreno_pm4types.h)).
 
 ## Polaris hardware facts
 
@@ -509,8 +517,9 @@ bring-up and a bounded test submission.
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
    maintenance are implemented, with OAS and PTFS_4K checks taken from the read-only ID registers.
-   The local firmware probe validates the ZAP MDT layout and applies the upstream SQE check to the
-   payload after its 4-byte file prefix; the extracted SQE passes the version floor. The read-only
+   Step 15 now constructs the A630 `CP_ME_INIT` and secure-mode packets offline. The local firmware
+   probe validates the ZAP MDT layout and applies the upstream SQE check to the payload after its
+   4-byte file prefix; the extracted SQE passes the version floor. The read-only
    SMMUv2 probe scans stream routes and context registers and produces conditional CB/SMR
    candidates; step 9 builds detached GPU, GMU-kernel, and GMU-user roots and step 11 can install
    GMU routes and a conditional 3D SID0/CB0 route with readback and rollback. Neither step 11 nor
