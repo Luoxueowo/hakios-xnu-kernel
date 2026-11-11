@@ -4496,23 +4496,23 @@ hakios_adreno_sdm845_init(void)
 		}
 		if (!polaris_gmu_hfi_send_perf_table()) {
 			polaris_gmu_hfi_stop_after_table_failure(13u);
-			printf("adreno-sdm845: step 13 failed; BW table, H2F_MSG_START, GX core, CP, and rendering remain disabled\n");
+			printf("adreno-sdm845: step 13 failed; BW table, GX core, CP, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL is acknowledged, while bus votes, H2F_MSG_START, GPU-user/3D routes, ZAP authentication, CP, and rendering remain disabled\n");
+		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL is acknowledged, while bus votes, GPU-user/3D routes, ZAP authentication, CP, and rendering remain disabled; A630 does not use the A640-only HFI START command\n");
 		return;
 	}
 	if (last_step == 14) {
-		printf("adreno-sdm845: step 14 explicitly boots GMU/HFI, then sends the A630 PERF_TBL and reconstructed BW_VOTE_TBL; it does not send H2F_MSG_START or render\n");
+		printf("adreno-sdm845: step 14 explicitly boots GMU/HFI, then sends the A630 PERF_TBL and reconstructed BW_VOTE_TBL; A630 does not use the A640-only HFI START command or render\n");
 		if (!polaris_gmu_hfi_start_stage(14u)) {
 			return;
 		}
 		if (!polaris_gmu_hfi_send_perf_table() || !polaris_gmu_hfi_send_bw_vote_table()) {
 			polaris_gmu_hfi_stop_after_table_failure(14u);
-			printf("adreno-sdm845: step 14 failed; H2F_MSG_START, GPU-user/3D routes, GX core, CP, and rendering remain disabled\n");
+			printf("adreno-sdm845: step 14 failed; GPU-user/3D routes, GX core, CP, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 14 finished; PERF_TBL and BW_VOTE_TBL are acknowledged, while H2F_MSG_START, GPU-user/3D routes, ZAP authentication, GX core, CP, and rendering remain disabled\n");
+		printf("adreno-sdm845: step 14 finished; PERF_TBL and BW_VOTE_TBL are acknowledged, while GPU-user/3D routes, ZAP authentication, GX core, CP, and rendering remain disabled\n");
 		return;
 	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
