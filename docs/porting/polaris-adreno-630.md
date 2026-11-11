@@ -189,9 +189,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   acknowledgement, HakiOS releases any temporary vote through Apps RSC TCS0 with the zero-bandwidth
   row; GMU remains the owner of HFI-described runtime votes. The TCS write path accepts only Apps RSC
   DRV2 v2.7, protects the shared sequencer with `hakios_rsc_lock`, and checks TCS completion and
-  per-command status. ZAP authentication, command processor startup, full
-  hardware-validated recovery, loader-return quiesce, thermal handling, and rendering remain
-  unavailable. Rejection of either table,
+  per-command status. ZAP authentication, command processor startup, recovery, thermal handling,
+  and rendering remain unavailable. Loader-return quiesce is implemented but not hardware-validated.
+  Rejection of either table,
   `HFI_TEST`, or initial DCVS invokes failure cleanup. Cleanup verifies CM3 reset before releasing
   the temporary Apps RSC DDR vote; after that readback, it attempts to disconnect the GMU SID4/SID5
   routes, invalidate the ASIDs, blank the two context banks, and restore the original S2CR values.
@@ -274,8 +274,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   This write stage has not been run on the phone.
 - The A630 backend keeps public-client submission disabled. Step 21 only submits one
   kernel-owned fence, and `ready()` requires a separate client-enable latch that bring-up never
-  raises. Orderly stop now handles that fully initialized diagnostic state; loader-return
-  quiesce is still not implemented, so clients remain disabled.
+  raises. Orderly stop handles that fully initialized diagnostic state, and loader-return
+  quiesce now has a bounded reset/route-fault path. Both remain unvalidated on the phone, so clients
+  stay disabled.
 - `sdm845_gpu_stop()` first confirms the kernel fence and CP are idle, drains all four Polaris
   VBIF XINs, releases the GPU/boot OOB holds, and requests the A630 legacy-HFI slumber state using
   the DT-selected initial performance and bandwidth indices. It checks GMU slumber, CX busy and
@@ -283,8 +284,8 @@ allow it. A successful firmware boot alone is not a completed driver.
   After PAS shutdown it faults and detaches GMU SID4/SID5 and GPU SID0, synchronizes each ASID,
   clears the context bank and restores its original S2CR before releasing private queue buffers.
   Any failed check retains the possibly referenced memory. This path accepts only the complete
-  kernel-owned fence stage; partial startup cleanup and panic/loader-return `quiesce` remain
-  unavailable. Its register sequence is based on Qualcomm's A630 legacy-HFI slumber path and
+  kernel-owned fence stage; partial orderly-start cleanup remains unavailable. Its register
+  sequence is based on Qualcomm's A630 legacy-HFI slumber path and
   no-GBIF bus drain in [`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/b6410c3f75259c0ca2df45a01838d2e46272723e/drivers/gpu/msm/adreno_a6xx_gmu.c) and
   [`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/63407d3081a6b406d94bd7d96ff2ca38fa7df236/drivers/gpu/drm/msm/adreno/a6xx_gpu.c). This implementation has not been run on hardware.
 - The failure-only GMU cleanup now requires CM3 reset readback before touching active SID4/SID5
@@ -296,9 +297,11 @@ allow it. A successful firmware boot alone is not a completed driver.
   has not created its client lock yet, the stop path dispatches directly because no clients can
   exist. The A630 stop hook handles only the completed kernel-owned fence stage and retains all
   hardware-referenced memory if CP idle, VBIF drain, GMU slumber, power-off, reset, PAS shutdown,
-  or SMMU detach cannot be confirmed. Its panic/loader-return `quiesce` hook is still missing, and
-  partial startup cleanup is not implemented. Do not run write stages on-device or treat a return
-  to the loader as safe until those paths are implemented and validated.
+  or SMMU detach cannot be confirmed. Panic/loader-return `quiesce` uses bounded MMIO/SMC
+  operations; if it cannot prove the DMA routes are isolated, it fail-stops rather than returning
+  control while the loader may reuse memory. Partial orderly-start cleanup is not implemented.
+  Neither shutdown path has been run on-device; do not run write stages on-device until they are
+  validated.
 
 ## Polaris hardware facts
 
@@ -560,8 +563,8 @@ shared service and lifecycle hooks through the selected backend. Redwood keeps i
 implementation behind that boundary. Polaris selects its own profile and a not-ready operations
 table. Its software map, commit, unmap and cache-maintenance callbacks are implemented; GMU
 firmware/HFI startup and initial ARC/DCVS requests are staged, while complete CX/GX sequencing,
-hardware validation of GMU-user/3D SMMU attachment, hardware-validated recovery, loader-return
-quiesce and thermal hooks are still missing. An orderly stop path exists for the fully initialized
+hardware validation of GMU-user/3D SMMU attachment, hardware-validated orderly stop and quiesce,
+recovery and thermal hooks are still missing. The orderly stop path handles the fully initialized
 kernel-owned fence stage, but has not been run on a phone.
 The A630 backend now has dormant `submit`, `done`, `last`, and `report` callbacks: submit builds
 the A6xx CCU-invalidate / `CP_INDIRECT_BUFFER_PFE` / `CACHE_FLUSH_TS` sequence, validates each IB
@@ -643,9 +646,9 @@ bounded hardware submission checks.
    production ring/fence callbacks are now implemented from the upstream A6xx submit ordering
    ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)); they have not been exercised on hardware. Next validate the packets,
    fence visibility, register protection and ring mappings on Polaris, then implement and validate
-   orderly stop path before accepting client submissions; add partial-start cleanup and
-   loader-return quiesce. The stop path does not yet remove all inherited CX/GMU parent-domain and
-   clock votes.
+   orderly stop path before accepting client submissions; validate loader-return quiesce and add
+   orderly partial-start cleanup. The stop path does not yet remove all inherited CX/GMU
+   parent-domain and clock votes.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; orderly stop and loader-return quiesce are validated on the phone.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -712,8 +715,9 @@ bounded hardware submission checks.
   SID4/SID5/SID0 and releases private CP buffers. `gmu_domain_ready` remains only an initial
   availability observation. A failed check leaves the affected resources attached. The normal
   stop path does not perform full CX/GMU rail, RPMh, clock or parent-domain power removal, and it
-  does not recover a hung GMU. Partial-start cleanup and panic/loader-return `quiesce` are still
-  open. Qualcomm's A630 legacy-HFI request and no-GBIF XIN drain are referenced in
+  does not recover a hung GMU. Partial orderly-start cleanup remains open; the panic/loader-return
+  `quiesce` implementation still needs device validation. Qualcomm's A630 legacy-HFI request and
+  no-GBIF XIN drain are referenced in
   [`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/b6410c3f75259c0ca2df45a01838d2e46272723e/drivers/gpu/msm/adreno_a6xx_gmu.c) and
   [`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/63407d3081a6b406d94bd7d96ff2ca38fa7df236/drivers/gpu/drm/msm/adreno/a6xx_gpu.c); the Polaris implementation is not hardware-validated.
 

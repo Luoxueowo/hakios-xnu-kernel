@@ -356,6 +356,7 @@ extern lck_mtx_t hakios_rsc_lock;
 #define GPU_CP_RB_RPTR                  GPU_WORD(0x0806)
 #define GPU_CP_RB_WPTR                  GPU_WORD(0x0807)
 #define GPU_CP_SQE_CNTL                 GPU_WORD(0x0808)
+#define GPU_RBBM_SW_RESET_CMD            GPU_WORD(0x0043)
 #define GPU_CP_SQE_INSTR_BASE_LO        GPU_WORD(0x0830)
 #define GPU_CP_SQE_INSTR_BASE_HI        GPU_WORD(0x0831)
 #define GPU_RBBM_CLOCK_CNTL             GPU_WORD(0x00ae)
@@ -393,6 +394,7 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_VBIF_XIN_HALT_MASK          0x0000000fu
 #define A630_STOP_TIMEOUT_US              100000u
 #define A630_STOP_POLL_US                 100u
+#define A630_QUIESCE_POLL_LIMIT           100000u
 #define A630_GMEM_BASE                  0x00100000u
 #define A630_GMEM_SIZE                  0x00100000u
 #define A630_HIGHEST_BANK_BIT           15u
@@ -973,6 +975,7 @@ static bool sdm845_gpu_done(uint32_t fence);
 static uint32_t sdm845_gpu_last(void);
 static void sdm845_gpu_report(const char *why);
 static void sdm845_gpu_stop(void);
+static void sdm845_gpu_quiesce(void);
 static bool polaris_a630_cp_idle_for_stop(void);
 static bool polaris_a630_vbif_drain_for_stop(void);
 static bool polaris_a630_gmu_request_slumber(void);
@@ -995,6 +998,7 @@ sdm845_gpu_ready(void)
 const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
 	.ready = sdm845_gpu_ready,
 	.parameter = hakios_gpu_profile_parameter,
+	.quiesce = sdm845_gpu_quiesce,
 	.address = sdm845_gpu_address,
 	.address_free = sdm845_gpu_address_free,
 	.map = sdm845_gpu_map,
@@ -1006,7 +1010,6 @@ const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
 	.last = sdm845_gpu_last,
 	.report = sdm845_gpu_report,
 	.stop = sdm845_gpu_stop,
-	/* SMMU translations are software-only until a verified context and stream are attached. */
 };
 
 static bool
@@ -2446,6 +2449,88 @@ polaris_smmu_gpu_context_detach(void)
 {
 	return polaris_smmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
 	    &polaris_smmu_gpu_route, 0u, "GPU");
+}
+
+/* Panic/loader-return path: no printf, allocation, or sleeping; leave the stream faulted. */
+static bool
+polaris_smmu_quiesce_route(struct polaris_smmu_address_space *space,
+	const struct polaris_smmu_route_candidate *route)
+{
+	uint32_t current_s2cr, fault_s2cr, bank, context;
+	uint64_t context_offset;
+
+	if (space == NULL || route == NULL || !route->valid || smmu.virtual == 0 ||
+	    route->slot >= POLARIS_SMMU_MAX_CONTEXT_BANKS || SMMU_S2CR(route->slot) + sizeof(uint32_t) > smmu.size ||
+	    (route->stream_matching && SMMU_SMR(route->slot) + sizeof(uint32_t) > polaris_smmu_context_base)) {
+		return false;
+	}
+	current_s2cr = probe_read(&smmu, SMMU_S2CR(route->slot));
+	fault_s2cr = current_s2cr & ~SMMU_S2CR_TYPE_FIELD_MASK;
+	fault_s2cr |= SMMU_S2CR_TYPE_FAULT << SMMU_S2CR_TYPE_SHIFT;
+	probe_write(&smmu, SMMU_S2CR(route->slot), fault_s2cr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, SMMU_S2CR(route->slot)) != fault_s2cr) {
+		return false;
+	}
+	if (!space->context_active) {
+		return true;
+	}
+	bank = space->context_bank;
+	if (bank >= polaris_smmu_context_bank_count || polaris_smmu_context_page_size == 0 ||
+	    SMMU_CBAR(bank) + sizeof(uint32_t) > polaris_smmu_context_base ||
+	    SMMU_CBA2R(bank) + sizeof(uint32_t) > polaris_smmu_context_base) {
+		return false;
+	}
+	context_offset = (uint64_t)polaris_smmu_context_base + (uint64_t)bank * polaris_smmu_context_page_size;
+	if (context_offset + polaris_smmu_context_page_size > smmu.size || context_offset > UINT32_MAX) {
+		return false;
+	}
+	context = (uint32_t)context_offset;
+	probe_write(&smmu, context + SMMU_CB_SCTLR, 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, context + SMMU_CB_SCTLR) != 0) {
+		return false;
+	}
+	probe_write(&smmu, context + SMMU_CB_TLBIASID, space->asid);
+	probe_write(&smmu, context + SMMU_CB_TLBSYNC, 1u);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t poll = 0; poll < A630_QUIESCE_POLL_LIMIT; poll++) {
+		if ((probe_read(&smmu, context + SMMU_CB_TLBSTATUS) & 1u) == 0) {
+			break;
+		}
+		if (poll + 1u == A630_QUIESCE_POLL_LIMIT) {
+			return false;
+		}
+	}
+	probe_write(&smmu, context + SMMU_CB_ACTLR, 0);
+	probe_write64(&smmu, context + SMMU_CB_TTBR0, 0);
+	probe_write64(&smmu, context + SMMU_CB_TTBR1, 0);
+	probe_write(&smmu, context + SMMU_CB_TCR, 0);
+	probe_write(&smmu, context + SMMU_CB_TCR2, 0);
+	probe_write(&smmu, context + SMMU_CB_CONTEXTIDR, 0);
+	probe_write(&smmu, context + SMMU_CB_MAIR0, 0);
+	probe_write(&smmu, context + SMMU_CB_MAIR1, 0);
+	probe_write(&smmu, SMMU_CBAR(bank), 0);
+	probe_write(&smmu, SMMU_CBA2R(bank), 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, context + SMMU_CB_ACTLR) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR0) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR0 + 4u) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR1) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR1 + 4u) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_TCR) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_TCR2) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_CONTEXTIDR) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_MAIR0) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_MAIR1) != 0 ||
+	    probe_read(&smmu, SMMU_CBAR(bank)) != 0 || probe_read(&smmu, SMMU_CBA2R(bank)) != 0) {
+		return false;
+	}
+	space->context_active = false;
+	space->context_bank = UINT32_MAX;
+	polaris_smmu_context_routed[bank] = false;
+	polaris_smmu_context_blank[bank] = polaris_smmu_context_is_blank(bank);
+	return true;
 }
 
 static bool
@@ -5534,6 +5619,171 @@ polaris_pas_shutdown(void)
 	polaris_zap_authenticated = false;
 	polaris_pas_metadata_free();
 	return true;
+}
+
+static __attribute__((noreturn)) void
+polaris_a630_quiesce_fail_stop(void)
+{
+	/* The loader will reuse kernel memory; do not hand control back with a live DMA path. */
+	for (;;) {
+		__asm__ volatile ("nop" ::: "memory");
+	}
+}
+
+/* Panic/loader-return path: only bounded MMIO/SMC operations; never print, sleep, or allocate. */
+static void
+sdm845_gpu_quiesce(void)
+{
+	struct polaris_smmu_address_space *gpu_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
+	struct polaris_smmu_address_space *gmu_kernel_space =
+	    &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL];
+	struct polaris_smmu_address_space *gmu_user_space =
+	    &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER];
+	bool gpu_engine_active = polaris_gpu_core_configured || polaris_gpu_cp_started;
+	bool gmu_engine_active = polaris_gmu_firmware_started || polaris_gmu_hfi_ready ||
+	    polaris_gmu_boot_rail_active || polaris_gmu_temp_bus_vote_active || polaris_gpu_oob_active;
+	bool gpu_route_needed = gpu_engine_active || gpu_space->context_active;
+	bool gmu_route_needed = gmu_engine_active || gmu_kernel_space->context_active || gmu_user_space->context_active;
+	bool gpu_core_accessible = false;
+	bool pas_active = polaris_pas_image_active;
+	bool safe = true;
+
+	if (!gpu_engine_active && !gmu_engine_active && !gpu_route_needed && !gmu_route_needed && !pas_active) {
+		return;
+	}
+	polaris_gpu_client_submission_enabled = false;
+	polaris_gpu_ring_submit_ready = false;
+	if (gpu_engine_active) {
+		if (gpucc.virtual == 0) {
+			safe = false;
+		} else {
+			uint32_t gx = probe_read(&gpucc, GPUCC_GX_GDSCR);
+			uint32_t clock = probe_read(&gpucc, GPUCC_GX_GFX3D_CBCR);
+			uint32_t clock_state = clock & (CBCR_ENABLE | CBCR_OFF);
+
+			if ((gx & GDSC_POWER_ON) == 0 && clock_state == CBCR_OFF) {
+				/* Both power and clock report off; no GPU MMIO is needed. */
+			} else if ((gx & GDSC_POWER_ON) != 0 && clock_state == CBCR_ENABLE && gpu.virtual != 0) {
+				bool xin_drained = false;
+				gpu_core_accessible = true;
+				probe_write(&gpu, GPU_VBIF_XIN_HALT_CTRL0, A630_VBIF_XIN_HALT_MASK);
+				__asm__ volatile ("dsb sy" ::: "memory");
+				for (uint32_t poll = 0; poll < A630_QUIESCE_POLL_LIMIT; poll++) {
+					if ((probe_read(&gpu, GPU_VBIF_XIN_HALT_CTRL1) & A630_VBIF_XIN_HALT_MASK) ==
+					    A630_VBIF_XIN_HALT_MASK) {
+						xin_drained = true;
+						break;
+					}
+				}
+				if (!xin_drained) {
+					safe = false;
+				}
+			} else {
+				/* A transitional or contradictory GPUCC state cannot prove DMA has stopped. */
+				safe = false;
+			}
+		}
+	}
+	if (gmu_engine_active) {
+		if (gmu.virtual == 0) {
+			safe = false;
+		} else {
+			probe_write(&gmu, GMU_GMU2HOST_INTR_CLR,
+			    A630_GMU_OOB_GPU_ACK_MASK | A630_GMU_OOB_BOOT_ACK_MASK | A630_GMU_OOB_DCVS_ACK_MASK);
+			polaris_gmu_oob_clear(A630_GMU_OOB_GPU_ACK_MASK | A630_GMU_OOB_BOOT_ACK_MASK |
+			    A630_GMU_OOB_DCVS_ACK_MASK);
+			probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			if ((probe_read(&gmu, GMU_CM3_SYSRESET) & 1u) == 0) {
+				safe = false;
+			} else {
+				polaris_gmu_firmware_started = false;
+				polaris_gmu_hfi_ready = false;
+				polaris_gmu_hfi_sealed = false;
+				polaris_gmu_hfi_perf_table_ready = false;
+				polaris_gmu_hfi_bw_table_ready = false;
+				polaris_gpu_oob_active = false;
+				polaris_hfi_state.initialized = false;
+			}
+		}
+	}
+	if (polaris_gpu_sptprac_enabled_by_driver) {
+		if (gmu.virtual == 0) {
+			safe = false;
+		} else {
+			uint32_t sptprac = GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD);
+			probe_write(&gmu, sptprac, probe_read(&gmu, sptprac) & ~1u);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			if ((probe_read(&gmu, sptprac) & 1u) != 0) {
+				safe = false;
+			} else {
+				polaris_gpu_sptprac_enabled_by_driver = false;
+			}
+		}
+	}
+	if (gpu_core_accessible) {
+		if (gpucc.virtual == 0 || (probe_read(&gpucc, GPUCC_GX_GDSCR) & GDSC_POWER_ON) == 0 ||
+		    (probe_read(&gpucc, GPUCC_GX_GFX3D_CBCR) & (CBCR_ENABLE | CBCR_OFF)) != CBCR_ENABLE) {
+			gpu_core_accessible = false;
+		}
+	}
+	if (gpu_core_accessible) {
+		bool core_idle = false;
+		probe_write(&gpu, GPU_RBBM_SW_RESET_CMD, 1u);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		(void)probe_read(&gpu, GPU_RBBM_SW_RESET_CMD);
+		probe_write(&gpu, GPU_RBBM_SW_RESET_CMD, 0u);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		for (uint32_t poll = 0; poll < A630_QUIESCE_POLL_LIMIT; poll++) {
+			if ((probe_read(&gpu, GPU_RBBM_STATUS) & A630_RBBM_CP_BUSY_MASK) == 0) {
+				core_idle = true;
+				break;
+			}
+		}
+		if (!core_idle) {
+			safe = false;
+		}
+	}
+	if (gpu_route_needed) {
+		if (!polaris_smmu_quiesce_route(gpu_space, &polaris_smmu_gpu_route)) {
+			safe = false;
+		}
+	}
+	if (gmu_route_needed) {
+		if (!polaris_smmu_quiesce_route(gmu_user_space, &polaris_smmu_gmu_user_route)) {
+			safe = false;
+		}
+		if (!polaris_smmu_quiesce_route(gmu_kernel_space, &polaris_smmu_gmu_kernel_route)) {
+			safe = false;
+		}
+	}
+	if (pas_active) {
+		int32_t status = -1;
+		uint64_t answer = UINT64_MAX;
+		uint64_t function = POLARIS_SCM_SIP | polaris_pas_scm_width | POLARIS_SCM_PAS_SHUTDOWN;
+
+		if (!polaris_pas_calls_ready ||
+		    !polaris_scm_call(function, POLARIS_SCM_ONE_VALUE, POLARIS_PAS_GPU, 0, 0, &status, &answer) ||
+		    status != 0 || answer != 0) {
+			safe = false;
+		} else {
+			polaris_pas_image_active = false;
+			polaris_zap_authenticated = false;
+		}
+	}
+	if (!safe) {
+		polaris_a630_quiesce_fail_stop();
+	}
+	polaris_gpu_core_ready = false;
+	polaris_gpu_core_configured = false;
+	polaris_gpu_cp_started = false;
+	polaris_gpu_cp_initialized = false;
+	polaris_gpu_unsecured_mode = false;
+	polaris_gpu_fence_smoke_test_done = false;
+	polaris_gpu_ring_write_pointer = 0;
+	polaris_gpu_last_fence = 0;
+	polaris_gmu_slumber_confirmed = false;
+	polaris_gmu_cm3_reset_confirmed = false;
 }
 
 static bool
