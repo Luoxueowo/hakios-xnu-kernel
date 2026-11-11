@@ -57,10 +57,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   name, and memory-region relationship
   ([`sdm845-gpu.dtsi`](https://android.googlesource.com/kernel/msm/+/refs/heads/android-msm-baiji-4.9-pie-wear-dr/arch/arm64/boot/dts/qcom/sdm845-gpu.dtsi)).
 - Before an `adreno=` probe or `gpu=1` request maps any block, the SDM845 backend now checks the
-  live device tree's Polaris GPU compatible/chip ID, the exact GPU/GPUCC/GMU/SMMUv2 `reg` windows,
-  SMMU phandle and 3-level-table flags, `gfx3d_user` GPU offset, and the user/secure/GMU stream
-  tuples. Missing or mismatched entries abort the request before GPU MMIO access. The SMMU probe
-  uses the validated runtime stream IDs when hardware reports indexed stream routing.
+  live device tree's Polaris GPU compatible/chip ID, the exact GPU/GPUCC/GFXCC/GMU/SMMUv2 `reg`
+  windows, GPU and GMU clock names/specifiers/provider phandles, shared GPU/GMU supply domains,
+  GPUCC CX/MX and GFXCC GFX regulator links, SMMU phandle and 3-level-table flags, `gfx3d_user`
+  GPU offset, and the user/secure/GMU stream tuples. Missing or mismatched entries abort the
+  request before GPU MMIO access. The SMMU probe uses the validated runtime stream IDs when
+  hardware reports indexed stream routing.
 - `adreno=6` now asks TrustZone whether the SCM availability query and PAS 13 calls are exposed,
   then asks whether GPU image 13 is supported. It does not submit a firmware header or image and
   does not write GPU registers. This query has not yet run under HakiOS on the phone.
@@ -120,6 +122,17 @@ The probe calculates the context-bank aperture as `2^(NUMPAGENDXB+1) * register-
 checks it against the device-tree `reg` extent before reading context registers.
 The v2 SMMU at `0x05040000` is not interchangeable with the Redwood driver's SMMUv500 at
 `0x03da0000`.
+
+The runtime clock tree is split across four providers: the core's `core_clk` comes from GFXCC,
+the GMU and RBBM timer clocks come from GPUCC, the GPU/GMU AXI and MEMNOC clocks come from GCC,
+and `l3_vote` comes from CPUCC. The GPU and GMU nodes' `vddcx`/`vdd` supplies resolve to the CX/GX
+GDSC nodes at `0x0509106c`/`0x0509100c`; their parent supplies resolve to GPUCC's CX rail and
+GFXCC's GFX rail. GPUCC also names a separate MX rail. The preflight now resolves these GDSC
+phandles, parent links, controller rails, and every clock tuple before allowing later stages.
+Qualcomm's SDM845 GPUCC source marks CX GDSC as votable and gives GX GDSC a no-op CPU power-on
+callback because the GMU controls GX; HakiOS must preserve that ownership rather than force the GX
+switch from the CPU
+([`gpucc-sdm845.c`](https://android.googlesource.com/kernel/common/+/b4ec805464a4a0299216a003278351d0b4806450/drivers/clk/qcom/gpucc-sdm845.c)).
 
 The local firmware set is `a630_gmu.bin`, `a630_sqe.fw`, and `a630_zap.{mdt,b00,b01,b02,elf}`.
 The `mdt` describes three program headers, with a single loadable segment matching `b02`; the
@@ -193,8 +206,9 @@ bring-up and a bounded test submission.
 2. **Separate the backends.** Extract a small shared backend contract and retain Redwood as an
    unchanged profile. The initial dispatcher selects the SDM845 backend from the SoC peripheral
    base (`0x00100000`) and rejects unknown bases before any Redwood GPU access. The diagnostic now
-   validates the runtime device tree's A630 chip ID, GPU/GPUCC/GMU/SMMU resource windows, and
-   IOMMU stream tuples before MMIO; still verify the powered GPU's hardware identity before writes.
+   validates the runtime device tree's A630 chip ID, GPU/GPUCC/GFXCC/GMU/SMMUv2 resource windows,
+   clock providers/specifiers, supply links, and IOMMU stream tuples before MMIO; still verify the
+   powered GPU's hardware identity before writes.
    **Gate:** both profiles build; selecting an unknown SoC touches no GPU register.
 3. **Read-only bring-up.** The initial A630-specific, boot-argument-gated reads are in place.
    Refine them against hardware logs and add any required clock/precondition checks before adding

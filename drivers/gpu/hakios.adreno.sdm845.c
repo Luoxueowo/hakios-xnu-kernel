@@ -52,6 +52,11 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_GPU_DT_PATH             "/soc/qcom,kgsl-3d0@5000000"
 #define POLARIS_GMU_DT_PATH             "/soc/qcom,gmu"
 #define POLARIS_GPUCC_DT_PATH           "/soc/qcom,gpucc@5090000"
+#define POLARIS_GFXCC_DT_PATH           "/soc/qcom,gfxcc@5090000"
+#define POLARIS_GPU_CX_GDSC_DT_PATH     "/soc/qcom,gdsc@0x509106c"
+#define POLARIS_GPU_GX_GDSC_DT_PATH     "/soc/qcom,gdsc@0x509100c"
+#define POLARIS_GCC_DT_PATH             "/soc/qcom,gcc@100000"
+#define POLARIS_CPUCC_DT_PATH           "/soc/qcom,cpucc@0x17d41000"
 #define POLARIS_SMMU_DT_PATH            "/soc/arm,smmu-kgsl@5040000"
 #define POLARIS_PIL_GPU_DT_PATH         "/soc/qcom,kgsl-hyp"
 #define POLARIS_GPU_MEMORY_DT_PATH      "/reserved-memory/gpu_region@0x8c415000"
@@ -492,6 +497,60 @@ polaris_dt_string_equals(DTEntry node, const char *name, const char *expected)
 }
 
 static bool
+polaris_dt_string_list_equals(DTEntry node, const char *name, const char *const *expected, uint32_t expected_count)
+{
+	const uint8_t *property;
+	unsigned int size = 0, offset = 0;
+
+	if (SecureDTGetProperty(node, name, (const void **)&property, &size) != kSuccess || property == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < expected_count; i++) {
+		size_t length = strlen(expected[i]) + 1;
+
+		if (offset > size || length > size - offset || memcmp(property + offset, expected[i], length - 1) != 0 ||
+		    property[offset + length - 1] != '\0') {
+			return false;
+		}
+		offset += (unsigned int)length;
+	}
+	return offset == size;
+}
+
+struct polaris_dt_clock_spec {
+	const char *provider_path;
+	uint32_t clock_id;
+};
+
+static bool
+polaris_dt_clocks_match(DTEntry node, const char *name, const struct polaris_dt_clock_spec *expected,
+	uint32_t expected_count)
+{
+	const uint8_t *property;
+	unsigned int size = 0;
+
+	if (SecureDTGetProperty(node, name, (const void **)&property, &size) != kSuccess || property == NULL ||
+	    size != expected_count * 8u) {
+		return false;
+	}
+	for (uint32_t i = 0; i < expected_count; i++) {
+		DTEntry provider = NULL;
+		uint32_t phandle;
+		uint32_t actual_phandle = polaris_dt_be32(property + i * 8u);
+		uint32_t actual_id = polaris_dt_be32(property + i * 8u + 4u);
+
+		if (SecureDTLookupEntry(NULL, expected[i].provider_path, &provider) != kSuccess || provider == NULL ||
+		    !polaris_dt_get_u32(provider, "phandle", &phandle) || actual_phandle != phandle ||
+		    actual_id != expected[i].clock_id) {
+			printf("adreno-sdm845: runtime %s clock %u is provider=%#x id=%u; expected %s/%u\n", name, i,
+			    actual_phandle, actual_id, expected[i].provider_path, expected[i].clock_id);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
 polaris_dt_has_reg64(DTEntry node, uint64_t address, uint64_t length)
 {
 	const uint8_t *reg;
@@ -661,9 +720,83 @@ polaris_dt_node_matches(const char *path, const char *compatible, uint32_t addre
 }
 
 static bool
+polaris_runtime_power_validate(DTEntry gpu_node, DTEntry gmu_node)
+{
+	static const char *const gpu_clock_names[] = {
+		"core_clk", "rbbmtimer_clk", "mem_clk", "mem_iface_clk", "gmu_clk", "l3_vote",
+	};
+	static const struct polaris_dt_clock_spec gpu_clocks[] = {
+		{ POLARIS_GFXCC_DT_PATH, 3 },  /* GPU_CC_GX_GFX3D_CLK */
+		{ POLARIS_GPUCC_DT_PATH, 10 }, /* GPU_CC_CXO_CLK */
+		{ POLARIS_GCC_DT_PATH, 26 },   /* GCC_DDRSS_GPU_AXI_CLK */
+		{ POLARIS_GCC_DT_PATH, 41 },   /* GCC_GPU_MEMNOC_GFX_CLK */
+		{ POLARIS_GPUCC_DT_PATH, 4 },  /* GPU_CC_CX_GMU_CLK */
+		{ POLARIS_CPUCC_DT_PATH, 16 }, /* L3_GPU_VOTE_CLK */
+	};
+	static const char *const gmu_clock_names[] = {
+		"gmu_clk", "cxo_clk", "axi_clk", "memnoc_clk",
+	};
+	static const struct polaris_dt_clock_spec gmu_clocks[] = {
+		{ POLARIS_GPUCC_DT_PATH, 4 },  /* GPU_CC_CX_GMU_CLK */
+		{ POLARIS_GPUCC_DT_PATH, 10 }, /* GPU_CC_CXO_CLK */
+		{ POLARIS_GCC_DT_PATH, 26 },   /* GCC_DDRSS_GPU_AXI_CLK */
+		{ POLARIS_GCC_DT_PATH, 41 },   /* GCC_GPU_MEMNOC_GFX_CLK */
+	};
+	static const char *const regulator_names[] = { "vddcx", "vdd" };
+	DTEntry gpucc_node = NULL, gfxcc_node = NULL;
+	DTEntry cx_gdsc_node = NULL, gx_gdsc_node = NULL;
+	uint32_t gpu_vddcx, gpu_vdd, gmu_vddcx, gmu_vdd;
+	uint32_t gpucc_vddcx, gpucc_vddmx, gfxcc_vddgfx, cx_parent, gx_parent;
+	uint32_t cx_gdsc_phandle, gx_gdsc_phandle, cx_clk_dis_wait;
+
+	if (!polaris_dt_node_matches(POLARIS_GFXCC_DT_PATH, "qcom,gfxcc-sdm845-v2", POLARIS_GPUCC_PHYS,
+	    POLARIS_GPUCC_SIZE) ||
+	    !polaris_dt_node_matches(POLARIS_GPU_CX_GDSC_DT_PATH, "qcom,gdsc", 0x0509106cu, 4) ||
+	    !polaris_dt_node_matches(POLARIS_GPU_GX_GDSC_DT_PATH, "qcom,gdsc", 0x0509100cu, 4) ||
+	    SecureDTLookupEntry(NULL, POLARIS_GPUCC_DT_PATH, &gpucc_node) != kSuccess || gpucc_node == NULL ||
+	    SecureDTLookupEntry(NULL, POLARIS_GFXCC_DT_PATH, &gfxcc_node) != kSuccess || gfxcc_node == NULL ||
+	    SecureDTLookupEntry(NULL, POLARIS_GPU_CX_GDSC_DT_PATH, &cx_gdsc_node) != kSuccess || cx_gdsc_node == NULL ||
+	    SecureDTLookupEntry(NULL, POLARIS_GPU_GX_GDSC_DT_PATH, &gx_gdsc_node) != kSuccess || gx_gdsc_node == NULL ||
+	    !polaris_dt_string_list_equals(gpu_node, "clock-names", gpu_clock_names,
+	    sizeof(gpu_clock_names) / sizeof(gpu_clock_names[0])) ||
+	    !polaris_dt_clocks_match(gpu_node, "clocks", gpu_clocks, sizeof(gpu_clocks) / sizeof(gpu_clocks[0])) ||
+	    !polaris_dt_string_list_equals(gmu_node, "clock-names", gmu_clock_names,
+	    sizeof(gmu_clock_names) / sizeof(gmu_clock_names[0])) ||
+	    !polaris_dt_clocks_match(gmu_node, "clocks", gmu_clocks, sizeof(gmu_clocks) / sizeof(gmu_clocks[0])) ||
+	    !polaris_dt_string_list_equals(gpu_node, "regulator-names", regulator_names,
+	    sizeof(regulator_names) / sizeof(regulator_names[0])) ||
+	    !polaris_dt_string_list_equals(gmu_node, "regulator-names", regulator_names,
+	    sizeof(regulator_names) / sizeof(regulator_names[0])) ||
+	    !polaris_dt_get_u32(gpu_node, "vddcx-supply", &gpu_vddcx) ||
+	    !polaris_dt_get_u32(gpu_node, "vdd-supply", &gpu_vdd) ||
+	    !polaris_dt_get_u32(gmu_node, "vddcx-supply", &gmu_vddcx) ||
+	    !polaris_dt_get_u32(gmu_node, "vdd-supply", &gmu_vdd) ||
+	    !polaris_dt_get_u32(gpucc_node, "vdd_cx-supply", &gpucc_vddcx) ||
+	    !polaris_dt_get_u32(gpucc_node, "vdd_mx-supply", &gpucc_vddmx) ||
+	    !polaris_dt_get_u32(gfxcc_node, "vdd_gfx-supply", &gfxcc_vddgfx) || gpu_vddcx == 0 || gpu_vdd == 0 ||
+	    !polaris_dt_get_u32(cx_gdsc_node, "phandle", &cx_gdsc_phandle) ||
+	    !polaris_dt_get_u32(gx_gdsc_node, "phandle", &gx_gdsc_phandle) ||
+	    !polaris_dt_get_u32(cx_gdsc_node, "parent-supply", &cx_parent) ||
+	    !polaris_dt_get_u32(gx_gdsc_node, "parent-supply", &gx_parent) ||
+	    !polaris_dt_get_u32(cx_gdsc_node, "qcom,clk-dis-wait-val", &cx_clk_dis_wait) ||
+	    !polaris_dt_string_equals(cx_gdsc_node, "regulator-name", "gpu_cx_gdsc") ||
+	    !polaris_dt_string_equals(gx_gdsc_node, "regulator-name", "gpu_gx_gdsc") ||
+	    gpu_vddcx != cx_gdsc_phandle || gpu_vdd != gx_gdsc_phandle ||
+	    gmu_vddcx != gpu_vddcx || gmu_vdd != gpu_vdd || gpu_vddcx == gpu_vdd || gpucc_vddcx == 0 ||
+	    gpucc_vddmx == 0 || gfxcc_vddgfx == 0 || cx_parent != gpucc_vddcx || gx_parent != gfxcc_vddgfx ||
+	    gpucc_vddcx == gpucc_vddmx || cx_clk_dis_wait != 8 ||
+	    gfxcc_vddgfx == gpucc_vddcx || gfxcc_vddgfx == gpucc_vddmx) {
+		printf("adreno-sdm845: runtime GPU power/clock dependencies are incomplete or differ from Polaris; probe refused\n");
+		return false;
+	}
+	printf("adreno-sdm845: runtime DT matches the SDM845 GPU/GFXCC clock tree, GPU/GMU supply domains, and CX/MX/GFX rails\n");
+	return true;
+}
+
+static bool
 polaris_runtime_dt_validate(void)
 {
-	DTEntry gpu_node = NULL, smmu_node = NULL;
+	DTEntry gpu_node = NULL, gmu_node = NULL, smmu_node = NULL;
 	const uint8_t *chip_id;
 	unsigned int chip_id_size = 0;
 	uint32_t actual_chip_id, smmu_phandle;
@@ -672,10 +805,13 @@ polaris_runtime_dt_validate(void)
 	    !polaris_dt_node_matches(POLARIS_GMU_DT_PATH, "qcom,gpu-gmu", POLARIS_GMU_PHYS, POLARIS_GMU_SIZE) ||
 	    !polaris_dt_node_matches(POLARIS_GPUCC_DT_PATH, "qcom,gpucc-sdm845-v2", POLARIS_GPUCC_PHYS,
 	    POLARIS_GPUCC_SIZE) ||
+	    !polaris_dt_node_matches(POLARIS_GFXCC_DT_PATH, "qcom,gfxcc-sdm845-v2", POLARIS_GPUCC_PHYS,
+	    POLARIS_GPUCC_SIZE) ||
 	    !polaris_dt_node_matches(POLARIS_SMMU_DT_PATH, "qcom,smmu-v2", POLARIS_SMMU_PHYS, POLARIS_SMMU_SIZE) ||
 	    SecureDTLookupEntry(NULL, POLARIS_GPU_DT_PATH, &gpu_node) != kSuccess || gpu_node == NULL ||
 	    SecureDTGetProperty(gpu_node, "qcom,chipid", (const void **)&chip_id, &chip_id_size) != kSuccess ||
 	    chip_id == NULL || chip_id_size != 4 ||
+	    SecureDTLookupEntry(NULL, POLARIS_GMU_DT_PATH, &gmu_node) != kSuccess || gmu_node == NULL ||
 	    SecureDTLookupEntry(NULL, POLARIS_SMMU_DT_PATH, &smmu_node) != kSuccess || smmu_node == NULL ||
 	    !polaris_dt_get_u32(smmu_node, "phandle", &smmu_phandle)) {
 		printf("adreno-sdm845: runtime device-tree validation failed; no GPU MMIO was accessed\n");
@@ -685,6 +821,9 @@ polaris_runtime_dt_validate(void)
 	if (actual_chip_id != POLARIS_GPU_CHIP_ID) {
 		printf("adreno-sdm845: runtime GPU chip ID is %#x, expected Polaris A630 %#x; probe refused\n",
 		    actual_chip_id, POLARIS_GPU_CHIP_ID);
+		return false;
+	}
+	if (!polaris_runtime_power_validate(gpu_node, gmu_node)) {
 		return false;
 	}
 	polaris_smmu_stream_count = 0;
