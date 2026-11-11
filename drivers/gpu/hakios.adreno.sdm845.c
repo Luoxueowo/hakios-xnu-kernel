@@ -230,8 +230,8 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_SMMU_PTE_ACCESSED        (1ull << 10)
 #define POLARIS_SMMU_PTE_NOT_GLOBAL      (1ull << 11)
 #define POLARIS_SMMU_PTE_ADDRESS         0x0000fffffffff000ull
-#define POLARIS_SMMU_PTE_CORE            (POLARIS_SMMU_PTE_UNPRIVILEGED | POLARIS_SMMU_PTE_SHARED | \
-					      POLARIS_SMMU_PTE_ACCESSED | POLARIS_SMMU_PTE_NOT_GLOBAL)
+#define POLARIS_SMMU_PTE_BASE            (POLARIS_SMMU_PTE_SHARED | POLARIS_SMMU_PTE_ACCESSED | \
+					      POLARIS_SMMU_PTE_NOT_GLOBAL)
 #define POLARIS_SMMU_CACHE_LINE           64u
 
 struct gpu_va_range {
@@ -263,6 +263,7 @@ enum polaris_smmu_address_space_id {
 
 struct polaris_smmu_address_space {
 	const char *name;
+	uint64_t pte_attributes;
 	struct polaris_smmu_table *root;
 	struct polaris_smmu_table *cached_l2;
 	struct polaris_smmu_table *cached_l3;
@@ -280,6 +281,7 @@ static uint32_t polaris_smmu_chunk_slots;
 static struct polaris_smmu_address_space polaris_smmu_spaces[POLARIS_SMMU_ADDRESS_SPACE_COUNT] = {
 	[POLARIS_SMMU_SPACE_GPU] = {
 		.name = "3D core",
+		.pte_attributes = POLARIS_SMMU_PTE_BASE | POLARIS_SMMU_PTE_UNPRIVILEGED,
 		.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE,
 		.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE,
 		.context_bank = UINT32_MAX,
@@ -287,6 +289,7 @@ static struct polaris_smmu_address_space polaris_smmu_spaces[POLARIS_SMMU_ADDRES
 	},
 	[POLARIS_SMMU_SPACE_GMU_KERNEL] = {
 		.name = "GMU kernel",
+		.pte_attributes = POLARIS_SMMU_PTE_BASE,
 		.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE,
 		.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE,
 		.context_bank = UINT32_MAX,
@@ -294,6 +297,7 @@ static struct polaris_smmu_address_space polaris_smmu_spaces[POLARIS_SMMU_ADDRES
 	},
 	[POLARIS_SMMU_SPACE_GMU_USER] = {
 		.name = "GMU user",
+		.pte_attributes = POLARIS_SMMU_PTE_BASE | POLARIS_SMMU_PTE_UNPRIVILEGED,
 		.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE,
 		.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE,
 		.context_bank = UINT32_MAX,
@@ -1416,7 +1420,7 @@ polaris_smmu_map_page_locked(struct polaris_smmu_address_space *space, uint64_t 
 	if (l3 == NULL || l3->entries[l3_index] != 0) {
 		return false;
 	}
-	descriptor = phys | POLARIS_SMMU_PTE_CORE | POLARIS_SMMU_PTE_PAGE;
+	descriptor = phys | space->pte_attributes | POLARIS_SMMU_PTE_PAGE;
 	if (read_only) {
 		descriptor |= POLARIS_SMMU_PTE_READ_ONLY;
 	}

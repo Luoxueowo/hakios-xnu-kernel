@@ -29,9 +29,11 @@ allow it. A successful firmware boot alone is not a completed driver.
 - The A630 backend now has separate software stage-1 page-table roots for the 3D core,
   `gmu_kernel`, and `gmu_user`; table pages are suballocated from XNU pages, checked against the
   SMMU output-address size, and kept for the backend lifetime. The diagnostic's IDR2 read supplies
-  the OAS and 4-KiB table capability. Shared `map/mapped/unmap` uses the 3D root. `adreno=9` also
-  allocates contiguous HFI memory, creates a write-combined CPU alias, initializes its legacy HFI
-  table, and maps its five 4-KiB pages into the detached `gmu_kernel` software root at `0x60000000`.
+  the OAS and 4-KiB table capability. Shared `map/mapped/unmap` uses the 3D root. Leaf permissions
+  are per address space: 3D and `gmu_user` use unprivileged mappings, while `gmu_kernel` keeps
+  privileged mappings for HFI memory. `adreno=9` also allocates contiguous HFI memory, creates a
+  write-combined CPU alias, initializes its legacy HFI table, and maps its five 4-KiB pages into the
+  detached `gmu_kernel` software root at `0x60000000`.
   No context bank, stream route, SMMU register, GMU interrupt, or firmware state is changed; these
   tables remain detached and `ready()` remains false. This preparation step has not been run on the
   phone.
