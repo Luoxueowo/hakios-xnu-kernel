@@ -7900,6 +7900,9 @@ hakios_adreno_sdm845_init(void)
 			printf("adreno-sdm845: gpu=1 requests the Polaris A630 runtime; completing guarded steps 21–23 before starting HakiosGPU\n");
 			if (!polaris_a630_gpu_full_start(23u)) {
 				printf("adreno-sdm845: Polaris A630 startup/CPU-root IB probe failed; HakiosGPU is not started\n");
+				/* Try the same bounded stop used after service-creation failure. It
+				 * unwinds only a verified idle startup and retains faulted state. */
+				sdm845_gpu_stop();
 				return;
 			}
 			polaris_gpu_client_submission_enabled = true;

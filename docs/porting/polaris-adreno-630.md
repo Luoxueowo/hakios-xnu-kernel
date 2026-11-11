@@ -26,7 +26,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   does not start the GPU by default; the explicit `gpu=1` boot argument runs guarded stages 21–23,
   then starts HakiosGPU only if the client-root IB and kernel-root fence probe passes. If IOKit
   service creation fails, it closes the client gate and requests the existing bounded orderly stop.
-  This runtime path has not yet been validated on the phone.
+  A failed `gpu=1` bring-up also calls that stop path; it can quiesce a verified healthy boundary
+  and deliberately retains resources if startup is faulted or safety cannot be confirmed. This
+  runtime cleanup path has not yet been validated on the phone.
 - On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
   `hakios.adreno.sdm845.o`, `hakios.adreno.o`, and the shared IOKit GPU service. The build script
   produced `hakios-kernel` and accepted the known XNU kext symbol-set check failures; this is
@@ -744,8 +746,10 @@ command isolation review, and bounded hardware submission checks.
    The path waits synchronously at the client-root boundary; it is not yet a multi-context async
    scheduler. Step 23 exercises one CP memory-write IB through this path. Validate register
    protection, root switching, ring scrubbing, fence visibility,
-   orderly stop and loader-return quiesce before accepting submissions; add orderly partial-start
-   cleanup. The stop path does not yet remove all inherited CX/GMU parent-domain and clock votes.
+   orderly stop and loader-return quiesce before accepting submissions. The `gpu=1` startup path
+   now requests bounded orderly stop after a failed guarded bring-up; validate each partial-start
+   boundary on the phone and add cleanup for states the stop path currently retains. The stop path
+   does not yet remove all inherited CX/GMU parent-domain and clock votes.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; client workloads and orderly stop/loader-return quiesce are validated on the phone.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
