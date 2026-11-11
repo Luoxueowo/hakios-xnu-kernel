@@ -15,10 +15,12 @@
  * power through the A630 GPU OOB and verifies the GFX3D clock. Step 18 repeats that guarded startup
  * then programs A630 HWCG, VBIF, UCHE, CP defaults, and protected-register ranges. Step 19
  * authenticates ZAP before SQE/CP startup; step 20 submits CP_SET_SECURE_MODE(0) and waits for idle.
- * Step 21 is a kernel-owned fence smoke test only. A production ring/fence callback path follows
- * it but remains gated; client submissions, runtime GPU DCVS, and rendering remain later stages.
- * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
- * during this bring-up. `ready()` remains false.
+ * Step 21 is a kernel-owned fence smoke test, step 22 probes a CPU-driven SMMUv2 root switch while
+ * the GPU is idle, and step 23 executes one bounded client-root IB that writes a private scratch
+ * page before returning to the kernel root for its fence. Public client submissions remain gated
+ * pending hardware validation of these steps and orderly shutdown.
+ * Write stages are guarded by runtime preflight/readbacks. The diagnostic adreno=N stages never
+ * open the public client gate; the explicit gpu=1 runtime path opens it only after step 23 passes.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
  *   qcom,gpucc@5090000 (qcom,gpucc-sdm845-v2)
@@ -51,6 +53,7 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern lck_mtx_t hakios_rsc_lock;
+extern void HakiosGPUStart(void);
 
 #define SDM845_SOC_BASE                 0x00100000ul
 #define POLARIS_GPUCC_PHYS              0x05090000ul
@@ -114,6 +117,7 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_FENCE_TEST_DWORDS       5u
 #define A630_CP_FENCE_TEST_VALUE        0xa6302014u
 #define A630_CP_FENCE_TEST_OFFSET       64u
+#define A630_CP_CLIENT_PROBE_VALUE      0xa6302301u
 #define A630_CP_RING_BYTES              (32u * 1024u)
 #define A630_CP_RING_DWORDS             (A630_CP_RING_BYTES / sizeof(uint32_t))
 #define A630_CP_SUBMIT_MAX_IBS           128u
@@ -580,6 +584,8 @@ static LCK_GRP_DECLARE(polaris_gpu_client_lck_grp, "polaris-gpu-client-space");
 static LCK_MTX_DECLARE(polaris_gpu_client_lck, &polaris_gpu_client_lck_grp);
 static struct polaris_gpu_client_space polaris_gpu_client_spaces[POLARIS_GPU_MAX_CLIENT_SPACES];
 static struct polaris_gpu_client_space polaris_gpu_context_probe_client;
+static struct polaris_gpu_dma_buffer polaris_gpu_context_probe_ib;
+static struct polaris_gpu_dma_buffer polaris_gpu_context_probe_data;
 static struct polaris_smmu_address_space *polaris_gpu_active_space;
 static uint32_t polaris_smmu_oas_bits;
 static uint32_t polaris_smmu_oas_encoding;
@@ -706,7 +712,7 @@ static bool polaris_gpu_cp_initialized;
 static bool polaris_gpu_unsecured_mode;
 static bool polaris_gpu_fence_smoke_test_done;
 static bool polaris_gpu_ring_submit_ready;
-/* Keep public client submission disabled until orderly stop and loader quiesce are validated. */
+/* Diagnostic stages leave this closed; only the explicit gpu=1 path opens it after step 23. */
 static bool polaris_gpu_client_submission_enabled;
 static bool polaris_gpu_sptprac_enabled_by_driver;
 static bool polaris_gmu_slumber_confirmed;
@@ -1009,18 +1015,28 @@ static bool polaris_smmu_gpu_context_detach(void);
 static bool polaris_smmu_space_root_prepare(struct polaris_smmu_address_space *space);
 static bool polaris_smmu_space_destroy(struct polaris_smmu_address_space *space);
 static bool polaris_smmu_gpu_context_switch(struct polaris_smmu_address_space *target, const char *reason);
+static uint32_t polaris_a630_gpu_kernel_fence_submit(void);
+static uint32_t polaris_a630_gpu_client_submit(struct polaris_gpu_client_space *client,
+	const uint64_t *addresses, const uint32_t *words, uint32_t count);
+static bool polaris_a630_gpu_fence_complete(uint32_t fence);
 static uint32_t smmu_id_size_to_bits(uint32_t encoding);
 
 static bool
-sdm845_gpu_ready(void)
+polaris_sdm845_gpu_hardware_ready(void)
 {
-	return polaris_gpu_client_submission_enabled && polaris_smmu_backend_enabled &&
+	return polaris_smmu_backend_enabled &&
 	    !polaris_smmu_backend_faulted && polaris_sqe_safe &&
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active && polaris_gmu_hfi_ready &&
 	    polaris_gmu_hfi_sealed && polaris_gpu_oob_active && polaris_gpu_core_ready &&
 	    polaris_gpu_core_configured && polaris_zap_authenticated && polaris_pas_image_active &&
 	    polaris_gpu_cp_started && polaris_gpu_cp_initialized && polaris_gpu_unsecured_mode &&
 	    polaris_gpu_fence_smoke_test_done && polaris_gpu_ring_submit_ready;
+}
+
+static bool
+sdm845_gpu_ready(void)
+{
+	return polaris_gpu_client_submission_enabled && polaris_sdm845_gpu_hardware_ready();
 }
 
 const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
@@ -2982,8 +2998,20 @@ polaris_gpu_dma_buffer_release(struct polaris_gpu_dma_buffer *buffer)
 		return;
 	}
 	if (buffer->gpu_address != 0 && buffer->allocation_size != 0) {
+		if (polaris_smmu_backend_faulted ||
+		    (polaris_gpu_active_space != NULL &&
+		    polaris_gpu_active_space != &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU])) {
+			printf("adreno-sdm845: retaining A630 DMA buffer at IOVA %#llx because SID0 is not a verified healthy kernel root\n",
+			    buffer->gpu_address);
+			return;
+		}
 		polaris_smmu_space_unmap(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], buffer->gpu_address,
 		    buffer->allocation_size);
+		if (polaris_smmu_backend_faulted) {
+			printf("adreno-sdm845: retaining A630 DMA buffer at IOVA %#llx after SMMU invalidation failed\n",
+			    buffer->gpu_address);
+			return;
+		}
 		polaris_gpu_private_address_free(buffer->gpu_address, buffer->allocation_size);
 	}
 	if (buffer->virtual != 0 && buffer->allocation_size != 0) {
@@ -5961,9 +5989,12 @@ sdm845_gpu_quiesce(void)
 	bool safe = true;
 
 	if (!gpu_engine_active && !gmu_engine_active && !gpu_route_needed && !gmu_route_needed && !pas_active) {
+		polaris_gpu_client_submission_enabled = false;
+		polaris_smmu_backend_enabled = false;
 		return;
 	}
 	polaris_gpu_client_submission_enabled = false;
+	polaris_smmu_backend_enabled = false;
 	polaris_gpu_ring_submit_ready = false;
 	if (gpu_engine_active) {
 		if (gpucc.virtual == 0) {
@@ -6241,7 +6272,8 @@ static void
 sdm845_gpu_stop(void)
 {
 	bool cp_buffers_present = polaris_gpu_sqe_buffer.virtual != 0 || polaris_gpu_ring_buffer.virtual != 0 ||
-	    polaris_gpu_rptr_buffer.virtual != 0;
+	    polaris_gpu_rptr_buffer.virtual != 0 || polaris_gpu_context_probe_ib.virtual != 0 ||
+	    polaris_gpu_context_probe_data.virtual != 0;
 	bool smmu_contexts_active = polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active;
@@ -6251,6 +6283,7 @@ sdm845_gpu_stop(void)
 
 	/* Keep both client gates closed before touching any hardware state. */
 	polaris_gpu_client_submission_enabled = false;
+	polaris_smmu_backend_enabled = false;
 	polaris_gpu_ring_submit_ready = false;
 	if (!polaris_gmu_firmware_started && !polaris_gmu_hfi_ready && !polaris_gmu_boot_rail_active &&
 	    !polaris_gmu_temp_bus_vote_active && !polaris_gpu_oob_active && !polaris_gpu_core_ready &&
@@ -6260,6 +6293,8 @@ sdm845_gpu_stop(void)
 			polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
 			polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
 			polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
+			polaris_gpu_dma_buffer_release(&polaris_gpu_context_probe_data);
+			polaris_gpu_dma_buffer_release(&polaris_gpu_context_probe_ib);
 			printf("adreno-sdm845: GPU stop released private buffers from a detached inactive backend\n");
 		}
 		polaris_gpu_ring_write_pointer = 0;
@@ -6397,6 +6432,8 @@ sdm845_gpu_stop(void)
 		polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
 		polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
 		polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_context_probe_data);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_context_probe_ib);
 	}
 	polaris_gpu_ring_write_pointer = 0;
 	polaris_gpu_last_fence = 0;
@@ -6764,6 +6801,156 @@ cleanup:
 		}
 	}
 	return false;
+}
+
+/* Execute one user-style CP IB in a temporary client root and prove its writable mapping. */
+static bool
+polaris_a630_gpu_client_ib_probe(void)
+{
+	struct polaris_gpu_client_space *client = &polaris_gpu_context_probe_client;
+	struct polaris_smmu_address_space *kernel_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
+	struct polaris_gpu_dma_buffer *buffers[] = {
+		&polaris_gpu_sqe_buffer, &polaris_gpu_ring_buffer,
+		&polaris_gpu_context_probe_ib, &polaris_gpu_context_probe_data,
+	};
+	uint64_t addresses[1];
+	uint32_t words[1] = { 5u };
+	uint32_t fence = 0;
+	bool result = false;
+
+	printf("adreno-sdm845: step 23: execute one client-root CP_MEM_WRITE IB, return SID0 to the kernel root, then verify the kernel fence\n");
+	if (client->smmu.root != NULL || client->smmu.mapped_pages != 0 ||
+	    polaris_gpu_context_probe_ib.virtual != 0 || polaris_gpu_context_probe_data.virtual != 0 ||
+	    polaris_gpu_active_space != kernel_space || !polaris_gpu_fence_smoke_test_done ||
+	    !polaris_gpu_ring_submit_ready || polaris_smmu_backend_faulted ||
+	    !polaris_sdm845_gpu_hardware_ready()) {
+		printf("adreno-sdm845: step 23 requires the kernel root, a healthy CP and a clean temporary probe slot\n");
+		return false;
+	}
+	bzero(client, sizeof(*client));
+	client->smmu.name = "3D client IB probe";
+	client->smmu.pte_attributes = kernel_space->pte_attributes;
+	client->smmu.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+	client->smmu.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+	client->smmu.context_bank = kernel_space->context_bank;
+	client->smmu.asid = POLARIS_GPU_CLIENT_ASID_FIRST;
+	client->smmu.context_active = true;
+	if (!polaris_gpu_dma_buffer_allocate(&polaris_gpu_context_probe_ib, PAGE_SIZE, true) ||
+	    !polaris_gpu_dma_buffer_allocate(&polaris_gpu_context_probe_data, PAGE_SIZE, false)) {
+		printf("adreno-sdm845: step 23 could not allocate its private IB and output pages\n");
+		goto cleanup;
+	}
+	uint32_t *ib = (uint32_t *)polaris_gpu_context_probe_ib.virtual;
+	volatile uint32_t *output = (volatile uint32_t *)polaris_gpu_context_probe_data.virtual;
+	uint64_t output_address = polaris_gpu_context_probe_data.gpu_address;
+	bzero((void *)polaris_gpu_context_probe_ib.virtual, polaris_gpu_context_probe_ib.allocation_size);
+	*output = 0;
+	ib[0] = polaris_a630_type7_packet(A630_CP_MEM_WRITE, 3u);
+	ib[1] = (uint32_t)output_address;
+	ib[2] = (uint32_t)(output_address >> 32);
+	ib[3] = A630_CP_CLIENT_PROBE_VALUE;
+	ib[4] = polaris_a630_type7_packet(A630_CP_WAIT_MEM_WRITES, 0u);
+	polaris_cache_lines(polaris_gpu_context_probe_ib.virtual, polaris_gpu_context_probe_ib.allocation_size);
+	polaris_cache_lines(polaris_gpu_context_probe_data.virtual, polaris_gpu_context_probe_data.allocation_size);
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	if (!polaris_gpu_client_space_map_private(client)) {
+		printf("adreno-sdm845: step 23 could not prepare its ordinary read-only SQE/ring mappings\n");
+		goto cleanup;
+	}
+	struct polaris_gpu_dma_buffer *client_buffers[] = {
+		&polaris_gpu_context_probe_ib, &polaris_gpu_context_probe_data,
+	};
+	for (uint32_t i = 0; i < sizeof(client_buffers) / sizeof(client_buffers[0]); i++) {
+		struct polaris_gpu_dma_buffer *buffer = client_buffers[i];
+
+		for (uint64_t offset = 0; offset < buffer->allocation_size; offset += POLARIS_SMMU_TABLE_BYTES) {
+			if (!polaris_smmu_space_map_page(&client->smmu, buffer->gpu_address + offset,
+			    buffer->physical + offset, buffer->gpu_read_only)) {
+				printf("adreno-sdm845: step 23 could not map its probe IB/output page into the client root\n");
+				goto cleanup;
+			}
+		}
+	}
+	lck_mtx_lock(&polaris_smmu_pt_lock);
+	polaris_smmu_commit_locked();
+	lck_mtx_unlock(&polaris_smmu_pt_lock);
+	if (!polaris_smmu_tlbi(kernel_space)) {
+		polaris_smmu_backend_faulted = true;
+		printf("adreno-sdm845: step 23 could not invalidate the newly added kernel-root probe mappings\n");
+		goto cleanup;
+	}
+	addresses[0] = polaris_gpu_context_probe_ib.gpu_address;
+	fence = polaris_a630_gpu_client_submit(client, addresses, words, 1u);
+	if (fence == 0) {
+		printf("adreno-sdm845: step 23 client-root CP submission failed; client gate remains closed\n");
+		if (polaris_gpu_active_space != kernel_space || polaris_smmu_backend_faulted) {
+			client->quarantined = true;
+			return false;
+		}
+		goto cleanup;
+	}
+	bool fence_done = false;
+	for (uint32_t elapsed = 0; elapsed < A630_CP_INIT_TIMEOUT_US; elapsed += A630_CP_INIT_POLL_US) {
+		if (polaris_a630_gpu_fence_complete(fence)) {
+			fence_done = true;
+			break;
+		}
+		delay_for_interval(A630_CP_INIT_POLL_US, NSEC_PER_USEC);
+	}
+	polaris_cache_lines(polaris_gpu_context_probe_data.virtual, sizeof(uint32_t));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!fence_done || *output != A630_CP_CLIENT_PROBE_VALUE ||
+	    polaris_gpu_active_space != kernel_space || !polaris_a630_gpu_idle_for_root_switch()) {
+		polaris_smmu_gpu_context_switch_fault("step 23 output write, kernel fence, or final idle check failed");
+		client->quarantined = true;
+		printf("adreno-sdm845: step 23 did not verify the client-root output and kernel-root fence; all probe resources are retained\n");
+		return false;
+	}
+	result = true;
+	printf("adreno-sdm845: step 23 verified client-root IB write %#x at %#llx; SID0 is back on the kernel root and user submissions remain gated\n",
+	    (uint32_t)*output, output_address);
+
+cleanup:
+	if (client->smmu.root != NULL) {
+		if (polaris_gpu_active_space != kernel_space || polaris_smmu_backend_faulted ||
+		    !polaris_a630_gpu_idle_for_root_switch()) {
+			client->quarantined = true;
+			polaris_smmu_backend_faulted = true;
+			polaris_gpu_ring_submit_ready = false;
+			printf("adreno-sdm845: step 23 retained client tables because it could not prove an idle kernel-root boundary\n");
+			return false;
+		}
+		for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
+			if (buffers[i]->gpu_address != 0 && buffers[i]->allocation_size != 0) {
+				polaris_smmu_space_unmap(&client->smmu, buffers[i]->gpu_address, buffers[i]->allocation_size);
+			}
+		}
+		if (client->smmu.mapped_pages != 0 || !polaris_smmu_space_destroy(&client->smmu) ||
+		    polaris_smmu_backend_faulted) {
+			client->quarantined = true;
+			polaris_smmu_backend_faulted = true;
+			polaris_gpu_ring_submit_ready = false;
+			printf("adreno-sdm845: step 23 could not reclaim its detached client root; tables and buffers remain allocated\n");
+			return false;
+		}
+	}
+	bzero(client, sizeof(*client));
+	if (polaris_gpu_active_space == kernel_space && !polaris_smmu_backend_faulted) {
+		polaris_gpu_dma_buffer_release(&polaris_gpu_context_probe_data);
+		if (polaris_smmu_backend_faulted) {
+			return false;
+		}
+		polaris_gpu_dma_buffer_release(&polaris_gpu_context_probe_ib);
+		if (polaris_smmu_backend_faulted) {
+			return false;
+		}
+	} else if (polaris_gpu_context_probe_ib.virtual != 0 || polaris_gpu_context_probe_data.virtual != 0) {
+		polaris_smmu_backend_faulted = true;
+		polaris_gpu_ring_submit_ready = false;
+		return false;
+	}
+	return result;
 }
 
 /* Polaris has no GBIF; drain all four VBIF XINs before releasing the GX hold. */
@@ -7210,6 +7397,7 @@ polaris_a630_cp_fence_smoke_test(void)
 	    !polaris_gpu_core_configured || !polaris_gpu_oob_active || !polaris_gmu_hfi_ready ||
 	    !polaris_gmu_hfi_sealed || !polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready ||
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    polaris_gpu_active_space != &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU] ||
 	    polaris_smmu_backend_faulted || polaris_gpu_sqe_buffer.virtual == 0 ||
 	    polaris_gpu_ring_buffer.virtual == 0 || polaris_gpu_rptr_buffer.virtual == 0 ||
 	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
@@ -7281,6 +7469,7 @@ polaris_a630_cp_fence_smoke_test(void)
 			polaris_gpu_last_fence = 0;
 			polaris_gpu_ring_submit_ready = true;
 			polaris_gpu_fence_smoke_test_done = true;
+			polaris_smmu_backend_enabled = true;
 			printf("adreno-sdm845: step 21 fence write completed at %#llx with value %#x; RPTR=%u CP idle\n",
 			    fence_address, completed_value, ring_rptr);
 			return true;
@@ -7298,35 +7487,27 @@ fault:
 	return false;
 }
 
-/* Kernel-root-only submit path; A630v2 client IBs remain refused until safe completion is implemented. */
+/* Queue a trusted completion fence only while SID0 is using the kernel-owned root. */
 static uint32_t
-sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words, uint32_t count)
+polaris_a630_gpu_kernel_fence_submit(void)
 {
 	struct polaris_smmu_address_space *target_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
 	uint32_t packet[A630_CP_SUBMIT_MAX_DWORDS];
-	uint32_t packet_dwords = 0, wanted, ring_rptr = 0, ring_wptr, room = 0;
+	uint32_t packet_dwords = 0, wanted = A630_CP_SUBMIT_FIXED_DWORDS, ring_rptr = 0, ring_wptr, room = 0;
 	uint32_t next_wptr, fence;
 	uint64_t fence_address;
 	vm_offset_t fence_virtual;
 	volatile uint32_t *fence_word;
 
-	/*
-	 * The Polaris A630v2 profile does not expose APRIV. Client roots therefore cannot hide a
-	 * writable fence page from client IBs while CP runs in that root. Keep this kernel-root-only
-	 * maintenance path limited to empty submissions until the client completion path is redesigned.
-	 */
-	if (handle != NULL || count != 0) {
-		return 0;
-	}
-	if (!sdm845_gpu_ready() || !polaris_gpu_ring_submit_ready ||
+	if (!polaris_sdm845_gpu_hardware_ready() || !polaris_gpu_ring_submit_ready ||
 	    !polaris_gpu_cp_started || !polaris_gpu_cp_initialized || !polaris_gpu_unsecured_mode ||
 	    !polaris_gpu_fence_smoke_test_done || !polaris_zap_authenticated ||
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    polaris_gpu_active_space != target_space ||
 	    target_space->root == NULL || !target_space->context_active || target_space->context_bank != 0 ||
 	    target_space->asid == 0 || target_space->asid > UINT16_MAX ||
 	    !polaris_smmu_phys_valid(target_space->root->phys, POLARIS_SMMU_TABLE_BYTES) ||
 	    polaris_smmu_backend_faulted ||
-	    count > A630_CP_SUBMIT_MAX_IBS || (count != 0 && (addresses == NULL || words == NULL)) ||
 	    polaris_gpu_sqe_buffer.virtual == 0 || polaris_gpu_ring_buffer.virtual == 0 ||
 	    polaris_gpu_rptr_buffer.virtual == 0 ||
 	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
@@ -7334,15 +7515,6 @@ sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words
 	    !polaris_gpu_sqe_buffer.gpu_read_only || !polaris_gpu_ring_buffer.gpu_read_only ||
 	    polaris_gpu_rptr_buffer.gpu_read_only) {
 		return 0;
-	}
-	for (uint32_t i = 0; i < count; i++) {
-		uint64_t bytes = (uint64_t)words[i] * sizeof(uint32_t);
-
-		if (words[i] == 0 || (addresses[i] & (sizeof(uint32_t) - 1u)) != 0 ||
-		    addresses[i] < POLARIS_GPU_VA_START || addresses[i] >= POLARIS_GPU_VA_END ||
-		    bytes > POLARIS_GPU_VA_END - addresses[i]) {
-			return 0;
-		}
 	}
 	if (!map_block(&gpu)) {
 		return 0;
@@ -7352,7 +7524,6 @@ sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words
 	if (ring_wptr >= A630_CP_RING_DWORDS || ring_wptr != polaris_gpu_ring_write_pointer) {
 		goto fault;
 	}
-	wanted = A630_CP_SUBMIT_FIXED_DWORDS + 4u * count;
 	for (uint32_t elapsed = 0; elapsed < A630_CP_INIT_TIMEOUT_US; elapsed += A630_CP_INIT_POLL_US) {
 		ring_rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
 		if (ring_rptr >= A630_CP_RING_DWORDS ||
@@ -7398,12 +7569,6 @@ sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words
 	packet[packet_dwords++] = A630_CP_CCU_INVALIDATE_DEPTH;
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
 	packet[packet_dwords++] = A630_CP_CCU_INVALIDATE_COLOR;
-	for (uint32_t i = 0; i < count; i++) {
-		packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_INDIRECT_BUFFER_PFE, 3u);
-		packet[packet_dwords++] = (uint32_t)addresses[i];
-		packet[packet_dwords++] = (uint32_t)(addresses[i] >> 32);
-		packet[packet_dwords++] = words[i];
-	}
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 4u);
 	packet[packet_dwords++] = A630_CP_CACHE_FLUSH_TS; /* Poll the memory fence; no IRQ is enabled. */
 	packet[packet_dwords++] = (uint32_t)fence_address;
@@ -7448,22 +7613,185 @@ fault:
 	return 0;
 }
 
+/*
+ * Execute client IBs under their own SMMUv2 root. A630v2 has no APRIV, so completion is
+ * deliberately split into two phases: no kernel address is put in the ring while the client root
+ * is active; after the CP/RBBM idle boundary, SID0 returns to the kernel root and only then gets a
+ * trusted kernel fence packet. The ring is scrubbed on both sides of the client interval.
+ */
+static uint32_t
+polaris_a630_gpu_client_submit(struct polaris_gpu_client_space *client,
+	const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	struct polaris_smmu_address_space *kernel_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
+	struct polaris_smmu_address_space *client_space;
+	uint32_t packet[A630_CP_SUBMIT_MAX_DWORDS];
+	uint32_t packet_dwords = 0, wanted, ring_rptr, ring_wptr, next_wptr;
+
+	if (client == NULL || addresses == NULL || words == NULL || count == 0 ||
+	    count > A630_CP_SUBMIT_MAX_IBS || client->quarantined ||
+	    !polaris_sdm845_gpu_hardware_ready() || !polaris_gpu_ring_submit_ready ||
+	    polaris_gpu_active_space != kernel_space || client->smmu.root == NULL ||
+	    !client->smmu.context_active || client->smmu.context_bank != kernel_space->context_bank ||
+	    client->smmu.asid == 0 || client->smmu.asid == kernel_space->asid ||
+	    client->smmu.pte_attributes != kernel_space->pte_attributes ||
+	    client->smmu.mapped_pages <= client->private_mapped_pages ||
+	    polaris_gpu_ring_buffer.virtual == 0 ||
+	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
+	    !polaris_gpu_ring_buffer.gpu_read_only) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t bytes = (uint64_t)words[i] * sizeof(uint32_t);
+
+		if (words[i] == 0 || (addresses[i] & (sizeof(uint32_t) - 1u)) != 0 ||
+		    addresses[i] < POLARIS_GPU_VA_START || addresses[i] >= POLARIS_GPU_VA_END ||
+		    bytes > POLARIS_GPU_VA_END - addresses[i]) {
+			return 0;
+		}
+	}
+	if (!map_block(&gpu)) {
+		return 0;
+	}
+	if (!polaris_a630_gpu_idle_for_root_switch()) {
+		polaris_smmu_gpu_context_switch_fault("client submit did not start at a full kernel-root idle boundary");
+		return 0;
+	}
+	ring_rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
+	ring_wptr = probe_read(&gpu, GPU_CP_RB_WPTR);
+	if (ring_rptr >= A630_CP_RING_DWORDS || ring_wptr >= A630_CP_RING_DWORDS ||
+	    ring_rptr != ring_wptr || ring_wptr != polaris_gpu_ring_write_pointer) {
+		polaris_smmu_gpu_context_switch_fault("CP ring pointers changed at the client-root boundary");
+		return 0;
+	}
+
+	/* Remove all prior trusted ring contents before making these pages visible to a client root. */
+	bzero((void *)polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
+	polaris_cache_lines(polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	client_space = &client->smmu;
+	if (!polaris_smmu_gpu_context_switch(client_space, "client IB submission")) {
+		if (polaris_gpu_active_space != kernel_space || polaris_smmu_backend_faulted) {
+			client->quarantined = true;
+		}
+		return 0;
+	}
+
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_SET_PROTECTED_MODE, 1u);
+	packet[packet_dwords++] = 1u;
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
+	packet[packet_dwords++] = A630_CP_CACHE_INVALIDATE;
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
+	packet[packet_dwords++] = A630_CP_CCU_INVALIDATE_DEPTH;
+	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_EVENT_WRITE, 1u);
+	packet[packet_dwords++] = A630_CP_CCU_INVALIDATE_COLOR;
+	for (uint32_t i = 0; i < count; i++) {
+		packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_INDIRECT_BUFFER_PFE, 3u);
+		packet[packet_dwords++] = (uint32_t)addresses[i];
+		packet[packet_dwords++] = (uint32_t)(addresses[i] >> 32);
+		packet[packet_dwords++] = words[i];
+	}
+	wanted = 8u + 4u * count;
+	if (packet_dwords != wanted || packet_dwords >= A630_CP_RING_DWORDS ||
+	    probe_read(&gpu, GPU_CP_RB_RPTR) != ring_rptr ||
+	    probe_read(&gpu, GPU_CP_RB_WPTR) != ring_wptr) {
+		goto fault_client;
+	}
+	uint32_t first_dwords = packet_dwords < A630_CP_RING_DWORDS - ring_wptr ?
+	    packet_dwords : A630_CP_RING_DWORDS - ring_wptr;
+	vm_offset_t first = polaris_gpu_ring_buffer.virtual + ring_wptr * sizeof(uint32_t);
+	memcpy((void *)first, packet, first_dwords * sizeof(uint32_t));
+	polaris_cache_lines(first, first_dwords * sizeof(uint32_t));
+	if (first_dwords != packet_dwords) {
+		uint32_t second_dwords = packet_dwords - first_dwords;
+		memcpy((void *)polaris_gpu_ring_buffer.virtual,
+		    packet + first_dwords, second_dwords * sizeof(uint32_t));
+		polaris_cache_lines(polaris_gpu_ring_buffer.virtual, second_dwords * sizeof(uint32_t));
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	next_wptr = (ring_wptr + packet_dwords) % A630_CP_RING_DWORDS;
+	probe_write(&gpu, GPU_CP_RB_WPTR, next_wptr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&gpu, GPU_CP_RB_WPTR) != next_wptr) {
+		goto fault_client;
+	}
+	polaris_gpu_ring_write_pointer = next_wptr;
+
+	if (!polaris_a630_gpu_idle_for_root_switch()) {
+		goto fault_client;
+	}
+	if (!polaris_smmu_gpu_context_switch(kernel_space, "client IB completion boundary")) {
+		if (polaris_gpu_active_space != kernel_space && !polaris_smmu_backend_faulted) {
+			polaris_smmu_gpu_context_switch_fault("client IB completed without a verified return to the kernel root");
+		}
+		client->quarantined = true;
+		return 0;
+	}
+	/* The client has finished and SID0 is back on the kernel root; erase its ring image before fencing. */
+	bzero((void *)polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
+	polaris_cache_lines(polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	uint32_t fence = polaris_a630_gpu_kernel_fence_submit();
+	if (fence == 0) {
+		if (!polaris_smmu_backend_faulted) {
+			polaris_smmu_gpu_context_switch_fault("kernel-root completion fence could not be queued");
+		}
+		client->quarantined = true;
+		return 0;
+	}
+	return fence;
+
+fault_client:
+	client->quarantined = true;
+	polaris_smmu_gpu_context_switch_fault("client ring publication or client IB execution failed");
+	printf("adreno-sdm845: client-root CP submission failed; GPU mappings and private buffers are retained\n");
+	return 0;
+}
+
+static uint32_t
+sdm845_gpu_submit(void *handle, const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	struct polaris_gpu_client_space *client;
+
+	if (!sdm845_gpu_ready()) {
+		return 0;
+	}
+	if (handle == NULL) {
+		if (count != 0 || addresses != NULL || words != NULL) {
+			return 0;
+		}
+		return polaris_a630_gpu_kernel_fence_submit();
+	}
+	client = polaris_gpu_client_space_lookup(handle);
+	if (client == NULL || client->quarantined) {
+		return 0;
+	}
+	return polaris_a630_gpu_client_submit(client, addresses, words, count);
+}
+
 static bool
-sdm845_gpu_done(uint32_t fence)
+polaris_a630_gpu_fence_complete(uint32_t fence)
 {
 	volatile uint32_t *fence_word;
 
 	if (fence == 0) {
 		return true;
 	}
-	if (!sdm845_gpu_ready() || !polaris_gpu_ring_submit_ready || polaris_smmu_backend_faulted ||
-	    polaris_gpu_rptr_buffer.virtual == 0 || (int32_t)(polaris_gpu_last_fence - fence) < 0) {
+	if (!polaris_sdm845_gpu_hardware_ready() || !polaris_gpu_ring_submit_ready ||
+	    polaris_smmu_backend_faulted || polaris_gpu_rptr_buffer.virtual == 0 ||
+	    (int32_t)(polaris_gpu_last_fence - fence) < 0) {
 		return false;
 	}
 	fence_word = (volatile uint32_t *)(polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET);
 	polaris_cache_lines((vm_offset_t)fence_word, sizeof(*fence_word));
 	__asm__ volatile ("dsb sy" ::: "memory");
 	return (int32_t)(*fence_word - fence) >= 0;
+}
+
+static bool
+sdm845_gpu_done(uint32_t fence)
+{
+	return sdm845_gpu_ready() && polaris_a630_gpu_fence_complete(fence);
 }
 
 static uint32_t
@@ -7541,6 +7869,15 @@ polaris_a630_gpu_domain_start(uint32_t step)
 	return true;
 }
 
+static bool
+polaris_a630_gpu_full_start(uint32_t step)
+{
+	return polaris_a630_gpu_domain_start(step) && polaris_a630_gpu_core_initialize() &&
+	    polaris_a630_cp_ring_start() && polaris_a630_cp_set_unsecured_mode() &&
+	    polaris_a630_cp_fence_smoke_test() && polaris_a630_gpu_root_switch_probe() &&
+	    polaris_a630_gpu_client_ib_probe();
+}
+
 void
 hakios_adreno_sdm845_init(void)
 {
@@ -7560,7 +7897,14 @@ hakios_adreno_sdm845_init(void)
 	}
 	if (!requested_probe) {
 		if (gpu_enabled) {
-			printf("adreno-sdm845: GPU rendering is not enabled: the A630 backend is at read-only bring-up stage\n");
+			printf("adreno-sdm845: gpu=1 requests the Polaris A630 runtime; completing guarded steps 21–23 before starting HakiosGPU\n");
+			if (!polaris_a630_gpu_full_start(23u)) {
+				printf("adreno-sdm845: Polaris A630 startup/CPU-root IB probe failed; HakiosGPU is not started\n");
+				return;
+			}
+			polaris_gpu_client_submission_enabled = true;
+			printf("adreno-sdm845: A630 client submission gate opened after the step 23 probe; starting HakiosGPU\n");
+			HakiosGPUStart();
 		}
 		return;
 	}
@@ -7781,8 +8125,16 @@ hakios_adreno_sdm845_init(void)
 		printf("adreno-sdm845: step 22 finished; SID0 returned to the kernel root and temporary tables were reclaimed; public client submission remains disabled\n");
 		return;
 	}
-	if (last_step > 22u) {
-		printf("adreno-sdm845: supported explicit stages end at adreno=22; requested step %u is refused\n", last_step);
+	if (last_step == 23u) {
+		printf("adreno-sdm845: step 23 executes one bounded CP_MEM_WRITE IB under a temporary client root, returns to the kernel root for a private fence, and keeps public submissions gated\n");
+		if (!polaris_a630_gpu_full_start(23u)) {
+			return;
+		}
+		printf("adreno-sdm845: step 23 finished; client-root memory translation and return-to-kernel fence passed; the diagnostic leaves HakiosGPU stopped (gpu=1 runs this probe before starting it)\n");
+		return;
+	}
+	if (last_step > 23u) {
+		printf("adreno-sdm845: supported explicit stages end at adreno=23; requested step %u is refused\n", last_step);
 		return;
 	}
 	printf("adreno-sdm845: Polaris Adreno 630 bring-up, steps 1..%u; step 7 stages ZAP only when explicitly requested\n",

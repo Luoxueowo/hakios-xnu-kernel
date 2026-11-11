@@ -22,8 +22,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   lifecycle structure; its register, clock, power, firmware, PAS, and SMMU assumptions do not
   apply here. The Polaris backend stays separate and follows the MIX 2S tree plus A630-specific
   Qualcomm sources.
-- `CONFIG_HAKIOS_ADRENO` remains disabled in `devices/polaris/configs/polaris.config` until the
-  Polaris path has passed staged hardware bring-up.
+- `CONFIG_HAKIOS_ADRENO=y` now includes the Polaris backend in the MIX 2S kernel build. The driver
+  does not start the GPU by default; the explicit `gpu=1` boot argument runs guarded stages 21–23,
+  then starts HakiosGPU only if the client-root IB and kernel-root fence probe passes. This runtime
+  path has not yet been validated on the phone.
 - A separate `hakios.adreno.sdm845.c` probe is now wired into the driver configuration. On an
   SDM845 build, `adreno=1..4` reads the GPUCC, KGSL SMMU, GMU and (only when powered and clocked)
   3D core status; it checks the GCC GPU config-AHB clock before reading GPUCC and checks CX plus
@@ -299,12 +301,26 @@ allow it. A successful firmware boot alone is not a completed driver.
   context-bank and ASID operations follow the ARM SMMUv2 architecture specification
   ([IHI 0062](https://documentation-service.arm.com/static/5f900d34f86e16515cdc08fb)). The stage has
   not been run on the phone.
-- The A630 backend keeps public-client submission disabled. Step 21 only submits one
-  kernel-owned fence; step 22 only changes the selected SMMU root while the GPU is idle. `ready()`
-  requires a separate client-enable latch that bring-up never raises. Orderly stop accepts the
-  successful idle GPU stages from GX startup through the kernel fence smoke test; loader-return
-  quiesce uses a bounded reset/route-fault path. Neither has been validated on the phone, so clients
-  stay disabled.
+- `adreno=23` repeats steps 21–22, maps a temporary read-only client IB plus a client-writable
+  output page, and dispatches one `CP_MEM_WRITE` IB while SID0 uses that client root. The shared
+  read-only ring is scrubbed before the switch, and its client-root packet contains no kernel TTBR
+  or completion address. After CP and the A6xx RBBM clients are idle, it switches SID0 back to the
+  kernel root, scrubs the client ring image, queues a trusted kernel-root fence, and checks both
+  the output word and fence. Probe tables and buffers are reclaimed only after the kernel-root idle
+  boundary is verified; uncertain state is retained. The stage does not enable the public userclient
+  gate, and has not been run on the phone.
+- `gpu=1` runs the guarded setup through step 23 and starts the shared HakiosGPU service only after
+  the client-root output and kernel-root fence both pass. It is an explicit opt-in path and has not
+  been run on the phone. The diagnostic `adreno=N` paths leave the public-client gate closed.
+- Step 21 only submits one
+  kernel-owned fence; step 22 changes the selected SMMU root while the GPU is idle; step 23 tests an
+  IB and writable mapping in a temporary client root. The production submit callback now serializes
+  client work across CPU-driven root switches and waits for a full idle boundary before returning to
+  the kernel root for its fence. `ready()` requires a separate client-enable latch that bring-up
+  opens only after the explicit `gpu=1` path passes step 23. Orderly stop is still not validated for
+  client workloads; its current backend conservatively retains GPU resources if clients were ever
+  enabled. Loader-return quiesce uses a bounded reset/route-fault path. These lifecycle paths also
+  need on-phone validation.
 - `sdm845_gpu_stop()` first confirms the kernel fence and CP are idle, drains all four Polaris
   VBIF XINs, releases the GPU/boot OOB holds, and requests the A630 legacy-HFI slumber state using
   the DT-selected initial performance and bandwidth indices. It checks GMU slumber, CX busy and
@@ -596,22 +612,26 @@ firmware/HFI startup and initial ARC/DCVS requests are staged, while complete CX
 hardware validation of GMU-user/3D SMMU attachment, hardware-validated orderly stop and quiesce,
 recovery and thermal hooks are still missing. The orderly stop path handles the fully initialized
 kernel-owned fence stage, but has not been run on a phone.
-The A630 backend has dormant `submit`, `done`, `last`, and `report` callbacks for its kernel-root
-fence path. `submit()` now rejects every client address-space handle: without APRIV, writing the
-completion scratch while the CP uses a client root would make that writable page available to the
-client IB too. The client roots currently map only SQE and ring pages, both unprivileged and
-read-only; writable scratch remains in the kernel GPU root. Public calls also remain blocked by
-the `ready()` gate, which requires an active SID0 context, ready/sealed GMU/HFI, GPU OOB/core setup,
-authenticated PAS/ZAP, initialized CP in unsecured mode, and the completed step 21 fence smoke
-test. The separate backend-enabled flag still has no writer, so `ready()` stays false. No callback
-falls through into Redwood's SMMUv500 or register state.
+The A630 backend has `submit`, `done`, `last`, and `report` callbacks. Without APRIV, the client
+callback switches SID0 from the CPU only at a full CP/RBBM idle boundary. It scrubs the shared ring,
+switches to the client root, submits only client IB addresses, waits for complete GPU idle, then
+switches back to the kernel root before queuing the writable completion fence. Client roots map the
+SQE/ring pages as unprivileged and read-only; writable completion scratch remains only in the kernel
+GPU root. Public calls remain blocked unless the full `gpu=1` path has completed step 23; that path
+opens a separate client-enable latch and starts HakiosGPU. The `ready()` gate also requires an active
+SID0 context, ready/sealed GMU/HFI, GPU OOB/core setup, authenticated PAS/ZAP, initialized CP in
+unsecured mode, and the completed step 21 fence smoke test. Diagnostic `adreno=N` runs leave the
+client latch closed. No callback falls through into Redwood's SMMUv500 or register state.
 
-The shared service now passes an opaque address-space handle through client create/destroy,
+The shared service passes an opaque address-space handle through client create/destroy,
 map/commit/unmap and submit. Polaris allocates up to 64 client roots with ASIDs 4–67; client BOs
 are mapped only in that client's root, while each root maps SQE and ring pages as unprivileged,
-read-only mappings. The writable RPTR/fence scratch is absent from client roots. The dormant packet
-builder retains the upstream A6xx `CP_SMMU_TABLE_UPDATE` sequence, but client submissions are
-rejected before reaching it until completion can be written after returning to the kernel root.
+read-only mappings. The writable RPTR/fence scratch is absent from client roots. The kernel-root
+fence builder retains the upstream A6xx `CP_SMMU_TABLE_UPDATE` sequence. Client submissions use a
+CPU-driven SMMUv2 root switch instead, so the client-visible ring never carries a trusted TTBR or
+kernel fence address. The implementation waits synchronously for client IBs to reach full GPU idle
+before it returns to the kernel root; the subsequent kernel fence gives the shared service its
+normal completion token. This is a first functional path, not yet an asynchronous context scheduler.
 Polaris A630v2 does not advertise `ADRENO_APRIV`. Matching KGSL allocates its CP ring and SQE
 microcode as GPU-read-only without the privileged-memory flag, so ordinary read-only CP-fetch
 mappings match that driver's A630v2 memory policy
@@ -621,8 +641,9 @@ mappings match that driver's A630v2 memory policy
 The reference A6xx context-switch sequence is documented in
 ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
 [`adreno_iommu.c`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_iommu.c)).
-Client submission is still rejected, so a client root cannot be in flight through the public path.
-The destroy hook reclaims it only after a kernel-root fence and complete unmap; otherwise it retains
+The `adreno=23` probe exercises the client-root submission path with a single memory-write IB and
+private output page. The destroy hook reclaims a client root only after a kernel-root fence and
+complete unmap; otherwise it retains
 the mappings and root. The protected-mode bracket is paired with an inspection of the local A630 SQE image
 (`fw-gpu/a630_sqe.fw`, version `0x016ee19a`) using Mesa 25.0.7's `afuc-disasm`. Its IB dispatcher
 tracks nesting depth in `$12`: the ring starts at level 0, `CP_INDIRECT_BUFFER` increments the level
@@ -639,9 +660,9 @@ software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use t
 `[0x40000000, 0x100000000)`. Both allocators round to 64-KiB extents and accept exact frees. This
 address partition complements per-client stage-1 roots: each root contains read-only CP fetch pages
 and only one client's BOs; writable completion scratch is kernel-root-only. The implementation
-builds on the 4K LPAE tables and active SID0 context. User submissions remain disabled until ring
-confidentiality, completion after return to the kernel root, and runtime command submission are
-validated on the device.
+builds on the 4K LPAE tables and active SID0 context. User submissions remain disabled until the
+step 23 client-root IB, ring confidentiality, completion after return to the kernel root, and the
+orderly stop/quiesce path are validated on the device.
 
 The table descriptor format follows the existing project mapper and the ARM LPAE definitions in
 upstream Linux [`io-pgtable-arm.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c).
@@ -701,22 +722,22 @@ command isolation review, and bounded hardware submission checks.
    request, GX/GFX3D verification, core HWCG/VBIF/UCHE defaults, CP register protection, bounded
    SQE/`CP_ME_INIT` startup, PAS ZAP authentication before SQE release, the
    `CP_SET_SECURE_MODE(0)` transition, and a kernel-owned CP memory-write fence smoke test. None
-   of these write stages has been run. Step 22 now probes CPU-driven CB0 root switching at a full
-   A6xx idle boundary, but it has not been run and only tests context-register readback. Verify the
+   of these write stages has been run. Step 22 probes CPU-driven CB0 root switching at a full
+   A6xx idle boundary; step 23 dispatches one client-root IB and verifies its output plus the
+   kernel-root fence. Neither has been run on the phone. Verify the
    Apps RSC transaction, sustained bandwidth/DCVS
    behavior, GX sequencing, core readbacks, CP idle/error status, fence visibility and PAS cleanup
    against Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. The client
-   submit callback still rejects client handles. The intended no-APRIV design is to switch roots
-   from the CPU only after a full CP/RBBM idle boundary, clear the shared read-only ring before each
-   client job, submit no trusted TTBR or kernel-fence address while the client root is active, then
-   return to the kernel root before issuing the cache-flush/fence packet. This avoids exposing
-   kernel root addresses through the client-readable ring and keeps writable completion memory out
-   of client roots, but remains a design proposal until step 22 and the command path are validated
-   on Polaris. Validate register protection, root switching, ring scrubbing, fence visibility,
+   submit path now switches roots from the CPU only after a full CP/RBBM idle boundary, clears the
+   shared read-only ring before each client job, submits no trusted TTBR or kernel-fence address
+   while the client root is active, then returns to the kernel root before issuing the fence packet.
+   The path waits synchronously at the client-root boundary; it is not yet a multi-context async
+   scheduler. Step 23 exercises one CP memory-write IB through this path. Validate register
+   protection, root switching, ring scrubbing, fence visibility,
    orderly stop and loader-return quiesce before accepting submissions; add orderly partial-start
    cleanup. The stop path does not yet remove all inherited CX/GMU parent-domain and clock votes.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
-   faults; orderly stop and loader-return quiesce are validated on the phone.
+   faults; client workloads and orderly stop/loader-return quiesce are validated on the phone.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
    maintenance are implemented, with OAS and PTFS_4K checks taken from the read-only ID registers.
    Step 15 now constructs the A630 `CP_ME_INIT` and secure-mode packets offline. The local firmware
@@ -728,11 +749,11 @@ command isolation review, and bounded hardware submission checks.
    any SMMU write stage has
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
-   verify steps 19–22's bounded SQE/CP bootstrap, ZAP authentication, secure-mode transition,
-   kernel fence write and CPU-driven CB0 root switching. Implement the no-APRIV client path by
-   serializing each root change at a full A6xx idle boundary, scrubbing the shared read-only ring
-   before it is exposed to one client, and issuing the completion fence only after returning to the
-   kernel root. Validate production register protection, ring/fence mappings, mapper behavior and
+   verify steps 19–23's bounded SQE/CP bootstrap, ZAP authentication, secure-mode transition,
+   kernel fence write, CPU-driven CB0 root switching, and client-root IB output. Validate the
+   no-APRIV client path at a full A6xx idle boundary, confirm that ring scrubbing prevents stale
+   trusted packets from reaching one client, and verify the completion fence only after returning
+   to the kernel root. Then validate production register protection, ring/fence mappings, mapper behavior and
    the normal-stop path. Qualcomm's
    A630 KGSL path sets the SQE base and authenticates ZAP through PIL before releasing SQE halt,
    submits `CP_ME_INIT`, then uses `CP_SET_SECURE_MODE(0)` to leave secure mode
@@ -787,13 +808,12 @@ command isolation review, and bounded hardware submission checks.
   because a client IB can still read the shared SQE/ring pages. The kernel-owned SQE and ring now
   use unprivileged read-only mappings; writable RPTR/fence scratch is mapped only in the kernel GPU
   root and omitted from client roots. This also does not provide safe asynchronous completion by
-  itself. A CPU-driven CB0 context-switch helper and explicit `adreno=22` register probe now exist;
-  the probe builds a disposable client root and refuses to reclaim its tables if it cannot return
-  to the kernel root. It has not run on-device and does not submit a client IB. The proposed client
-  path clears the shared ring before one client's IBs, avoids putting kernel TTBR/fence addresses
-  into the client-visible ring, then switches to the kernel root at full GPU idle before flushing
-  and writing the private fence. The userclient submit callback still rejects all client handles;
-  the public gate remains closed. The local SQE guards `CP_SMMU_TABLE_UPDATE` and
+  itself. A CPU-driven CB0 context-switch helper, explicit `adreno=22` register probe, and
+  `adreno=23` client-root IB probe now exist. Step 23 runs one memory-write IB against a private
+  client-writable page, returns to the kernel root, and verifies a kernel-root fence. Both stages
+  retain their tables if the root return cannot be confirmed. They have not run on-device. The
+  production callback uses the same root-switch and ring-scrub sequence, but the userclient submit
+  gate remains closed until hardware validation. The local SQE guards `CP_SMMU_TABLE_UPDATE` and
   `CP_SET_PROTECTED_MODE` inside IBs, but broader command isolation and safe context-switch/teardown
   behavior still require hardware validation.
 - A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence
