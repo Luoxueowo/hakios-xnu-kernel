@@ -65,8 +65,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   `ro,noload`. SHA-256 hashes for all seven A630 firmware files matched `fw-gpu/SHA256SUMS`.
   Its live device tree reported model `Xiaomi Technologies, Inc. Polaris MP v2.1`, chip ID
   `0x06030001`, and the GPU, GPUCC, GMU and SMMUv2 windows recorded below. KGSL reported
-  `Adreno630v2`, a 257 MHz idle clock and available frequencies through 710 MHz. These are
-  stock Recovery/Linux observations; the HakiOS diagnostic has not yet run on the device.
+  `Adreno630v2`, `default_pwrlevel=6`/initial-pwrlevel 6 (257 MHz), and frequencies through
+  710 MHz. These are stock Recovery/Linux observations; the HakiOS diagnostic has not yet run on
+  the device.
 - The live Recovery tree's `/soc/qcom,kgsl-hyp` identifies `qcom,pil-tz-generic`, PAS ID `13`,
   firmware name `a630_zap`, and a `memory-region` phandle that resolves to the `no-map` GPU region
   at `0x8c415000/0x2000`. The matching Qualcomm SDM845 GPU DTS declares the same PAS ID, firmware
@@ -147,10 +148,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   `mas-qxm-gpu → slv-qns-memnoc-snoc → mas-qnm-memnoc → slv-qns-cnoc` (SH2, SN15, SN3). It
   mirrors Qualcomm's bus aggregation/division, BCM commit/valid encoding, VCD ordering, and A630
   KGSL wait-mask construction. The HFI payload has 13 DDR rows and 2 CNOC rows within the A630
-  fixed-size limits. It does not issue host RPMh requests, attach GMU-user
-  or 3D contexts, authenticate ZAP, enable GX/CP, or expose rendering. If either table is rejected,
-  it reasserts CM3 reset and marks the backend faulted. This write stage has not been run on the
-  phone.
+  fixed-size limits. The stage then sends legacy `H2F_MSG_TEST` to tell the A630 GMU there will be
+  no more HFI messages until the next boot. Polaris DT sets `qcom,gpu-quirk-hfi-use-reg`, the
+  upstream condition for this closeout. A630 does not use the A640-only `H2F_MSG_START`. It does
+  not issue host RPMh requests, attach GMU-user or 3D contexts, authenticate ZAP, enable GX/CP, or
+  expose rendering. Rejection of either table or `HFI_TEST` reasserts CM3 reset and marks the
+  backend faulted. This write stage has not been run on the phone.
   The bus arithmetic follows Qualcomm's downstream MSM-bus implementation for comparison; verify
   against the exact Polaris kernel revision before allowing HFI to start DCVS.
 
@@ -295,12 +298,15 @@ frequency/corner table, and GMU 200/500 MHz use the SDM845 CX minimum/low corner
 the GPU-specific ARC vote owner is the GMU; HakiOS should not duplicate those votes with CPU-side
 active TCS requests. Qualcomm's A630v2 target identifies GMU 1.3 and enables RPMh, while KGSL
 labels the A630/A615 firmware path as legacy HFI. Step 13 sends `PERF_TBL` only; step 14 sends
-`PERF_TBL` plus `BW_VOTE_TBL`. The A6xx `a6xx_gmu_hfi_start_msg()` returns without sending
-`H2F_MSG_START` unless the target is A640, so this command is not an A630 bring-up requirement.
-Qualcomm's `gmu_start()` instead enables the GMU domains/clocks, establishes a startup bus vote,
-runs `GMU_FW_START`, starts HFI, then requests the default GPU power level; HakiOS has not
-implemented or validated that power/clock sequence. An ACK for the two tables only confirms that
-firmware accepted their contents. See the primary
+`PERF_TBL`, `BW_VOTE_TBL`, then the legacy `HFI_TEST` closeout. Polaris DT sets
+`qcom,gpu-quirk-hfi-use-reg`, the upstream condition for sending that command. The A6xx
+`a6xx_gmu_hfi_start_msg()` returns without sending `H2F_MSG_START` unless the target is A640, so
+this command is not an A630 bring-up requirement. Qualcomm's `gmu_start()` enables the GMU
+domains/clocks, establishes a startup bus vote, runs `GMU_FW_START`, starts HFI, then requests the
+default GPU power level; HakiOS has not implemented or validated that power/clock sequence. The
+`HFI_TEST` ACK completes the legacy message phase; legacy DCVS uses GMU registers and still needs
+a verified power/clock and vote path. An ACK for the tables only confirms that firmware accepted
+their contents. See the primary
 [`gpucc-sdm845.c`](https://android.googlesource.com/kernel/msm/%2B/048cc82284cb0ee2c7381ec5d1b08a2f7d7aa0b4/drivers/clk/qcom/gpucc-sdm845.c),
 [`SDM845 RPMh level bindings`](https://android.googlesource.com/kernel/common/%2B/3135f5b73592988af0eb1b11ccbb72a8667be201/include/dt-bindings/power/qcom-rpmpd.h),
 [`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm/+/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/kgsl_gmu.c),
@@ -329,8 +335,9 @@ noncached kernel range beginning at `0x60000000`. `adreno=3` checks and reports 
 layout. Step 9 prepares detached HFI/dump/log mappings, step 11 attaches the GMU-kernel context,
 step 12 starts the GMU, sends `GMU_INIT`, and verifies the A630 GMU firmware version through
 `FW_VERSION`. Step 13 builds and sends the 43-dword HFI v1 `PERF_TBL`; step 14 sends that table
-with the 160-dword `BW_VOTE_TBL`. GMU-user and 3D contexts, command processor startup, and
-rendering remain pending. The cited A630 HFI flow does not use the A640-only `H2F_MSG_START`.
+with the 160-dword `BW_VOTE_TBL`, then sends `HFI_TEST` to close the legacy message phase.
+GMU-user and 3D contexts, legacy register-based DCVS, command processor startup, and rendering
+remain pending. The cited A630 HFI flow does not use the A640-only `H2F_MSG_START`.
 Steps 12–14 are code-only bring-up stages and have not
 been invoked on the phone.
 The queue-table header still reports four active slots with dispatch disabled in its queue header,

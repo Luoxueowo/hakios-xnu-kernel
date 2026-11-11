@@ -6,10 +6,11 @@
  * adreno=1..6 performs read-only probes. Explicit adreno=7 stages and releases PAS metadata,
  * adreno=10 loads GMU ITCM while reset stays asserted, adreno=11 installs only the GMU-kernel
  * SMMUv2 context and SID route, adreno=12 boots the GMU and checks HFI firmware version, and
- * adreno=13 sends the A630 HFI performance table; adreno=14 sends that table plus the reconstructed
- * DDR/CNOC bandwidth table. Write stages are guarded by runtime preflight/readbacks and are not to
- * be invoked on hardware during this bring-up. ZAP authentication, GMU-user and 3D contexts, HFI
- * START, command submission, and rendering are still unavailable, so `ready()` remains false.
+ * adreno=13 sends the A630 HFI performance table; adreno=14 sends that table and the reconstructed
+ * DDR/CNOC bandwidth table, then closes the legacy HFI message phase with HFI_TEST. Write stages
+ * are guarded by runtime preflight/readbacks and are not to be invoked on hardware during this
+ * bring-up. ZAP authentication, GMU-user and 3D contexts, GPU DCVS, command submission, and
+ * rendering are still unavailable, so `ready()` remains false.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
  *   qcom,gpucc@5090000 (qcom,gpucc-sdm845-v2)
@@ -496,6 +497,7 @@ static bool polaris_hfi_space_mapped;
 static bool polaris_gmu_firmware_loaded;
 static bool polaris_gmu_firmware_started;
 static bool polaris_gmu_hfi_ready;
+static bool polaris_gmu_hfi_sealed;
 static bool polaris_gmu_domain_ready;
 static bool polaris_gpu_core_ready;
 static bool polaris_smmu_backend_enabled;
@@ -3690,6 +3692,10 @@ polaris_gmu_hfi_send_command(const uint32_t *command, uint32_t command_dwords,
 	if (reply_dwords != NULL) {
 		*reply_dwords = 0;
 	}
+	if (polaris_gmu_hfi_sealed) {
+		printf("adreno-sdm845: step 14 rejected an HFI command after the A630 legacy HFI_TEST closed the message phase\n");
+		return false;
+	}
 	if (command == NULL || command_dwords == 0 || !polaris_hfi_state.initialized ||
 	    (reply == NULL && reply_capacity != 0) || reply_dwords == NULL) {
 		printf("adreno-sdm845: step 12 rejected an invalid A630 HFI transaction\n");
@@ -3880,8 +3886,28 @@ polaris_gmu_hfi_send_bw_vote_table(void)
 	return true;
 }
 
+static bool
+polaris_gmu_hfi_send_test(void)
+{
+	uint32_t message[2], response_dwords = 0;
+	uint32_t sequence = polaris_a630_hfi_next_sequence(&polaris_hfi_state);
+
+	if (sequence == 0 || !polaris_a630_hfi_make_test((uint16_t)sequence, message) ||
+	    !polaris_gmu_hfi_send_command(message, sizeof(message) / sizeof(message[0]), NULL, 0,
+	    &response_dwords)) {
+		printf("adreno-sdm845: step 14 A630 legacy HFI_TEST was not acknowledged\n");
+		return false;
+	}
+	if (response_dwords < 3u) {
+		printf("adreno-sdm845: step 14 HFI_TEST ACK is too short (%u dwords)\n", response_dwords);
+		return false;
+	}
+	polaris_gmu_hfi_sealed = true;
+	return true;
+}
+
 static void
-polaris_gmu_hfi_stop_after_table_failure(uint32_t step)
+polaris_gmu_hfi_stop_after_failure(uint32_t step)
 {
 	uint32_t reset = UINT32_MAX;
 
@@ -3892,6 +3918,7 @@ polaris_gmu_hfi_stop_after_table_failure(uint32_t step)
 	}
 	polaris_gmu_firmware_started = false;
 	polaris_gmu_hfi_ready = false;
+	polaris_gmu_hfi_sealed = false;
 	polaris_hfi_state.initialized = false;
 	polaris_smmu_backend_faulted = true;
 	printf("adreno-sdm845: step %u failure cleanup requested CM3 reset (readback=%#x); GMU-kernel SID5 remains attached and backend stays faulted\n",
@@ -3907,6 +3934,7 @@ polaris_gmu_hfi_start(void)
 	uint32_t reset, init_result, context, s2cr, log_info, hfi_version, firmware_version;
 
 	if (!polaris_gmu_firmware_loaded || polaris_gmu_firmware_started || polaris_gmu_hfi_ready ||
+	    polaris_gmu_hfi_sealed ||
 	    !polaris_gmu_domain_ready || polaris_gpu_core_ready || !polaris_hfi_space_mapped ||
 	    !polaris_hfi_state.initialized || polaris_hfi_state.gmu_address != POLARIS_A630_HFI_GMU_KERNEL_BASE ||
 	    !space->context_active || space->context_bank == UINT32_MAX || !route->valid ||
@@ -4495,28 +4523,29 @@ hakios_adreno_sdm845_init(void)
 			return;
 		}
 		if (!polaris_gmu_hfi_send_perf_table()) {
-			polaris_gmu_hfi_stop_after_table_failure(13u);
+			polaris_gmu_hfi_stop_after_failure(13u);
 			printf("adreno-sdm845: step 13 failed; BW table, GX core, CP, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL is acknowledged, while bus votes, GPU-user/3D routes, ZAP authentication, CP, and rendering remain disabled; A630 does not use the A640-only HFI START command\n");
+		printf("adreno-sdm845: step 13 finished; GMU PERF_TBL is acknowledged, while BW_VOTE_TBL, GPU-user/3D routes, ZAP authentication, CP, and rendering remain disabled; A630 uses legacy HFI, not the A640-only HFI START command\n");
 		return;
 	}
 	if (last_step == 14) {
-		printf("adreno-sdm845: step 14 explicitly boots GMU/HFI, then sends the A630 PERF_TBL and reconstructed BW_VOTE_TBL; A630 does not use the A640-only HFI START command or render\n");
+		printf("adreno-sdm845: step 14 boots GMU/HFI, sends A630 PERF_TBL and BW_VOTE_TBL, then HFI_TEST closes this boot's HFI message phase; GPU rendering stays disabled\n");
 		if (!polaris_gmu_hfi_start_stage(14u)) {
 			return;
 		}
-		if (!polaris_gmu_hfi_send_perf_table() || !polaris_gmu_hfi_send_bw_vote_table()) {
-			polaris_gmu_hfi_stop_after_table_failure(14u);
-			printf("adreno-sdm845: step 14 failed; GPU-user/3D routes, GX core, CP, and rendering remain disabled\n");
+		if (!polaris_gmu_hfi_send_perf_table() || !polaris_gmu_hfi_send_bw_vote_table() ||
+		    !polaris_gmu_hfi_send_test()) {
+			polaris_gmu_hfi_stop_after_failure(14u);
+			printf("adreno-sdm845: step 14 failed; legacy HFI setup did not complete, GPU-user/3D routes, GX core, CP, and rendering remain disabled\n");
 			return;
 		}
-		printf("adreno-sdm845: step 14 finished; PERF_TBL and BW_VOTE_TBL are acknowledged, while GPU-user/3D routes, ZAP authentication, GX core, CP, and rendering remain disabled\n");
+		printf("adreno-sdm845: step 14 finished; PERF_TBL, BW_VOTE_TBL, and HFI_TEST are acknowledged; the GMU will accept no further HFI messages until reboot, and GPU-user/3D routes, ZAP authentication, GX core, CP, and rendering remain disabled\n");
 		return;
 	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches only GMU SID5, step 12 boots GMU/HFI, step 13 sends PERF_TBL, and step 14 sends PERF_TBL plus BW_VOTE_TBL; "
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached GMU shared memory, step 10 loads GMU ITCM, step 11 attaches only GMU SID5, step 12 boots GMU/HFI, step 13 sends PERF_TBL, and step 14 sends PERF_TBL/BW_VOTE_TBL plus HFI_TEST; "
 		    "requested step %u is capped at %zu in the sequential probe path\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);

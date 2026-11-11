@@ -32,6 +32,7 @@
 #define POLARIS_A630_HFI_ID_DEBUG             5u
 #define POLARIS_A630_HFI_ID_BW_VOTE_TABLE     3u
 #define POLARIS_A630_HFI_ID_PERF_TABLE        4u
+#define POLARIS_A630_HFI_ID_TEST              5u
 
 #define POLARIS_A630_HFI_TYPE_COMMAND         0u
 #define POLARIS_A630_HFI_TYPE_POST            1u
@@ -396,6 +397,18 @@ polaris_a630_hfi_make_fw_version(uint32_t supported_version, uint16_t sequence, 
 		return false;
 	}
 	message[1] = supported_version;
+	return true;
+}
+
+/* Close the A630 legacy HFI message phase after its tables have been accepted. */
+static inline bool
+polaris_a630_hfi_make_test(uint16_t sequence, uint32_t message[2])
+{
+	if (message == NULL || !polaris_a630_hfi_make_header(POLARIS_A630_HFI_ID_TEST, 2,
+	    POLARIS_A630_HFI_TYPE_COMMAND, sequence, &message[0])) {
+		return false;
+	}
+	message[1] = 0;
 	return true;
 }
 
