@@ -2253,6 +2253,168 @@ rollback:
 	return false;
 }
 
+/* Detach only GMU SIDs after CM3 reset is read back; leave the 3D route to GPU-specific shutdown. */
+static bool
+polaris_smmu_gmu_context_detach(struct polaris_smmu_address_space *space,
+	const struct polaris_smmu_route_candidate *route)
+{
+	struct polaris_smmu_context_image image;
+	const char *name, *failure = "unknown state";
+	uint32_t stream_id, bank, context, attached_s2cr, fault_s2cr, current_s2cr, expected_smr;
+	uint64_t context_offset;
+
+	if (space == NULL || route == NULL) {
+		printf("adreno-sdm845: GMU SMMU detach received a null address space or route\n");
+		return false;
+	}
+	if (!space->context_active) {
+		return true;
+	}
+	if (space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL]) {
+		name = "GMU-kernel";
+		stream_id = 5u;
+	} else if (space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER]) {
+		name = "GMU-user";
+		stream_id = 4u;
+	} else {
+		printf("adreno-sdm845: GMU SMMU detach refused a non-GMU address space\n");
+		return false;
+	}
+	bank = space->context_bank;
+	if (!route->valid || route->stream_id != stream_id || route->context_bank != bank ||
+	    bank >= polaris_smmu_context_bank_count || route->slot >= POLARIS_SMMU_MAX_CONTEXT_BANKS ||
+	    ((route->expected_s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK) == SMMU_S2CR_TYPE_TRANS ||
+	    gmu.virtual == 0 || smmu.virtual == 0 ||
+	    (probe_read(&gmu, GMU_CM3_SYSRESET) & 1u) == 0 || polaris_gpu_core_ready ||
+	    polaris_gpu_cp_started || polaris_pas_image_active) {
+		failure = "CM3 reset, route identity, or GPU-idle preconditions are not satisfied";
+		goto fail;
+	}
+	if ((probe_read(&smmu, SMMU_SCR0) & SMMU_SCR0_CLIENTPD) != 0 ||
+	    !polaris_smmu_context_image_build(space, &image)) {
+		failure = "SMMU client or context image is unavailable";
+		goto fail;
+	}
+	context_offset = (uint64_t)polaris_smmu_context_base + (uint64_t)bank * polaris_smmu_context_page_size;
+	if (context_offset + polaris_smmu_context_page_size > smmu.size || context_offset > UINT32_MAX ||
+	    SMMU_CBAR(bank) + sizeof(uint32_t) > polaris_smmu_context_base ||
+	    SMMU_S2CR(route->slot) + sizeof(uint32_t) > smmu.size ||
+	    (route->stream_matching && SMMU_SMR(route->slot) + sizeof(uint32_t) > polaris_smmu_context_base)) {
+		failure = "SMMU route or context register window is invalid";
+		goto fail;
+	}
+	context = (uint32_t)context_offset;
+	attached_s2cr = route->expected_s2cr & ~(SMMU_S2CR_TYPE_FIELD_MASK | SMMU_S2CR_CBNDX_MASK);
+	attached_s2cr |= (SMMU_S2CR_TYPE_TRANS << SMMU_S2CR_TYPE_SHIFT) | bank;
+	current_s2cr = probe_read(&smmu, SMMU_S2CR(route->slot));
+	if (current_s2cr != attached_s2cr ||
+	    probe_read(&smmu, SMMU_CBAR(bank)) != image.cbar ||
+	    probe_read(&smmu, SMMU_CBA2R(bank)) != image.cba2r ||
+	    probe_read(&smmu, context + SMMU_CB_SCTLR) != image.sctlr ||
+	    probe_read(&smmu, context + SMMU_CB_ACTLR) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR0) != (uint32_t)image.ttbr0 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR0 + 4u) != (uint32_t)(image.ttbr0 >> 32) ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR1) != (uint32_t)image.ttbr1 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR1 + 4u) != (uint32_t)(image.ttbr1 >> 32) ||
+	    probe_read(&smmu, context + SMMU_CB_TCR) != image.tcr ||
+	    probe_read(&smmu, context + SMMU_CB_TCR2) != image.tcr2 ||
+	    probe_read(&smmu, context + SMMU_CB_CONTEXTIDR) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_MAIR0) != image.mair0 ||
+	    probe_read(&smmu, context + SMMU_CB_MAIR1) != image.mair1 ||
+	    probe_read(&smmu, context + SMMU_CB_FSR) != 0) {
+		failure = "attached route or GMU context changed or recorded an SMMU fault";
+		goto fail;
+	}
+	if (route->stream_matching) {
+		expected_smr = route->existing_smr ? route->expected_smr :
+		    (SMMU_SMR_VALID | (stream_id & SMMU_SMR_ID_MASK));
+		if (probe_read(&smmu, SMMU_SMR(route->slot)) != expected_smr) {
+			failure = "SMR changed since GMU attachment";
+			goto fail;
+		}
+	}
+
+	/* Arm SMMUv2 maps SIDs through S2CR; fault the stream before invalidating a newly allocated SMR. */
+	fault_s2cr = attached_s2cr & ~(SMMU_S2CR_TYPE_FIELD_MASK | SMMU_S2CR_CBNDX_MASK);
+	fault_s2cr |= SMMU_S2CR_TYPE_FAULT << SMMU_S2CR_TYPE_SHIFT;
+	probe_write(&smmu, SMMU_S2CR(route->slot), fault_s2cr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, SMMU_S2CR(route->slot)) != fault_s2cr) {
+		failure = "S2CR fault-route readback failed";
+		goto fail;
+	}
+	if (route->stream_matching && !route->existing_smr) {
+		probe_write(&smmu, SMMU_SMR(route->slot), route->expected_smr);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		if (probe_read(&smmu, SMMU_SMR(route->slot)) != route->expected_smr) {
+			failure = "new SMR invalidation readback failed";
+			goto fail;
+		}
+	}
+	if (!polaris_smmu_tlbi(space)) {
+		failure = "ASID TLB synchronization failed";
+		goto fail;
+	}
+	probe_write(&smmu, context + SMMU_CB_SCTLR, 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, context + SMMU_CB_SCTLR) != 0) {
+		failure = "context disable readback failed";
+		goto fail;
+	}
+	probe_write(&smmu, context + SMMU_CB_ACTLR, 0);
+	probe_write64(&smmu, context + SMMU_CB_TTBR0, 0);
+	probe_write64(&smmu, context + SMMU_CB_TTBR1, 0);
+	probe_write(&smmu, context + SMMU_CB_TCR, 0);
+	probe_write(&smmu, context + SMMU_CB_TCR2, 0);
+	probe_write(&smmu, context + SMMU_CB_CONTEXTIDR, 0);
+	probe_write(&smmu, context + SMMU_CB_MAIR0, 0);
+	probe_write(&smmu, context + SMMU_CB_MAIR1, 0);
+	probe_write(&smmu, SMMU_CBAR(bank), 0);
+	probe_write(&smmu, SMMU_CBA2R(bank), 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!polaris_smmu_context_is_blank(bank)) {
+		failure = "context-bank blank-state readback failed";
+		goto fail;
+	}
+	probe_write(&smmu, SMMU_S2CR(route->slot), route->expected_s2cr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, SMMU_S2CR(route->slot)) != route->expected_s2cr) {
+		failure = "original S2CR restore readback failed";
+		goto fail;
+	}
+	space->context_active = false;
+	space->context_bank = UINT32_MAX;
+	polaris_smmu_context_blank[bank] = true;
+	polaris_smmu_context_routed[bank] = false;
+	printf("adreno-sdm845: detached %s SID%u after confirmed CM3 reset; context bank %u is blank and the original S2CR is restored\n",
+	    name, stream_id, bank);
+	return true;
+
+fail:
+	polaris_smmu_backend_faulted = true;
+	printf("adreno-sdm845: %s SMMU detach refused or failed (%s); stream/context state and page tables are retained\n",
+	    space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER] ? "GMU-user" : "GMU-kernel", failure);
+	return false;
+}
+
+static bool
+polaris_smmu_gmu_contexts_detach(void)
+{
+	bool success = true;
+
+	if (polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active &&
+	    !polaris_smmu_gmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER],
+	    &polaris_smmu_gmu_user_route)) {
+		success = false;
+	}
+	if (polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active &&
+	    !polaris_smmu_gmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL],
+	    &polaris_smmu_gmu_kernel_route)) {
+		success = false;
+	}
+	return success;
+}
+
 static bool
 polaris_smmu_gpu_attach(void)
 {
@@ -4911,27 +5073,38 @@ static void
 polaris_gmu_hfi_stop_after_failure(uint32_t step)
 {
 	uint32_t reset = UINT32_MAX;
+	bool reset_confirmed = false;
+	bool gmu_contexts_detached;
 
-	polaris_gmu_gpu_oob_release();
 	if (gmu.virtual != 0) {
-		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK | A630_GMU_OOB_DCVS_ACK_MASK);
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
 		reset = probe_read(&gmu, GMU_CM3_SYSRESET);
+		reset_confirmed = (reset & 1u) != 0;
 	}
+	if (!reset_confirmed) {
+		/* Keep HFI, OOB, SMMU, and any host DDR vote live if CM3 may still be running. */
+		polaris_gmu_firmware_started = true;
+		polaris_smmu_backend_faulted = true;
+		printf("adreno-sdm845: step %u failure cleanup could not confirm CM3 reset (readback=%#x); GMU/HFI, OOB, SMMU, and DDR-vote state are retained\n",
+		    step, reset);
+		return;
+	}
+	polaris_gmu_gpu_oob_release();
+	polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK | A630_GMU_OOB_DCVS_ACK_MASK);
+	gmu_contexts_detached = polaris_smmu_gmu_contexts_detach();
 	if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
 		printf("adreno-sdm845: step %u could not confirm release of the temporary Apps RSC DDR vote\n", step);
 	}
 	polaris_gmu_firmware_started = false;
 	polaris_gmu_hfi_ready = false;
 	polaris_gmu_hfi_sealed = false;
-	polaris_gmu_boot_rail_active = false;
 	polaris_gmu_hfi_perf_table_ready = false;
 	polaris_gmu_hfi_bw_table_ready = false;
 	polaris_hfi_state.initialized = false;
 	polaris_smmu_backend_faulted = true;
-	printf("adreno-sdm845: step %u failure cleanup requested CM3 reset (readback=%#x); GMU SID5/SID4 contexts remain attached and backend stays faulted\n",
-	    step, reset);
+	printf("adreno-sdm845: step %u failure cleanup confirmed CM3 reset (readback=%#x); GMU contexts %s, the GX/MX boot-rail vote remains marked active, and the backend stays faulted\n",
+	    step, reset, gmu_contexts_detached ? "were detached" : "remain attached or faulted");
 }
 
 /* Boot GMU/HFI with the host DDR vote; the GMU-user and GMU-kernel contexts are both active. */

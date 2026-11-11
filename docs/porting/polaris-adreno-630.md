@@ -165,9 +165,8 @@ allow it. A successful firmware boot alone is not a completed driver.
   follow KGSL order (idle through 710 MHz); the live device-tree order is reversed while building
   the table. It does not send `BW_VOTE_TBL` or an additional RPMh TCS request. Qualcomm's A630 flow
   omits `H2F_MSG_START`, which the A6xx driver sends only
-  for A640. If construction or acknowledgement fails, it reasserts
-  CM3 reset, marks the backend faulted, and leaves GMU SID5/SID4 attached. This write stage has
-  not been run on the phone.
+  for A640. After successful startup, a `PERF_TBL` construction or acknowledgement failure runs
+  the verified-reset cleanup described below. This write stage has not been run on the phone.
 - `adreno=14` repeats the guarded GMU/HFI startup and its temporary Apps RSC DDR vote, sends
   `PERF_TBL`, then builds and sends the A630 v1 `H2F_MSG_BW_VOTE_TBL`. The builder validates the
   runtime bus graph and Apps RSC BCM
@@ -192,8 +191,13 @@ allow it. A successful firmware boot alone is not a completed driver.
   DRV2 v2.7, protects the shared sequencer with `hakios_rsc_lock`, and checks TCS completion and
   per-command status. ZAP authentication, command processor startup, full
   stop/thermal handling, and rendering remain unavailable. Rejection of either table,
-  `HFI_TEST`, or initial DCVS reasserts CM3 reset and marks the backend faulted. This write stage has
-  not been run on the phone.
+  `HFI_TEST`, or initial DCVS invokes failure cleanup. Cleanup verifies CM3 reset before releasing
+  the temporary Apps RSC DDR vote; after that readback, it attempts to disconnect the GMU SID4/SID5
+  routes, invalidate the ASIDs, blank the two context banks, and restore the original S2CR values.
+  It leaves the backend faulted if any readback or synchronization fails. If
+  reset cannot be confirmed, it retains HFI/OOB/SMMU state and votes. The GX/MX boot-rail vote stays
+  marked active because this failure path does not perform the normal slumber/power-down sequence.
+  This write stage has not been run on the phone.
 - `adreno=15` runs read-only steps 1–6, then builds the A630 `CP_ME_INIT` packet (12 dwords) and
   the `CP_SET_SECURE_MODE(0)` packet (2 dwords) in local stack buffers and prints them for review.
   The `CP_ME_INIT` ordinals follow the A630 KGSL 4.9 mask and values; the type-7 headers use
@@ -271,6 +275,11 @@ allow it. A successful firmware boot alone is not a completed driver.
   is not implemented yet, so stop deliberately refuses to tear resources down underneath a live
   CP. This is a safety guard, not a completed power-down path; runtime start/stop and recovery
   remain unavailable.
+- The failure-only GMU cleanup now requires CM3 reset readback before touching active SID4/SID5
+  routes. It changes each GMU S2CR to fault, invalidates a newly allocated SMR, synchronizes the
+  ASID, clears and verifies the context bank, then restores the original S2CR. It never detaches
+  GPU SID0, does not free GMU page tables, and retains the GX/MX boot-rail vote. The ordering follows
+  the SMMUv2 stream-routing rules in Linux [`arm-smmu.c`](https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/%2B/77a1c68a96f4e018860033f3827602014a4f1663/drivers/iommu/arm-smmu.c).
 - The orderly stop entry now dispatches backend `stop()` even while `ready()` is false; this is
   required to clean up a partial start. If HakiosGPU has not created its client lock yet, the stop
   path dispatches directly because no clients can exist. A630's stop hook now preserves all state
