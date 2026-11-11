@@ -5554,7 +5554,7 @@ polaris_gmu_hfi_stop_after_failure(uint32_t step)
 {
 	uint32_t reset = UINT32_MAX;
 	bool reset_confirmed = false;
-	bool gmu_contexts_detached;
+	bool gmu_contexts_detached, gpu_context_detached;
 
 	if (gmu.virtual != 0) {
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
@@ -5572,19 +5572,34 @@ polaris_gmu_hfi_stop_after_failure(uint32_t step)
 	}
 	polaris_gmu_gpu_oob_release();
 	polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK | A630_GMU_OOB_DCVS_ACK_MASK);
-	gmu_contexts_detached = polaris_smmu_gmu_contexts_detach();
-	if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
-		printf("adreno-sdm845: step %u could not confirm release of the temporary Apps RSC DDR vote\n", step);
-	}
+	/* Detach requires the software state to reflect the reset readback above. */
 	polaris_gmu_firmware_started = false;
 	polaris_gmu_hfi_ready = false;
 	polaris_gmu_hfi_sealed = false;
 	polaris_gmu_hfi_perf_table_ready = false;
 	polaris_gmu_hfi_bw_table_ready = false;
 	polaris_hfi_state.initialized = false;
+	polaris_gmu_slumber_confirmed = false;
+	polaris_gmu_cm3_reset_confirmed = true;
+	gmu_contexts_detached = polaris_smmu_gmu_contexts_detach();
+	/* SID0 has an independent route and must not be left pointing at a detached root. */
+	gpu_context_detached = polaris_smmu_gpu_context_detach();
+	if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
+		printf("adreno-sdm845: step %u could not confirm release of the temporary Apps RSC DDR vote\n", step);
+	}
+	if (gmu_contexts_detached && gpu_context_detached && !polaris_smmu_backend_faulted &&
+	    !polaris_gpu_core_ready && !polaris_gpu_core_configured && !polaris_gpu_cp_started &&
+	    !polaris_gpu_cp_initialized && polaris_gpu_active_space == NULL) {
+		polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_context_probe_data);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_context_probe_ib);
+	}
 	polaris_smmu_backend_faulted = true;
-	printf("adreno-sdm845: step %u failure cleanup confirmed CM3 reset (readback=%#x); GMU contexts %s, the GX/MX boot-rail vote remains marked active, and the backend stays faulted\n",
-	    step, reset, gmu_contexts_detached ? "were detached" : "remain attached or faulted");
+	printf("adreno-sdm845: step %u failure cleanup confirmed CM3 reset (readback=%#x); GMU contexts %s, SID0 %s, the GX/MX boot-rail vote remains marked active, and the backend stays faulted\n",
+	    step, reset, gmu_contexts_detached ? "were detached" : "remain attached or faulted",
+	    gpu_context_detached ? "was detached or was not active" : "remains attached or faulted");
 }
 
 /* Boot GMU/HFI with the host DDR vote; the GMU-user and GMU-kernel contexts are both active. */

@@ -348,9 +348,13 @@ allow it. A successful firmware boot alone is not a completed driver.
   no-GBIF bus drain in [`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/b6410c3f75259c0ca2df45a01838d2e46272723e/drivers/gpu/msm/adreno_a6xx_gmu.c) and
   [`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/63407d3081a6b406d94bd7d96ff2ca38fa7df236/drivers/gpu/drm/msm/adreno/a6xx_gpu.c). This implementation has not been run on hardware.
 - The failure-only GMU cleanup now requires CM3 reset readback before touching active SID4/SID5
-  routes. It changes each GMU S2CR to fault, invalidates a newly allocated SMR, synchronizes the
-  ASID, clears and verifies the context bank, then restores the original S2CR. It never detaches
-  GPU SID0, does not free GMU page tables, and retains the GX/MX boot-rail vote. The ordering follows
+  routes and only then clears its software `firmware_started` state. It changes each GMU S2CR to
+  fault, invalidates a newly allocated SMR, synchronizes the
+  ASID, clears and verifies the context bank, then restores the original S2CR. It attempts to detach
+  GPU SID0 after the GMU contexts. CP buffers are freed only if every relevant context detached and
+  the GPU core remains confirmed off; GMU page tables/HFI backing and the GX/MX boot-rail vote stay
+  retained, and the backend remains faulted. A failed reset/detach keeps possibly referenced state.
+  The ordering follows
   the SMMUv2 stream-routing rules in Linux [`arm-smmu.c`](https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/%2B/77a1c68a96f4e018860033f3827602014a4f1663/drivers/iommu/arm-smmu.c).
 - The orderly stop entry dispatches backend `stop()` even while `ready()` is false. If HakiosGPU
   has not created its client lock yet, the stop path dispatches directly because no clients can
