@@ -776,7 +776,13 @@ command isolation review, and bounded hardware submission checks.
    complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno
    buffer allocation, mappings, command submission, synchronization, surfaces and display; then
-   exercise the Metal client on the same service where supported. Add hang timeout/recovery and
+   add an A630-specific Metal client profile and exercise that path on the same service. The
+   existing `hakios-metal` implementation cannot be used as-is: `Gpu::chipId()` reads Polaris's
+   `0x06030001`, while `hakios_metal_chip_known()` only accepts `0x06030500` (the A635-family
+   Adreno 642L profile) or zero. Its PM4, 512 KiB GMEM, texture and ir3 compiler tables are also
+   built for that A635 profile; Polaris reports 1 MiB GMEM. The current Metal open path therefore
+   refuses the A630 before command submission. Preserve the chip-ID gate until the A630-specific
+   hardware and compiler data are implemented and validated. Add hang timeout/recovery and
    resource limits needed for persistent system use.
    **Gate:** sustained UI rendering, client teardown, repeated GPU start/stop, and software
    fallback all work on Polaris without kernel faults or GPU hangs.
@@ -807,6 +813,10 @@ command isolation review, and bounded hardware submission checks.
   Apps RSC active-TCS path remains unverified on hardware.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
+- The existing `hakios-metal` window-server client is A635/Adreno 642L-specific. It refuses the
+  Polaris A630 chip ID (`0x06030001` versus its accepted `0x06030500`) and its command, GMEM,
+  texture and ir3 compiler data do not describe the A630. Until an A630-specific implementation
+  is validated, the MIX 2S UI must use the non-Metal rendering path.
 - Do not assume CP APRIV can separate kernel and client mappings on this device. The Polaris
   SDM845 kernel's `a630v2` catalog entries omit `ADRENO_APRIV`, and its A6xx ring startup path does
   not program `CP_APRIV_CNTL`. Matching KGSL allocates its CP ring and SQE microcode as

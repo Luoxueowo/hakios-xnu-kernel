@@ -4,6 +4,12 @@ Two implementations of Metal draw the window server on the phone's Adreno 642L. 
 measure it, and what is not known. The numbers: [Metal measurements](metal-measurements.md). How it got here, step by step:
 [the plan](../metal-plan.md).
 
+This implementation does not currently support the MIX 2S Adreno 630. `hakios-metal` accepts chip ID `0x06030500` and its
+PM4, GMEM, texture and ir3 compiler data describe the A635-family Adreno 642L. Polaris reports `0x06030001` and has a different
+GMEM profile. `hakios_metal_open()` rejects that chip ID, so the Metal plug-in cannot use the Polaris GPU service yet. An A630
+Metal port needs an A630-specific hardware/compiler profile and device validation; changing only the reported chip ID would leave
+the command and shader data describing different hardware.
+
 **Status, POCO X5 Pro 5G, 3 and 4 November 2026.** Both paths draw the system correctly. hakios-metal is the faster: page swipes 100
 to 104 frames a second, Settings' scroll about 90, the home button about 90 at the full 1125x2436; rendering at 750x1624, stretched to the panel (`fbscale=2`, the default of `tools/metal-run.sh`), scroll 118 to 120, swipes 107 to 118, home button 95 to 111, about 110 over the bench as a whole. metal2vulkan: swipes 50 to 57, scroll 41. **120 frames a second has not been
 reached on either.** Neither is on by default: without `metal=1` the window server draws through OpenGL ES, as it always has.
