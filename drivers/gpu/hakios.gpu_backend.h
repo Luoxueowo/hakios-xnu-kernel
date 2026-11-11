@@ -13,6 +13,8 @@ struct hakios_gpu_backend_ops {
 	bool (*parameter)(uint32_t which, uint64_t *value);
 	void (*quiesce)(void);
 	void (*minute)(void);
+	uint64_t (*address)(uint64_t size);
+	void (*address_free)(uint64_t address, uint64_t size);
 	bool (*map)(uint64_t address, uint64_t phys, bool read_only);
 	void (*mapped)(void);
 	void (*unmap)(uint64_t address, uint64_t size);

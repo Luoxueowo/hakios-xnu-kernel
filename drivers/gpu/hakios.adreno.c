@@ -3344,8 +3344,8 @@ hakios_gpu_profile_parameter(uint32_t which, uint64_t *value)
 }
 
 /* Addresses for a buffer of so many bytes; 0: none left. */
-uint64_t
-hakios_gpu_address(uint64_t size)
+static uint64_t
+redwood_gpu_address(uint64_t size)
 {
 	size = (size + 0xffff) & ~0xffffull;
 	for (unsigned i = 0; i < gpu_free_count; i++) {
@@ -3363,8 +3363,8 @@ hakios_gpu_address(uint64_t size)
 	return 0;
 }
 
-void
-hakios_gpu_address_free(uint64_t address, uint64_t size)
+static void
+redwood_gpu_address_free(uint64_t address, uint64_t size)
 {
 	unsigned at;
 
@@ -3628,6 +3628,8 @@ const struct hakios_gpu_backend_ops hakios_gpu_redwood_backend_ops = {
 	.parameter = hakios_gpu_profile_parameter,
 	.quiesce = redwood_adreno_quiesce,
 	.minute = redwood_adreno_minute,
+	.address = redwood_gpu_address,
+	.address_free = redwood_gpu_address_free,
 	.map = redwood_gpu_map,
 	.mapped = redwood_gpu_mapped,
 	.unmap = redwood_gpu_unmap,
@@ -3667,6 +3669,21 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 {
 	return gpu_backend_ops != NULL && gpu_backend_ops->parameter != NULL &&
 	    gpu_backend_ops->parameter(which, value);
+}
+
+uint64_t
+hakios_gpu_address(uint64_t size)
+{
+	return gpu_backend_ops != NULL && gpu_backend_ops->address != NULL ?
+	    gpu_backend_ops->address(size) : 0;
+}
+
+void
+hakios_gpu_address_free(uint64_t address, uint64_t size)
+{
+	if (gpu_backend_ops != NULL && gpu_backend_ops->address_free != NULL) {
+		gpu_backend_ops->address_free(address, size);
+	}
 }
 
 bool

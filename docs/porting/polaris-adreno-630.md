@@ -17,8 +17,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   Polaris path has passed staged hardware bring-up.
 - A separate `hakios.adreno.sdm845.c` probe is now wired into the driver configuration. On an
   SDM845 build, `adreno=1..4` reads the GPUCC, KGSL SMMU, GMU and (only when powered and clocked)
-  3D core status; it does not write registers or expose rendering. This probe has not been run on
-  the phone yet.
+  3D core status; it checks the GCC GPU config-AHB clock before reading GPUCC and checks CX plus
+  GPU MEMNOC before reading the SMMU. Step 2 also reports SMMU capabilities and the current
+  SMR/S2CR stream routing (or the device-tree KGSL stream IDs when stream indexing is active).
+  It does not write registers or expose rendering. This probe has not been run on the phone yet.
 - Firmware has been extracted read-only from the Polaris Recovery vendor partition. The local
   `fw-gpu/` directory is ignored by Git; the blobs must stay out of the repository and be staged
   into the image only by the existing firmware packaging path.
@@ -46,10 +48,24 @@ The separate SDM845 v2 GFX3D clock controller is present in Google's downstream
 and the matching Android device tree. A6xx GPU/GMU register XML is the reference for generation
 shared registers; the Polaris tree and the phone's firmware remain authoritative for device data.
 
-The IOMMU references in the tree include GMU kernel/user contexts 5/4, the 3D user context 0,
-and secure contexts 2/1. `qcom,use-3-lvl-tables` is present. The final stream IDs/masks, context
-bank policy, secure-context ownership, and which device-tree resource the firmware expects must
-be re-read from the complete properties before any SMMU programming.
+The device-tree `iommus` tuples resolve through phandle `0x204` to `arm,smmu-kgsl`, whose
+`#iommu-cells` is 1. Their arguments are stream IDs, not context-bank numbers:
+
+| Client | Stream IDs | Device-tree node |
+|---|---:|---|
+| 3D user | `0` | `qcom,kgsl-iommu/gfx3d_user` (`qcom,gpu-offset = 0x48000`) |
+| 3D secure | `2`, `1` | `qcom,kgsl-iommu/gfx3d_secure` |
+| GMU kernel | `5` | `qcom,gmu/gmu_kernel` |
+| GMU user | `4` | `qcom,gmu/gmu_user` |
+
+The SMMU node is marked `qcom,dynamic` and `qcom,use-3-lvl-tables`; the KGSL node also has
+`qcom,protect = <0x40000 0xc000>`. These facts identify the stream assignments and table mode,
+but they do not establish context-bank numbers, SMR masks, secure-context ownership, or whether
+the active hypervisor lets this kernel program those streams. Those still need validation against
+the matching Qualcomm KGSL/SMMU implementation and the live device before SMMU writes.
+The read-only probe decodes the SMMU ID registers and current stream-routing registers using the
+ARM SMMUv2 register layout cross-checked against upstream Linux [`arm-smmu.h`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)
+and [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
 The v2 SMMU at `0x05040000` is not interchangeable with the Redwood driver's SMMUv500 at
 `0x03da0000`.
 
@@ -62,8 +78,8 @@ starting the CP.
 
 ## MSM capability profile
 
-The shared service's `GET_PARAM` answers are being changed from Redwood constants to a selected
-GPU profile. For Polaris, the profile values now recorded in `hakios.adreno.c` are:
+The shared service's `GET_PARAM` answers come from the selected GPU profile. For Polaris, the
+profile values now recorded in `hakios.adreno.c` are:
 
 | MSM parameter | Polaris value | Evidence |
 |---|---:|---|
@@ -93,6 +109,12 @@ cannot fall through into Redwood's SMMUv500 or register state. The A630 implemen
 those operations with SDM845/A630 register, clock, power, RPMh/GMU, PAS firmware, SMMUv2 and core
 logic. Shared code may own page-table allocation where formats match, ring primitives and the
 IOKit service only after each shared operation has an explicit compatibility reason.
+
+GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
+software-only, locked 32-bit IOVA allocator: the lower 1 GiB is reserved for backend-owned
+firmware/ring mappings, while client allocations use `[0x40000000, 0x100000000)`. It records each
+allocation and accepts only exact frees. This does not install SMMU mappings or enable rendering;
+the backend remains not ready until its translation and submission paths are implemented.
 
 The backend boundary must carry at least: SoC/GPU identity, firmware file set, MMIO resources,
 GMEM and frequency capabilities, SMMU implementation and stream/context assignments, startup and
