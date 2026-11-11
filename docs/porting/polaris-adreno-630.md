@@ -36,8 +36,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   this is compile evidence only, not a device boot or GPU runtime result.
 - The Polaris loader builds the XNU-facing `/arm-io/gic` node from its SDM845 platform profile:
   the GICv3 distributor/redistributor addresses and virtual-timer PPI match the device profile,
-  while the `arm-io` `ranges` property supplies the nonzero SoC base expected by XNU. This is
-  separate from the Android/Recovery tree, which names the controller under `/soc`. A read-only
+  while the `arm-io` `ranges` property supplies the nonzero SoC base expected by XNU. It now also
+  embeds the checked-in Android DTB at build time and imports its `/soc` and `/reserved-memory`
+  subtrees into the Apple-format tree, preserving the root `interrupt-parent`. Names longer than
+  the Apple tree's 32-byte fields are omitted. The loader reserves 2 MiB for the resulting tree
+  and aborts before kernel handoff if it does not fit. This makes the runtime DT paths used by the
+  Polaris drivers available; it is build/source evidence only, not a phone boot. A read-only
   Recovery inspection on 2026-11-12 found the KGSL interrupt tuple `<0 0x12c 0>`. The KGSL node
   inherits root interrupt-parent phandle `1` (`qcom,pdc-sdm845-v2`), whose parent is the GICv3
   node at `0x17a00000` (phandle `0xa2`). The existing generic XNU GICv3 path has an SPI attach

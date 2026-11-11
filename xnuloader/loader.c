@@ -12,6 +12,9 @@
 #include "efi.h"
 #include "identity.h"         /* who Darwin shall think we are: from the iPhone's own device tree (mkidentity.py) */
 #include "identity_conf.h"    /* the serial number and the UDID's inputs: devices/<device>/identity.conf (mkidentityconf.py) */
+#ifdef HAVE_POLARIS_ANDROID_DTB
+#include "polaris_android_dtb.h"
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
@@ -733,6 +736,184 @@ dt_end(struct dt_writer *w)
 {
 	w->depth--;
 }
+
+#ifdef HAVE_POLARIS_ANDROID_DTB
+/* The Polaris loader receives an Apple-format tree, while SoC drivers use the Android DT paths. */
+struct fdt_reader {
+	const uint8_t *blob;
+	uint32_t struct_offset, struct_size;
+	uint32_t strings_offset, strings_size;
+	uint32_t offset;
+	uint32_t selected_nodes;
+};
+
+enum {
+	FDT_BEGIN_NODE = 1,
+	FDT_END_NODE = 2,
+	FDT_PROP = 3,
+	FDT_NOP = 4,
+	FDT_END = 9,
+	FDT_MAX_DEPTH = 12,
+};
+#define FDT_MAGIC 0xd00dfeedu
+
+static uint32_t
+fdt_be32(const uint8_t *p)
+{
+	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+static int
+fdt_read_node_name(struct fdt_reader *r, const char **name)
+{
+	uint32_t start = r->offset;
+	uint32_t end = r->struct_offset + r->struct_size;
+
+	while (r->offset < end && r->blob[r->offset] != 0) {
+		r->offset++;
+	}
+	if (r->offset == end) {
+		return 0;
+	}
+	*name = (const char *)(r->blob + start);
+	r->offset = (r->offset + 4) & ~3u;
+	return r->offset <= end;
+}
+
+/* Consume one FDT node and copy it when it belongs to /soc or /reserved-memory. */
+static int
+fdt_copy_node(struct fdt_reader *r, struct dt_writer *w, const char *node_name, uint32_t depth, int emit)
+{
+	uint32_t end = r->struct_offset + r->struct_size;
+	int write_node = emit && str_len(node_name) <= 32;
+
+	if (depth > FDT_MAX_DEPTH) {
+		return 0;
+	}
+	if (write_node) {
+		dt_begin(w, node_name);
+	}
+	for (;;) {
+		uint32_t token;
+
+		if (r->offset > end || end - r->offset < 4) {
+			return 0;
+		}
+		token = fdt_be32(r->blob + r->offset);
+		r->offset += 4;
+		if (token == FDT_BEGIN_NODE) {
+			const char *child_name;
+			int child_emit;
+
+			if (!fdt_read_node_name(r, &child_name)) {
+				return 0;
+			}
+			if (depth == 0) {
+				child_emit = str_eq(child_name, "soc") || str_eq(child_name, "reserved-memory");
+				if (child_emit) {
+					r->selected_nodes++;
+				}
+			} else {
+				child_emit = write_node;
+			}
+			if (!fdt_copy_node(r, w, child_name, depth + 1, child_emit)) {
+				return 0;
+			}
+		} else if (token == FDT_PROP) {
+			uint32_t length, name_offset, data_offset;
+			const char *prop_name;
+			uint32_t strings_end = r->strings_offset + r->strings_size;
+			uint32_t name_end;
+
+			if (r->offset > end || end - r->offset < 8) {
+				return 0;
+			}
+			length = fdt_be32(r->blob + r->offset);
+			name_offset = fdt_be32(r->blob + r->offset + 4);
+			r->offset += 8;
+			data_offset = (r->offset + 3) & ~3u;
+			if (name_offset >= r->strings_size || data_offset > end || length > end - data_offset) {
+				return 0;
+			}
+			prop_name = (const char *)(r->blob + r->strings_offset + name_offset);
+			name_end = r->strings_offset + name_offset;
+			while (name_end < strings_end && r->blob[name_end] != 0) {
+				name_end++;
+			}
+			if (name_end == strings_end) {
+				return 0;
+			}
+			if ((write_node && !str_eq(prop_name, "name") && str_len(prop_name) <= 32) ||
+			    (depth == 0 && str_eq(prop_name, "interrupt-parent"))) {
+				dt_prop(w, prop_name, r->blob + data_offset, length);
+			}
+			r->offset = (data_offset + length + 3) & ~3u;
+			if (r->offset > end) {
+				return 0;
+			}
+		} else if (token == FDT_END_NODE) {
+			if (write_node) {
+				dt_end(w);
+			}
+			return 1;
+		} else if (token == FDT_NOP) {
+			continue;
+		} else {
+			return 0;
+		}
+	}
+}
+
+static int
+dt_import_polaris_android(struct dt_writer *w)
+{
+	struct fdt_reader r = { .blob = polaris_android_dtb };
+	const uint8_t *blob = polaris_android_dtb;
+	uint32_t total_size, struct_offset, strings_offset, struct_size, strings_size;
+	const char *root_name;
+
+	if (sizeof(polaris_android_dtb) < 40 || fdt_be32(blob) != FDT_MAGIC) {
+		print("Polaris Android DTB has an invalid header\n");
+		return 0;
+	}
+	total_size = fdt_be32(blob + 4);
+	struct_offset = fdt_be32(blob + 8);
+	strings_offset = fdt_be32(blob + 12);
+	struct_size = fdt_be32(blob + 36);
+	strings_size = fdt_be32(blob + 32);
+	if (total_size > sizeof(polaris_android_dtb) || total_size < 40 || struct_offset > total_size ||
+	    struct_size > total_size - struct_offset || strings_offset > total_size ||
+	    strings_size > total_size - strings_offset || struct_offset < 40 || strings_offset < 40) {
+		print("Polaris Android DTB has invalid section bounds\n");
+		return 0;
+	}
+	r.struct_offset = struct_offset;
+	r.struct_size = struct_size;
+	r.strings_offset = strings_offset;
+	r.strings_size = strings_size;
+	r.offset = struct_offset;
+	if (struct_size < 8 || fdt_be32(blob + r.offset) != FDT_BEGIN_NODE) {
+		print("Polaris Android DTB has no root node\n");
+		return 0;
+	}
+	r.offset += 4;
+	if (!fdt_read_node_name(&r, &root_name) || root_name[0] != 0 ||
+	    !fdt_copy_node(&r, w, root_name, 0, 0)) {
+		print("Polaris Android DTB structure is malformed\n");
+		return 0;
+	}
+	while (r.offset + 4 <= struct_offset + struct_size && fdt_be32(blob + r.offset) == FDT_NOP) {
+		r.offset += 4;
+	}
+	if (r.offset + 4 > struct_offset + struct_size || fdt_be32(blob + r.offset) != FDT_END ||
+	    r.selected_nodes != 2) {
+		print("Polaris Android DTB is missing /soc or /reserved-memory\n");
+		return 0;
+	}
+	print("Polaris Android DT: imported /soc and /reserved-memory\n");
+	return 1;
+}
+#endif /* HAVE_POLARIS_ANDROID_DTB */
 
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
@@ -3365,6 +3546,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* everything up to topOfKernelData is the kernel's static region: it must cover both images */
 	uint64_t dt_pa = rd1_size != 0 ? rd1_pa + rd1_size : rd_pa + rd_size;
 	uint64_t dt_max = 0x10000;
+#ifdef HAVE_POLARIS_ANDROID_DTB
+	/* Polaris includes the SoC and reserved-memory subtrees from its Android DTB. */
+	if (PLAT == &platform_polaris) {
+		dt_max = 0x200000;
+	}
+#endif
 	uint64_t ba_pa = dt_pa + dt_max;
 	uint64_t top = ba_pa + PAGE_SIZE_MAX;
 
@@ -3906,6 +4093,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_end(&w);
 	}
 	dt_end(&w);
+	/* The A630 and other Polaris SoC drivers resolve their MMIO, clocks and reserved memory by Android DT path. */
+#ifdef HAVE_POLARIS_ANDROID_DTB
+	if (plat == &platform_polaris && !dt_import_polaris_android(&w)) {
+		return 0;
+	}
+#endif
 
 	dt_end(&w);
 

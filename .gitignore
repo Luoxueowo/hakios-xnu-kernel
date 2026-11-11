@@ -53,6 +53,7 @@ __pycache__/
 !/xnuloader/loader.c
 !/xnuloader/mkidentity.py
 !/xnuloader/mkidentityconf.py
+!/xnuloader/mkpolarisdtb.py
 !/xnuloader/mkpayload.py
 
 /qemu/*
@@ -112,6 +113,7 @@ __pycache__/
 # devices/<device>/identity.conf -- that file is tracked, the header is not)
 /xnuloader/identity.h
 /xnuloader/identity_conf.h
+/xnuloader/polaris_android_dtb.h
 !/xnuloader/im4p.py
 !/xnuloader/mkidentity.sh
 
