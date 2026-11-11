@@ -220,3 +220,4 @@ Edited: drivers/gpu/hakios.gpu.cpp, drivers/gpu/hakios.adreno.c, xnu/files/iokit
 - G15 SKIPPED. Releasing the global GPU lock while waiting for ring space is a locking-design change.
 - G16 SKIPPED. Cache invalidation after GPU writes depends on the SMMU/bus coherency model; NEEDS-HARDWARE.
 - G17 SKIPPED. Needs to know whether IOKit serialises `clientClose()` against calls in flight; not established.
+- GPU hang admission FIXED. `gpu.cpp`: a long completion wait now latches `gGPUUnresponsive` separately from the one-shot diagnostic flag. Later submits return `kIOReturnTimeout` before cache maintenance or backend submission, while `hakios_gpu_ready()` stays true so in-flight buffers remain retained. A ring-full diagnostic alone no longer makes every later fence wait fail immediately.

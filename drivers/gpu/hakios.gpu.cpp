@@ -185,6 +185,7 @@ struct hakios_show {
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
 static bool gGPUReported;
+static bool gGPUUnresponsive;                   /* a long completion wait expired; keep buffers, but take no more work */
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 static bool gGPUServiceStarted;
 
@@ -212,16 +213,19 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			}
 			return true;
 		}
-		if (mach_absolute_time() - began >= patience || gGPUReported) {
+		if (mach_absolute_time() - began >= patience || gGPUUnresponsive) {
 			break;                  /* (a GPU that has stopped answering is not waited for again) */
 		}
 		IOLockUnlock(gGPULock);
 		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
 		IOLockLock(gGPULock);
 	}
-	if (milliseconds >= 1000 && !gGPUReported) {
-		gGPUReported = true;
-		hakios_gpu_report("no answer");
+	if (milliseconds >= 1000 && !gGPUUnresponsive) {
+		gGPUUnresponsive = true;
+		if (!gGPUReported) {
+			gGPUReported = true;
+			hakios_gpu_report("no answer");
+		}
 	}
 	return false;
 }
@@ -1051,6 +1055,11 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		goto out;
 	}
 	IOLockLock(gGPULock);
+	if (gGPUUnresponsive) {
+		IOLockUnlock(gGPULock);
+		ret = kIOReturnTimeout;
+		goto out;
+	}
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
