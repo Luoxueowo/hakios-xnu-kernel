@@ -5391,6 +5391,12 @@ sdm845_gpu_stop(void)
 	bool cp_buffers_present = polaris_gpu_sqe_buffer.virtual != 0 || polaris_gpu_ring_buffer.virtual != 0 ||
 	    polaris_gpu_rptr_buffer.virtual != 0;
 
+	/* Never remove GX/PAS resources underneath an SQE that has been released from halt. */
+	if (polaris_gpu_cp_started || polaris_pas_image_active) {
+		printf("adreno-sdm845: GPU stop retains CP/GX/SMMU/PAS state; A630 idle, ring stop, and reset sequencing is not implemented\n");
+		return;
+	}
+
 	polaris_gmu_gpu_oob_release();
 	if (polaris_gmu_boot_rail_active) {
 		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);

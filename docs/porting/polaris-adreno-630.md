@@ -258,6 +258,11 @@ allow it. A successful firmware boot alone is not a completed driver.
   [`adreno_ringbuffer.c`](https://android.googlesource.com/kernel/msm/%2B/037b70a47d04f86b930d349f38a8dcfd7fd07944/drivers/gpu/msm/adreno_ringbuffer.c).
   `ready()` remains false and user submissions are disabled. This write stage has not been run on
   the phone.
+- Once SQE halt has been released, `sdm845_gpu_stop()` now leaves the GMU OOB vote, PAS image,
+  SMMU mappings and CP buffers intact. A630's graceful idle/slumber, ring stop and reset sequence
+  is not implemented yet, so stop deliberately refuses to tear resources down underneath a live
+  CP. This is a safety guard, not a completed power-down path; runtime start/stop and recovery
+  remain unavailable.
 
 ## Polaris hardware facts
 
@@ -642,6 +647,9 @@ bring-up and a bounded test submission.
   Apps RSC active-TCS path remains unverified on hardware.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
+- A630 shutdown after SQE startup: the current stop hook conservatively retains hardware votes,
+  PAS and buffers. Implement and validate the GMU idle/slumber and CP stop/reset sequence before
+  enabling client submissions or claiming recoverable power-down.
 
 These are gates to resolve with source evidence and controlled device runs, not values to infer
 from Redwood or fill with guessed constants. The Dipper repository is only a comparison reference:
