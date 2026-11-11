@@ -104,11 +104,11 @@ allow it. A successful firmware boot alone is not a completed driver.
 - `adreno=7` now exercises PAS ZAP staging and cleanup: it requires the DT-resolved reserved
   region, affirmative PAS 13 support, the required SCM calls, and already-powered CX/GMU and
   GX/GFX3D clocks. It sends the ELF header plus `.b01` hash metadata to `PAS_INIT_IMAGE`, assigns
-  the aligned image span with `PAS_MEM_SETUP`, copies `.b02`, then shuts PAS down. It does not call
-  `PAS_AUTH_AND_RESET`: Qualcomm's A6xx startup enables SQE and initializes CP first, then
-  authenticates ZAP, submits `CP_SET_SECURE_MODE(0)`, and waits for CP idle. HakiOS does not yet
-  implement that SQE/CP secure-mode transition path, so a verified SID0 route alone is not enough
-  to make standalone authentication safe. This write stage has not been invoked on the device;
+  the aligned image span with `PAS_MEM_SETUP`, copies `.b02`, then shuts PAS down without
+  authentication. Step 19 restages and authenticates ZAP through `PAS_AUTH_AND_RESET` before
+  releasing SQE halt, matching Qualcomm's A630 `a6xx_microcode_load()` order. HakiOS still keeps
+  the GPU in secure mode until a later `CP_SET_SECURE_MODE(0)` stage. This write stage has not
+  been invoked on the device;
   `ready()` remains false.
 - `adreno=11` is an explicit SMMUv2 write stage. It runs steps 1–6, prepares detached HFI buffers
   and separate GPU, GMU-kernel, and GMU-user page-table roots, then performs a fresh read-only SMMU
@@ -231,15 +231,16 @@ allow it. A successful firmware boot alone is not a completed driver.
   This write stage has not been run on the phone; `ready()` remains false.
 - `adreno=19` repeats the guarded GMU/GX startup and step 18 core setup, programs the SQE,
   read-only 32-KiB CP ring and writable RPTR page, then releases SQE halt and publishes the
-  12-dword `CP_ME_INIT` packet. It verifies the programmed IOVAs and ring control before starting
-  CP, verifies the published WPTR, then waits up to two seconds for RPTR to retire the packet,
-  RBBM CP/AHB busy bits to clear, and CP error, hardware-fault and protection status to stay clear. Failures fault the backend
-  and retain buffers and power for diagnosis. This follows Qualcomm's A630 `a6xx_rb_start()` /
-  `a6xx_send_cp_init()` sequence in [`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c) and
+  12-dword `CP_ME_INIT` packet. Before releasing SQE halt, it restages the validated ZAP image and
+  calls PAS `AUTH_AND_RESET`; an authenticated image remains active until GPU shutdown. It verifies
+  the programmed IOVAs and ring control, verifies the published WPTR, then waits up to two seconds
+  for RPTR to retire the packet, RBBM CP/AHB busy bits to clear, and CP error, hardware-fault and
+  protection status to stay clear. Failures fault the backend and retain buffers and power for
+  diagnosis. This follows Qualcomm's A630 `a6xx_rb_start()` / `a6xx_microcode_load()` /
+  `a6xx_send_cp_init()` order in [`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c) and
   the ring-size definition in [`adreno_a6xx.h`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_a6xx.h).
-  Secure mode remains unchanged; ZAP authentication, `CP_SET_SECURE_MODE`, fences and user
-  submissions are not attempted. This write stage has not been run on the phone; `ready()` remains
-  false.
+  Secure mode remains enabled; `CP_SET_SECURE_MODE(0)`, fences and user submissions are not
+  attempted. This write stage has not been run on the phone; `ready()` remains false.
 
 ## Polaris hardware facts
 
@@ -563,8 +564,9 @@ bring-up and a bounded test submission.
    bounded SQE/`CP_ME_INIT` startup with idle/error readbacks; none of these write stages has been
    run. Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior, GX sequencing, core
    readbacks and CP idle/error status against Polaris before proceeding. Keep step 7 limited to PAS
-   staging and shutdown. Next implement the secure-mode transition and ZAP authentication in the
-   A630 order; verify CP idle and unwind PAS, GMU, GPU OOB and power state on failure.
+   staging and shutdown. Step 19 now authenticates ZAP before SQE startup; next implement the
+   `CP_SET_SECURE_MODE(0)` transition in the A630 order and verify CP idle plus PAS, GMU, GPU OOB
+   and power-state cleanup on failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -578,9 +580,10 @@ bring-up and a bounded test submission.
    any SMMU write stage has
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
-   verify step 19's bounded SQE/CP bootstrap ring, authenticate ZAP, send
+   verify step 19's bounded SQE/CP bootstrap ring and ZAP authentication, send
    `CP_SET_SECURE_MODE(0)`, and wait for CP idle before ordinary command submission. Qualcomm's
-   A6xx path enables SQE and calls `a6xx_cp_init` before ZAP authentication, then uses the CP packet to leave secure mode
+   A630 KGSL path sets the SQE base and authenticates ZAP through PIL before releasing SQE halt,
+   submits `CP_ME_INIT`, then uses the CP packet to leave secure mode
    ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/68a00586559f5fce3bb163f4618f1b71ef05b4e7/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
    [`adreno_gpu.c`](https://android.googlesource.com/kernel/common/%2B/19b68814b1cd60c40546f31f7cc5b7895c0b013b/drivers/gpu/drm/msm/adreno/adreno_gpu.c)).
    Continue with production register protection, ring/fence mappings and mapper validation. Keep

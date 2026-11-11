@@ -13,11 +13,12 @@
  * local memory for inspection. adreno=16 prepares the SQE, CP ring, and RPTR scratch in the
  * detached GPU SID0 page table; adreno=17 maps those buffers, starts GMU/HFI, then requests GX
  * power through the A630 GPU OOB and verifies the GFX3D clock. Step 18 repeats that guarded startup
- * then programs A630 HWCG, VBIF, UCHE, CP defaults, and protected-register ranges; SQE/CP startup
- * and ZAP authentication remain separate later stages.
+ * then programs A630 HWCG, VBIF, UCHE, CP defaults, and protected-register ranges. Step 19
+ * authenticates ZAP before SQE/CP startup; the secure-mode transition and user submissions remain
+ * later stages.
  * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
- * during this bring-up. ZAP authentication waits for the A6xx SQE/CP initialization and
- * CP_SET_SECURE_MODE transition path; GPU command submission, runtime GPU DCVS,
+ * during this bring-up. Step 19 authenticates ZAP before SQE release; CP_SET_SECURE_MODE,
+ * command submission, runtime GPU DCVS,
  * and rendering are still unavailable, so `ready()` remains false.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
@@ -611,6 +612,7 @@ static bool polaris_zap_manifest_valid;
 static bool polaris_pas_calls_ready;
 static bool polaris_pas_gpu_supported;
 static bool polaris_pas_image_active;
+static bool polaris_zap_authenticated;
 static uint64_t polaris_pas_scm_width;
 static uint32_t polaris_rpmh_drv_id;
 static uint32_t polaris_rpmh_drv_base;
@@ -5232,12 +5234,13 @@ polaris_pas_shutdown(void)
 		return false;
 	}
 	polaris_pas_image_active = false;
+	polaris_zap_authenticated = false;
 	polaris_pas_metadata_free();
 	return true;
 }
 
 static bool
-stage_zap_shader(void)
+polaris_zap_pas_load(uint32_t step, bool authenticate)
 {
 	uint64_t metadata_size = (uint64_t)polaris_zap_header_size + polaris_zap_hash_size;
 	vm_size_t metadata_allocation;
@@ -5245,19 +5248,28 @@ stage_zap_shader(void)
 	uint64_t metadata_phys;
 	volatile uint8_t *memory;
 
-	printf("adreno-sdm845: step 7: stage A630 ZAP metadata/segment through PAS, then shut it down; no AUTH_AND_RESET (explicit PAS writes)\n");
+	printf("adreno-sdm845: step %u: stage A630 ZAP metadata/segments through PAS%s\n", step,
+	    authenticate ? " and authenticate/reset image 13" : "; no AUTH_AND_RESET");
 	if (!polaris_zap_manifest_valid || !polaris_pas_calls_ready || !polaris_pas_gpu_supported ||
 	    polaris_zap_memory_phys == 0 || polaris_zap_memory_size == 0 || polaris_zap_memory_setup_size == 0) {
-		printf("adreno-sdm845: step 7 refused: firmware manifest, PAS 13 support/calls, or reserved memory is not verified\n");
+		printf("adreno-sdm845: step %u refused: firmware manifest, PAS 13 support/calls, or reserved memory is not verified\n", step);
+		return false;
+	}
+	if (polaris_zap_authenticated) {
+		if (authenticate && polaris_pas_image_active) {
+			printf("adreno-sdm845: step %u ZAP image 13 is already authenticated\n", step);
+			return true;
+		}
+		printf("adreno-sdm845: step %u refused to replace an authenticated ZAP image\n", step);
 		return false;
 	}
 	if (!polaris_gmu_domain_ready || !polaris_gpu_core_ready) {
-		printf("adreno-sdm845: step 7 refused: CX/GMU clock and GX/GFX3D clock must already be on; this step does not power them\n");
+		printf("adreno-sdm845: step %u refused: CX/GMU clock and GX/GFX3D clock must already be on; this step does not power them\n", step);
 		return false;
 	}
 	if (metadata_size == 0 || metadata_size > A630_MDT_MAX_BYTES ||
 	    polaris_zap_memory_setup_size > polaris_zap_memory_size) {
-		printf("adreno-sdm845: step 7 refused: PAS metadata or relocated image span exceeds validated bounds\n");
+		printf("adreno-sdm845: step %u refused: PAS metadata or relocated image span exceeds validated bounds\n", step);
 		return false;
 	}
 	for (uint32_t i = 0; i < polaris_zap_segment_count; i++) {
@@ -5266,38 +5278,38 @@ stage_zap_shader(void)
 
 		if (segment->paddr < polaris_zap_min_address || offset + segment->memory_size > polaris_zap_memory_setup_size ||
 		    segment->file_size > segment->memory_size || (segment->file_size != 0 && segment->data == NULL)) {
-			printf("adreno-sdm845: step 7 refused: ZAP segment %u escaped the validated memory manifest\n", i);
+			printf("adreno-sdm845: step %u refused: ZAP segment %u escaped the validated memory manifest\n", step, i);
 			return false;
 		}
 	}
-	if (!polaris_pas_shutdown()) {
-		printf("adreno-sdm845: step 7 refused: TrustZone did not release any previous GPU PAS image\n");
+	if (polaris_pas_image_active && !polaris_pas_shutdown()) {
+		printf("adreno-sdm845: step %u refused: TrustZone did not release any previous GPU PAS image\n", step);
 		return false;
 	}
 	metadata_allocation = (vm_size_t)round_page(metadata_size);
 	if (metadata_allocation < metadata_size ||
 	    kmem_alloc_contig(kernel_map, &metadata, metadata_allocation, PAGE_MASK, 0, 0,
 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		printf("adreno-sdm845: step 7 could not allocate physically contiguous PAS metadata (%llu bytes)\n", metadata_size);
+		printf("adreno-sdm845: step %u could not allocate physically contiguous PAS metadata (%llu bytes)\n", step, metadata_size);
 		return false;
 	}
 	metadata_phys = kvtophys(metadata);
 	if ((metadata_phys & PAGE_MASK) != 0) {
 		kmem_free(kernel_map, metadata, metadata_allocation);
-		printf("adreno-sdm845: step 7 PAS metadata is not 4-KiB aligned\n");
+		printf("adreno-sdm845: step %u PAS metadata is not 4-KiB aligned\n", step);
 		return false;
 	}
 	if (polaris_pas_scm_width == 0 &&
 	    (metadata_phys > UINT32_MAX || polaris_zap_memory_phys > UINT32_MAX ||
 	    polaris_zap_memory_setup_size > UINT32_MAX - polaris_zap_memory_phys + 1ull)) {
 		kmem_free(kernel_map, metadata, metadata_allocation);
-		printf("adreno-sdm845: step 7 refuses 32-bit SCM addresses that do not fit\n");
+		printf("adreno-sdm845: step %u refuses 32-bit SCM addresses that do not fit\n", step);
 		return false;
 	}
 	for (vm_size_t offset = PAGE_SIZE; offset < metadata_allocation; offset += PAGE_SIZE) {
 		if (kvtophys(metadata + offset) != metadata_phys + offset) {
 			kmem_free(kernel_map, metadata, metadata_allocation);
-			printf("adreno-sdm845: step 7 PAS metadata allocation is not physically contiguous\n");
+			printf("adreno-sdm845: step %u PAS metadata allocation is not physically contiguous\n", step);
 			return false;
 		}
 	}
@@ -5324,7 +5336,7 @@ stage_zap_shader(void)
 		    (vm_size_t)polaris_zap_memory_size);
 	}
 	if (polaris_zap_memory_virtual == 0) {
-		printf("adreno-sdm845: step 7 could not map the DT-reserved ZAP memory after PAS_MEM_SETUP\n");
+		printf("adreno-sdm845: step %u could not map the DT-reserved ZAP memory after PAS_MEM_SETUP\n", step);
 		(void)polaris_pas_shutdown();
 		return false;
 	}
@@ -5341,12 +5353,29 @@ stage_zap_shader(void)
 		}
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
+	if (authenticate) {
+		if (!polaris_pas_command("PAS_AUTH_AND_RESET", POLARIS_SCM_PAS_AUTH_RESET,
+		    POLARIS_SCM_ONE_VALUE, POLARIS_PAS_GPU, 0, 0)) {
+			(void)polaris_pas_shutdown();
+			return false;
+		}
+		polaris_zap_authenticated = true;
+		polaris_pas_metadata_free();
+		printf("adreno-sdm845: step %u authenticated A630 ZAP image 13; PAS remains active until GPU shutdown\n", step);
+		return true;
+	}
 	if (!polaris_pas_shutdown()) {
-		printf("adreno-sdm845: step 7 could not release the staged PAS image; it remains active for stop-time cleanup\n");
+		printf("adreno-sdm845: step %u could not release the staged PAS image; it remains active for stop-time cleanup\n", step);
 		return false;
 	}
-	printf("adreno-sdm845: PAS accepted and released the A630 ZAP staging area; AUTH_AND_RESET waits for the SQE/CP secure-mode transition path\n");
+	printf("adreno-sdm845: step %u PAS staging probe finished; image 13 was shut down without authentication\n", step);
 	return true;
+}
+
+static bool
+stage_zap_shader(void)
+{
+	return polaris_zap_pas_load(7u, false);
 }
 
 static void
@@ -5653,7 +5682,12 @@ polaris_a630_cp_ring_start(void)
 		goto fault;
 	}
 
-	/* Match KGSL's A6xx order: program SQE, release SQE_HALT, then publish CP_ME_INIT. */
+	/* Match KGSL's A6xx order: authenticate ZAP before releasing SQE_HALT. */
+	if ((!polaris_zap_authenticated && !polaris_zap_pas_load(19u, true)) ||
+	    !polaris_zap_authenticated || !polaris_pas_image_active) {
+		printf("adreno-sdm845: step 19 requires successful PAS authentication before SQE startup\n");
+		return false;
+	}
 	polaris_gpu_cp_started = true;
 	probe_write(&gpu, GPU_CP_SQE_CNTL, 1u);
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -5676,7 +5710,7 @@ polaris_a630_cp_ring_start(void)
 		if (ring_rptr == A630_CP_INIT_PACKET_DWORDS &&
 		    (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0) {
 			polaris_gpu_cp_initialized = true;
-			printf("adreno-sdm845: step 19 CP_ME_INIT retired: RPTR=%u CP idle; secure mode unchanged, ZAP auth and user submissions remain disabled\n",
+			printf("adreno-sdm845: step 19 CP_ME_INIT retired: RPTR=%u CP idle; ZAP is authenticated, secure mode remains enabled, and user submissions remain disabled\n",
 			    ring_rptr);
 			return true;
 		}
@@ -5937,12 +5971,12 @@ hakios_adreno_sdm845_init(void)
 		return;
 	}
 	if (last_step == 19) {
-		printf("adreno-sdm845: step 19 performs guarded GMU/GX/core setup then starts the SQE and waits for CP_ME_INIT idle; secure mode and submissions remain disabled\n");
+		printf("adreno-sdm845: step 19 performs guarded GMU/GX/core setup, authenticates ZAP before SQE startup, then waits for CP_ME_INIT idle; secure mode and submissions remain disabled\n");
 		if (!polaris_a630_gpu_domain_start(19u) || !polaris_a630_gpu_core_initialize() ||
 		    !polaris_a630_cp_ring_start()) {
 			return;
 		}
-		printf("adreno-sdm845: step 19 finished; SQE is running and CP_ME_INIT retired, but ZAP authentication, secure-mode transition, fences, and rendering remain disabled\n");
+		printf("adreno-sdm845: step 19 finished; SQE is running, CP_ME_INIT retired, and ZAP is authenticated; secure-mode transition, fences, and rendering remain disabled\n");
 		return;
 	}
 	if (last_step > 19u) {
