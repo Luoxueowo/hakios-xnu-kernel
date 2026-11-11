@@ -77,6 +77,7 @@ enum {
 #define MINISURF_TABLE_SIZE     16384
 #define MINISURF_MAX_DIMENSION  16384
 #define MINISURF_MAX_ALLOC      (512u << 20)
+#define MINISURF_MAX_TOTAL_ALLOC (1ull << 30)   /* active and concurrently creating surfaces */
 #define MINISURF_ROW_ALIGN      64
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
@@ -86,6 +87,7 @@ static MiniIOSurface *  gSurfaceTable[MINISURF_TABLE_SIZE];     /* index = surfa
 static uint32_t         gSurfaceNext = 1;
 static uint32_t         gSurfaceCount;
 static uint64_t         gSurfaceBytes;
+static uint64_t         gSurfaceReservedBytes;
 static uint32_t         gSurfaceUnheld;         /* surfaces around client memory that could not be made (said a few times) */
 /* what making surfaces and taking them away has cost since it was last asked (MiniIOSurfaceCost()) */
 static uint64_t         gSurfaceMaking, gSurfaceFreeing;
@@ -136,6 +138,7 @@ OSDefineMetaClassAndStructors(MiniIOSurface, OSObject);
  * out, or by whoever asks for the memory if that comes first.
  */
 #define SURFACE_KEEP_FROM       (4u << 20)      /* bytes: smaller ones are not worth it */
+#define SURFACE_KEEP_MAX_BYTES  (32u << 20)     /* bound the four-entry cache to 128 MiB */
 #define SURFACE_KEPT            4
 #define SURFACE_CLEAR_MS        40              /* kept memory is cleared this long after, if the display's driver has not done it */
 
@@ -230,7 +233,8 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
 	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() != 1) {
 		OSIncrementAtomic(&gSurfacesNotKept[0]);
 	}
-	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() == 1 && gSurfaceKeptLock != NULL) {
+	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getCapacity() <= SURFACE_KEEP_MAX_BYTES &&
+	    memory->getRetainCount() == 1 && gSurfaceKeptLock != NULL) {
 		int oldest = -1;
 
 		IOLockLock(gSurfaceKeptLock);
@@ -267,6 +271,38 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
 		}
 	}
 	memory->release();
+}
+
+/* Reserve active-surface bytes before wiring pages, so concurrent creates share the same cap. */
+static bool
+surfaceReserve(uint64_t bytes)
+{
+	bool reserved = false;
+
+	if (gSurfaceLock == NULL) {
+		return false;
+	}
+	IOLockLock(gSurfaceLock);
+	if (gSurfaceBytes <= MINISURF_MAX_TOTAL_ALLOC &&
+	    gSurfaceReservedBytes <= MINISURF_MAX_TOTAL_ALLOC - gSurfaceBytes &&
+	    bytes <= MINISURF_MAX_TOTAL_ALLOC - gSurfaceBytes - gSurfaceReservedBytes) {
+		gSurfaceReservedBytes += bytes;
+		reserved = true;
+	}
+	IOLockUnlock(gSurfaceLock);
+	return reserved;
+}
+
+static void
+surfaceCancelReservation(uint64_t bytes)
+{
+	IOLockLock(gSurfaceLock);
+	if (bytes > gSurfaceReservedBytes) {
+		IOLog("MiniIOSurface: surface byte reservation accounting underflow (%llu bytes)\n", bytes);
+	} else {
+		gSurfaceReservedBytes -= bytes;
+	}
+	IOLockUnlock(gSurfaceLock);
 }
 
 void
@@ -451,9 +487,10 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	uint32_t width, height, format, bpe, ew, eh, bpr, alloc, offset, planeCount = 0;
 	uint32_t hsub, vsub;
 	bool wide, onePlane = false;
+	bool surfaceReserved = false;
 	OSArray * planeInfo;
 	OSNumber * wrapped;
-	uint64_t needed;
+	uint64_t needed, accountedBytes;
 
 	*error = kIOReturnBadArgument;
 	width = dictNumber(props, "IOSurfaceWidth", 0);
@@ -631,11 +668,21 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 			return NULL;
 		}
 	}
+	accountedBytes = (uint64_t) alloc + PAGE_SIZE;   /* payload (or wrapped pages) and the shared-state page */
+	if (!surfaceReserve(accountedBytes)) {
+		IOLog("MiniIOSurface: total surface memory cap refuses %u bytes\n", alloc);
+		s->release();
+		*error = kIOReturnNoMemory;
+		return NULL;
+	}
+	surfaceReserved = true;
 
 	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
+		surfaceCancelReservation(accountedBytes);
+		surfaceReserved = false;
 		s->release();
 		*error = kIOReturnNoMemory;
 		return NULL;
@@ -665,6 +712,8 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 				IOLog("MiniIOSurface: the memory to make a surface around (%u bytes at %#llx) cannot be %s (%#x)\n", alloc,
 				    s->clientAddress, held == kIOReturnSuccess ? "seen from here" : "held", held);
 			}
+			surfaceCancelReservation(accountedBytes);
+			surfaceReserved = false;
 			s->release();
 			*error = kIOReturnVMError;
 			return NULL;
@@ -702,6 +751,8 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	if (sid == 0) {
 		IOLockUnlock(gSurfaceLock);
 		IOLog("MiniIOSurface: the surface table is full\n");
+		surfaceCancelReservation(accountedBytes);
+		surfaceReserved = false;
 		s->release();
 		*error = kIOReturnNoResources;
 		return NULL;
@@ -712,7 +763,12 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	info->traceID = sid;
 	gSurfaceTable[sid] = s;                 /* the table owns the object until the last holder goes */
 	gSurfaceCount++;
-	gSurfaceBytes += alloc;
+	if (!surfaceReserved || accountedBytes > gSurfaceReservedBytes) {
+		IOLog("MiniIOSurface: surface byte reservation accounting underflow at create commit (%llu bytes)\n", accountedBytes);
+	} else {
+		gSurfaceReservedBytes -= accountedBytes;
+	}
+	gSurfaceBytes += accountedBytes;
 
 	struct minisurf_shared * sh = s->shared();
 	sh->registryID = 0x100000000ULL + sid;
@@ -743,7 +799,7 @@ surfaceUnhold(MiniIOSurface * s)
 	}
 	gSurfaceTable[s->sid] = NULL;
 	gSurfaceCount--;
-	gSurfaceBytes -= s->info.allocSize;
+	gSurfaceBytes -= (uint64_t) s->info.allocSize + PAGE_SIZE;
 	s->release();
 }
 

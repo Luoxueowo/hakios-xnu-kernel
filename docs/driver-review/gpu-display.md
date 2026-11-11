@@ -2,7 +2,7 @@
 
 ## Scope and method
 
-(This review came before HakiosGPU's request `0x7d`, the client's own pages as a buffer, added 3 November: [Metal on the Adreno](../reference/metal.md#hakiosgpu-driversgpuhakiosgpucpp). That request has not been reviewed, and it adds to G6's wired memory without a cap of its own.)
+(This review came before HakiosGPU's request `0x7d`, the client's own pages as a buffer, added 3 November: [Metal on the Adreno](../reference/metal.md#hakiosgpu-driversgpuhakiosgpucpp). The original review did not cover that request; the later G6 follow-up below records its GPU address-space cap.)
 
 Read-only review of the user-reachable surface of the GPU and display code. Nothing was built or run; the XNU source tree itself is not in this repository (only `xnu/files` overlays), so XNU API behaviour is not verified here.
 
@@ -115,13 +115,15 @@ Suggested fix: mark the buffer as being freed before any unlock:
 
 Suggested fix: clamp `py0/py1` to `[0, fPanelHeight]` (and `px0/px1` to the panel width) immediately after computing them, and compute `dx+dw`, `dy+dh` in int64.
 
-### G6 No resource limits on wired memory (Medium, CONFIRMED)
+### G6 No resource limits on wired memory (Medium, CONFIRMED; FIXED IN PART)
 
 - `gemNew` (gpu.cpp:698): each buffer is limited to 256 MB and each client to 8192 handles, but `fBufferBytes` is only used for logging; there is no byte cap per client or in total. The GPU address pool (3.5 GB) is shared by all clients, so one client can also exhaust it.
 - `surfaceCreate` (MiniIOSurface.cpp:598-615): up to 512 MB each, 16384 table slots, `gSurfaceBytes` tracked but not limited. Memory is wired kernel memory.
 - `HakiosGPUUserClient::show` (gpu.cpp:1037-1045): `size = rowBytes * height` with `rowBytes` a free 32-bit value (only `>= 4*width` is checked) and height up to 4096, passed to `IOMallocData()` and then `copyin()`. Size can reach tens of terabytes; large-but-satisfiable values wire memory. This selector also works when the GPU is not ready (line 1103).
 
-Suggested fix: cap `rowBytes` (e.g. `<= 4 * 4096`... use `rowBytes <= 64 * width` or an absolute 1 MB), add per-client and global byte budgets enforced in `newBuffer()` and `surfaceCreate()`.
+Original suggested fix: cap `rowBytes` (e.g. `<= 4 * 4096`... use `rowBytes <= 64 * width` or an absolute 1 MB), add per-client and global byte budgets enforced in `newBuffer()` and `surfaceCreate()`.
+
+Follow-up: `show()` now refuses buffers above 256 MB. `HakiosGPUUserClient::newBuffer()` reserves GPU virtual-address bytes under `gGPULock`, with a 1 GiB per-client and 2 GiB global ceiling; reservations cover concurrent allocations and mapped bytes stay charged while a fence, a stuck submission, or the reuse cache retains the mapping. `surfaceCreate()` reserves active IOSurface bytes, including wrapped client pages and the shared-state page, against a 1 GiB global ceiling. Its four-entry reuse cache now keeps only allocations up to 32 MiB each (at most 128 MiB total). These are software limits chosen for the initial port; their fit for Polaris workloads still needs device validation. The fixed surface-table capacity remains unchanged.
 
 ### G7 Use of a freed surface in methodCreate() (Low, CONFIRMED)
 
@@ -208,7 +210,7 @@ Scope note: G1–G17 began as a source review of the shared Redwood GPU service 
 - G3 FIXED. gpu.cpp `kMsmWaitFence`: a fence ahead of `hakios_gpu_last()` returns kIOReturnBadArgument before `gpuWait()`, so a bad argument can no longer latch `gGPUReported`.
 - G4 FIXED. gpu.cpp `freeBuffer()`: the buffer is taken out of its handle (memory/surface NULL, counters decremented) and the rest works on a local copy, before `gpuWait()` can drop the lock; a second close of the handle now gets BadArgument.
 - G5 FIXED. MiniIOMobileFramebuffer.cpp `drawLayer()`: destination rectangle computed in 64 bits; one beyond +-16M panel pixels, or wholly off the panel, is not drawn (a layer wholly left of the panel previously computed columns far outside the source row); the row loop and the helper threads' split use the on-panel rows (`ry0/ry1` in `RowJob`), while the scaling still uses the original py0/py1 so partly off-panel layers draw exactly as before.
-- G6 FIXED in part. gpu.cpp `show()`: `rowBytes * height` above 256 MB (the buffer maximum) is refused. SKIPPED: per-client and global byte budgets for buffers and surfaces (a policy choice of limits), and the surface table.
+- G6 FIXED in part. gpu.cpp `show()`: `rowBytes * height` above 256 MB (the buffer maximum) is refused. `HakiosGPUUserClient::newBuffer()` enforces 1 GiB mapped GPU VA per client and 2 GiB globally, including concurrent reservations and retained mappings. `MiniIOSurface.cpp` enforces 1 GiB of active surface payload/wrapped pages plus shared-state pages and limits its four kept allocations to 32 MiB each. These policy limits have source evidence only and need workload tuning on Polaris. The fixed surface-table capacity is unchanged.
 - G7 FIXED. MiniIOSurface.cpp `methodCreate()`: `allocSize` copied to a local before the creator's hold is dropped.
 - G8 FIXED. MiniIOMobileFramebuffer.cpp `vsync()`: the async send is done with `fLock` held (as the report suggests); `registerNotificationPort()` swaps under the same lock, so the old port is only released after the send. The send uses kIOUserNotifyOptionCanDrop; owner to confirm it cannot block.
 - G9 SKIPPED. Ownership and privilege checks on surface IDs are policy, not to be changed here.

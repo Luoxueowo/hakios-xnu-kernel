@@ -177,6 +177,8 @@ struct hakios_show {
 
 #define GPU_BUFFERS             8192            /* a client's, at most */
 #define GPU_BUFFER_MAX          (256u << 20)
+#define GPU_CLIENT_VA_BYTES_MAX (1ull << 30)    /* mapped and retained address space per client */
+#define GPU_VA_BYTES_MAX        (2ull << 30)    /* mapped and retained address space across clients */
 #define GPU_SUBMIT_CMDS         128
 #define GPU_SUBMIT_BOS          8192
 #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
@@ -188,6 +190,7 @@ static bool gGPUReported;
 static bool gGPUUnresponsive;                   /* a long completion wait expired; keep buffers, but take no more work */
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 static bool gGPUServiceStarted;
+static uint64_t gGPUVAMappedBytes, gGPUVAReservedBytes;
 
 /* What the last seconds' submissions were and cost here, for the log. */
 static struct {
@@ -463,6 +466,7 @@ class HakiosGPUUserClient : public IOUserClient
 	uint32_t                fNextBuffer;            /* where the search for a free handle starts: one given back is not the next given */
 	uint32_t                fBufferCount;
 	uint64_t                fBufferBytes;
+	uint64_t                fVAMappedBytes, fVAReservedBytes;
 	uint32_t                fSubmits;
 	uint32_t                fStrangers;             /* requests that named a buffer the client does not have */
 	struct gpu_left         fLeft[GPU_LEFT];
@@ -471,7 +475,12 @@ class HakiosGPUUserClient : public IOUserClient
 	uint64_t                fKeptBytes;
 
 	struct gpu_buffer * buffer(uint32_t handle);
-	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
+	bool reserveVABudget(uint64_t size);
+	void cancelVABudget(uint64_t size);
+	void commitVABudget(uint64_t size);
+	void releaseVABudget(uint64_t size);
+	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
+	    bool reserved = false);
 	void freeBuffer(struct gpu_buffer * b);
 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
 	void dropKept(struct gpu_kept * k);
@@ -504,6 +513,10 @@ HakiosGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 t
 	fTask = owningTask;
 	fGpuSpace = NULL;
 	fBuffers = NULL;
+	fNextQueue = fNextBuffer = fBufferCount = fSubmits = fStrangers = fLeftCount = 0;
+	fBufferBytes = fVAMappedBytes = fVAReservedBytes = fKeptBytes = 0;
+	bzero(fLeft, sizeof(fLeft));
+	bzero(fKept, sizeof(fKept));
 	return true;
 }
 
@@ -579,6 +592,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 		} else if (hakios_gpu_ready()) {
 			hakios_gpu_unmap(fGpuSpace, b->address, b->size);
 			hakios_gpu_address_free(b->address, b->size);
+			releaseVABudget(b->size);
 		}
 		if (b->memory != NULL) {
 			b->memory->release();
@@ -606,6 +620,7 @@ HakiosGPUUserClient::reap(void)
 		} else if (hakios_gpu_ready()) {
 			hakios_gpu_unmap(fGpuSpace, left->address, left->size);
 			hakios_gpu_address_free(left->address, left->size);
+			releaseVABudget(left->size);
 		}
 		if (left->memory != NULL) {
 			left->memory->release();
@@ -676,15 +691,85 @@ HakiosGPUUserClient::buffer(uint32_t handle)
 	return &fBuffers[handle - 1];
 }
 
+static bool
+gpuCanReserveBytes(uint64_t used, uint64_t reserved, uint64_t bytes, uint64_t limit)
+{
+	return used <= limit && reserved <= limit - used && bytes <= limit - used - reserved;
+}
+
+/* With gGPULock held. Count every mapped address, including mappings held behind a fence or in the reuse cache. */
+bool
+HakiosGPUUserClient::reserveVABudget(uint64_t size)
+{
+	if (!gpuCanReserveBytes(fVAMappedBytes, fVAReservedBytes, size, GPU_CLIENT_VA_BYTES_MAX) ||
+	    !gpuCanReserveBytes(gGPUVAMappedBytes, gGPUVAReservedBytes, size, GPU_VA_BYTES_MAX)) {
+		return false;
+	}
+	fVAReservedBytes += size;
+	gGPUVAReservedBytes += size;
+	return true;
+}
+
+/* With gGPULock held. */
+void
+HakiosGPUUserClient::cancelVABudget(uint64_t size)
+{
+	if (size > fVAReservedBytes || size > gGPUVAReservedBytes) {
+		IOLog("HakiosGPU: GPU VA reservation accounting underflow (%llu bytes)\n", size);
+		return;
+	}
+	fVAReservedBytes -= size;
+	gGPUVAReservedBytes -= size;
+}
+
+/* With gGPULock held. */
+void
+HakiosGPUUserClient::commitVABudget(uint64_t size)
+{
+	if (size > fVAReservedBytes || size > gGPUVAReservedBytes) {
+		IOLog("HakiosGPU: GPU VA reservation accounting underflow at map commit (%llu bytes)\n", size);
+		return;
+	}
+	fVAReservedBytes -= size;
+	gGPUVAReservedBytes -= size;
+	fVAMappedBytes += size;
+	gGPUVAMappedBytes += size;
+}
+
+/* With gGPULock held; called only after the GPU address has been unmapped and returned. */
+void
+HakiosGPUUserClient::releaseVABudget(uint64_t size)
+{
+	if (size > fVAMappedBytes || size > gGPUVAMappedBytes) {
+		IOLog("HakiosGPU: GPU VA mapped-byte accounting underflow (%llu bytes)\n", size);
+		return;
+	}
+	fVAMappedBytes -= size;
+	gGPUVAMappedBytes -= size;
+}
+
 /*
  * A handle and addresses of the GPU's for `size` bytes of a memory descriptor, from byte `from`
  * of it on (wired memory; both in whole pages). With the lock held; NULL: there is no room.
  */
 struct gpu_buffer *
-HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
+HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
+	bool reserved)
 {
 	struct gpu_buffer * b = NULL;
 	bool mapped = true;
+
+	if (reserved) {
+		if (size > fVAReservedBytes || size > gGPUVAReservedBytes) {
+			IOLog("HakiosGPU: missing GPU VA reservation for %llu-byte mapping\n", size);
+			return NULL;
+		}
+	} else if (!reserveVABudget(size)) {
+		IOLog("HakiosGPU: GPU VA budget refuses %llu bytes (%llu/%llu MB client, %llu/%llu MB global)\n",
+		    size, fVAMappedBytes >> 20, GPU_CLIENT_VA_BYTES_MAX >> 20,
+		    gGPUVAMappedBytes >> 20, GPU_VA_BYTES_MAX >> 20);
+		return NULL;
+	}
 
 	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
 		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
@@ -698,6 +783,7 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	}
 	if (b == NULL || (b->address = hakios_gpu_address(size)) == 0) {
 		IOLog("HakiosGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
+		cancelVABudget(size);
 		return NULL;
 	}
 	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
@@ -711,9 +797,11 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	if (!mapped) {
 		hakios_gpu_unmap(fGpuSpace, b->address, size);
 		hakios_gpu_address_free(b->address, size);
+		cancelVABudget(size);
 		IOLog("HakiosGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
 		return NULL;
 	}
+	commitVABudget(size);
 	b->size = size;
 	b->flags = flags;
 	b->seed = 0;
@@ -737,6 +825,7 @@ HakiosGPUUserClient::dropKept(struct gpu_kept * k)
 	if (hakios_gpu_ready()) {
 		hakios_gpu_unmap(fGpuSpace, k->address, k->size);
 		hakios_gpu_address_free(k->address, k->size);
+		releaseVABudget(k->size);
 	}
 	k->memory->release();
 	k->memory = NULL;
@@ -831,11 +920,21 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 			return kIOReturnSuccess;
 		}
 	}
+	if (!reserveVABudget(size)) {
+		IOLockUnlock(gGPULock);
+		IOLog("HakiosGPU: GPU VA budget refuses a new %llu-byte buffer (%llu/%llu MB client, %llu/%llu MB global)\n",
+		    size, fVAMappedBytes >> 20, GPU_CLIENT_VA_BYTES_MAX >> 20,
+		    gGPUVAMappedBytes >> 20, GPU_VA_BYTES_MAX >> 20);
+		return kIOReturnNoMemory;
+	}
 	IOLockUnlock(gGPULock);
 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
 	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
 	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
 	if (memory == NULL) {
+		IOLockLock(gGPULock);
+		cancelVABudget(size);
+		IOLockUnlock(gGPULock);
 		IOLog("HakiosGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
 		    fBufferBytes >> 20);
 		return kIOReturnNoMemory;
@@ -845,7 +944,7 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 	}
 
 	IOLockLock(gGPULock);
-	b = newBuffer(memory, 0, size, request->flags, &request->handle);
+	b = newBuffer(memory, 0, size, request->flags, &request->handle, true);
 	if (b != NULL) {
 		b->memory = memory;
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();

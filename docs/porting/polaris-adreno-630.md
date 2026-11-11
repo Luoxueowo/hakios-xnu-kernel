@@ -30,9 +30,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   and deliberately retains resources if startup is faulted or safety cannot be confirmed. This
   runtime cleanup path has not yet been validated on the phone.
 - On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
-  `hakios.adreno.sdm845.o`, `hakios.adreno.o`, and the shared IOKit GPU service. The build script
-  produced `hakios-kernel` and accepted the known XNU kext symbol-set check failures; this is
-  compile evidence only, not a device boot or GPU runtime result.
+  `hakios.adreno.sdm845.o`, `hakios.adreno.o`, `MiniIOSurface.cpo`, and the shared IOKit GPU service,
+  including the new resource caps. The build emitted `hakios-kernel`, then exited 2 on the known
+  XNU kext symbol-set import-list failures; this is compile evidence only, not a device boot or GPU
+  runtime result.
 - The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
   A completion wait of at least one second that expires blocks later GEM submissions before cache
   maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory
@@ -845,7 +846,11 @@ command isolation review, and bounded hardware submission checks.
    phone. Keep the chip-ID gate and do not enable the Metal path until the A630 profile has been
    exercised on hardware. The shared service now gates new
    submissions after a long completion timeout and retains in-flight resources; add and validate
-   an A630 hardware recovery/restart policy and the resource limits needed for persistent system use.
+   an A630 hardware recovery/restart policy. Initial software resource ceilings are now in place:
+   1 GiB of mapped GPU VA per client, 2 GiB globally, 1 GiB of active IOSurface allocations, and
+   four cached IOSurface allocations of at most 32 MiB each. These limits include concurrent
+   reservations and retained GPU mappings, but their fit for real Polaris workloads still needs
+   device validation and tuning.
    **Gate:** sustained UI rendering, client teardown, repeated GPU start/stop, and software
    fallback all work on Polaris without kernel faults or GPU hangs.
 7. **Enable only proven support.** Update the Polaris config and device status only after the
