@@ -24,8 +24,18 @@ allow it. A successful firmware boot alone is not a completed driver.
   Qualcomm sources.
 - `CONFIG_HAKIOS_ADRENO=y` now includes the Polaris backend in the MIX 2S kernel build. The driver
   does not start the GPU by default; the explicit `gpu=1` boot argument runs guarded stages 21–23,
-  then starts HakiosGPU only if the client-root IB and kernel-root fence probe passes. This runtime
-  path has not yet been validated on the phone.
+  then starts HakiosGPU only if the client-root IB and kernel-root fence probe passes. If IOKit
+  service creation fails, it closes the client gate and requests the existing bounded orderly stop.
+  This runtime path has not yet been validated on the phone.
+- On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
+  `hakios.adreno.sdm845.o`, `hakios.adreno.o`, and the shared IOKit GPU service. The build script
+  produced `hakios-kernel` and accepted the known XNU kext symbol-set check failures; this is
+  compile evidence only, not a device boot or GPU runtime result.
+- On 2026-11-12, Recovery ADB confirmed `/vendor` is the phone's `ext4 ro` mount from
+  `/dev/block/sde47`. `devices/polaris/pull-firmware.sh` pulled the seven A630 files from
+  `/vendor/firmware` and compared each pulled file's SHA-256 against the device-side hash. The
+  local blobs and `fw-gpu/SHA256SUMS` remain ignored by Git. This confirms firmware provenance and
+  integrity, not that HakiOS can load or run it.
 - A separate `hakios.adreno.sdm845.c` probe is now wired into the driver configuration. On an
   SDM845 build, `adreno=1..4` reads the GPUCC, KGSL SMMU, GMU and (only when powered and clocked)
   3D core status; it checks the GCC GPU config-AHB clock before reading GPUCC and checks CX plus

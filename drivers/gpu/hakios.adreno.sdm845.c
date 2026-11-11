@@ -53,7 +53,7 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern lck_mtx_t hakios_rsc_lock;
-extern void HakiosGPUStart(void);
+extern bool HakiosGPUStart(void);
 
 #define SDM845_SOC_BASE                 0x00100000ul
 #define POLARIS_GPUCC_PHYS              0x05090000ul
@@ -7904,7 +7904,12 @@ hakios_adreno_sdm845_init(void)
 			}
 			polaris_gpu_client_submission_enabled = true;
 			printf("adreno-sdm845: A630 client submission gate opened after the step 23 probe; starting HakiosGPU\n");
-			HakiosGPUStart();
+			if (!HakiosGPUStart()) {
+				polaris_gpu_client_submission_enabled = false;
+				printf("adreno-sdm845: HakiosGPU service creation failed; client gate closed and orderly A630 stop requested\n");
+				sdm845_gpu_stop();
+				return;
+			}
 		}
 		return;
 	}

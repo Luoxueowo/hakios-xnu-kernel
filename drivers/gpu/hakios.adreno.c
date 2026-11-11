@@ -3244,7 +3244,7 @@ static struct {
 } gpu_free[1024];                       /* the addresses not in use, in order */
 static unsigned gpu_free_count;
 
-extern void HakiosGPUStart(void);
+extern bool HakiosGPUStart(void);
 extern void HakiosGPUStop(void);       /* locks clients when the service exists, then dispatches stop */
 static void gpu_block_stop(void);
 
@@ -4076,7 +4076,11 @@ hakios_adreno_init(void)
 			gpu_kept = true;
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
-			HakiosGPUStart();
+			if (!HakiosGPUStart()) {
+				printf("adreno: HakiosGPU service creation failed; stopping the GPU and using software rendering\n");
+				redwood_gpu_stop();
+				return;
+			}
 			return;
 		}
 		if (!by_itself) {

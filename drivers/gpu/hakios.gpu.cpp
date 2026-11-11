@@ -67,7 +67,7 @@ void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
 
-void HakiosGPUStart(void);
+bool HakiosGPUStart(void);
 void HakiosGPUStop(void);
 void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
 }
@@ -186,6 +186,7 @@ struct hakios_show {
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
 static bool gGPUReported;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
+static bool gGPUServiceStarted;
 
 /* What the last seconds' submissions were and cost here, for the log. */
 static struct {
@@ -326,30 +327,55 @@ HakiosGPU::start(IOService * provider)
 	return true;
 }
 
-void
+bool
 HakiosGPUStart(void)
 {
 	IOService * provider = IOService::getPlatform();
-	HakiosGPU * gpu;
+	HakiosGPU * gpu = NULL;
 	uint32_t cached = 0;
+	bool lock_created = false, attached = false;
+
+	if (gGPUServiceStarted) {
+		return true;
+	}
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
-	gGPULock = IOLockAlloc();
+	if (gGPULock == NULL) {
+		gGPULock = IOLockAlloc();
+		lock_created = gGPULock != NULL;
+	}
 	if (gGPULock == NULL) {
 		IOLog("HakiosGPU: cannot allocate the service lock\n");
-		return;
+		return false;
 	}
 	gpu = OSTypeAlloc(HakiosGPU);
-	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
-		OSSafeReleaseNULL(gpu);
+	if (gpu == NULL || provider == NULL || !gpu->init()) {
 		IOLog("HakiosGPU: cannot create the service\n");
-		return;
+		goto failed;
 	}
+	if (!gpu->attach(provider)) {
+		IOLog("HakiosGPU: cannot attach the service to the platform\n");
+		goto failed;
+	}
+	attached = true;
 	if (!gpu->start(provider)) {
-		gpu->detach(provider);
 		IOLog("HakiosGPU: the service did not start\n");
+		goto failed;
 	}
 	gpu->release();
+	gGPUServiceStarted = true;
+	return true;
+
+failed:
+	if (attached) {
+		gpu->detach(provider);
+	}
+	OSSafeReleaseNULL(gpu);
+	if (lock_created) {
+		IOLockFree(gGPULock);
+		gGPULock = NULL;
+	}
+	return false;
 }
 
 /* The run is ending (hakios.adreno.c): nobody is in the middle of anything when the GPU goes. */

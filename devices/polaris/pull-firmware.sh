@@ -10,9 +10,9 @@ FILES=(a630_gmu.bin a630_sqe.fw a630_zap.mdt a630_zap.b00 a630_zap.b01 a630_zap.
 
 adb() {
 	if [[ -n "${ANDROID_SERIAL:-}" ]]; then
-		"$ADB" -s "$ANDROID_SERIAL" "$@"
+		command "$ADB" -s "$ANDROID_SERIAL" "$@"
 	else
-		"$ADB" "$@"
+		command "$ADB" "$@"
 	fi
 }
 
@@ -99,6 +99,12 @@ for file in "${FILES[@]}"; do
 	fi
 	adb pull "$remote" "$tmp/$file" >/dev/null
 	[[ -s "$tmp/$file" ]] || { echo "pull-firmware: adb pulled an empty file: $file" >&2; exit 1; }
+	remote_hash=$(adb shell "sha256sum '$remote'" 2>/dev/null | tr -d '\r' | awk '{ print $1; exit }')
+	local_hash=$(shasum -a 256 "$tmp/$file" | awk '{ print $1 }')
+	if [[ ! "$remote_hash" =~ ^[[:xdigit:]]{64}$ || "$remote_hash" != "$local_hash" ]]; then
+		echo "pull-firmware: SHA-256 mismatch for $remote (device=$remote_hash local=$local_hash)" >&2
+		exit 1
+	fi
 done
 
 mkdir -p "$DEST"

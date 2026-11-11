@@ -22,5 +22,6 @@
 | cpu | works | all eight cores (`bootcpu=7 cpus=8 cpufreq=1`); the clock is the boot loader's, SDM845's OSM is not driven |
 | storage | works | persistent HFSX Data volume; Settings reports about 120–121 GB available |
 | battery | works | battery level and charging status are reported through HakiosBattery (`battery=1`) |
+| gpu | partly | A630 backend is built and seven firmware files match the phone's read-only `/vendor/firmware`; startup and rendering have not been validated on-device (`gpu=1` is opt-in) |
 
 The state is what has been seen on this device, written down in `devices/polaris/device.conf`; a part the table does not name has not been looked at.
