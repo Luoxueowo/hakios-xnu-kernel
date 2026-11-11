@@ -75,6 +75,18 @@ allow it. A successful firmware boot alone is not a completed driver.
   `Adreno630v2`, `default_pwrlevel=6`/initial-pwrlevel 6 (257 MHz), and frequencies through
   710 MHz. These are stock Recovery/Linux observations; the HakiOS diagnostic has not yet run on
   the device.
+- A second read-only Recovery inspection on 2026-11-12 identified the device as
+  `fox_polaris`/`polaris` on `sdm845` with Qualcomm hardware; the running Recovery kernel was
+  `4.9.337-OrangeFox-polaris-LOS21+`, and `/vendor` was mounted read-only from `/dev/block/sde47`.
+  All seven firmware files again matched the local ignored copies byte-for-byte. Their SHA-256
+  values were: `a630_gmu.bin` `b07f90299ff2ae33948fcfd6ed67f53fbd287b5bf85ff2d43db11d4d32c1621f`,
+  `a630_sqe.fw` `36298bd53ea3666413d288a3a3f5266f67fcb6db038a0a481af5869d1c17859c`,
+  `a630_zap.mdt` `e1e11d7f124b53efe73c2b03fab613fc1075d4caa5f41f6a19dc2ac56ea736dd`,
+  `a630_zap.b00` `b2975f6a4c28a98197c1d694f6e275e71b23ec7e31e32ff5d1f83fdb80a94282`,
+  `a630_zap.b01` `a6d10b93e1d83b53d4cf501c78945ab324bf2a1622bcfd08cafe3d7a6f49aacb`,
+  `a630_zap.b02` `519b5538809f54ee566246b0520746a8ea82ca9384ea6bddb0b0e0d3c2de520c`, and
+  `a630_zap.elf` `fe7a870b3adc6f0d8e58d682ba54c4689188c679ad1433a68e6616896e57882f`. No phone
+  storage was written.
 - The live Recovery tree's `/soc/qcom,kgsl-hyp` identifies `qcom,pil-tz-generic`, PAS ID `13`,
   firmware name `a630_zap`, and a `memory-region` phandle that resolves to the `no-map` GPU region
   at `0x8c415000/0x2000`. The matching Qualcomm SDM845 GPU DTS declares the same PAS ID, firmware
@@ -734,15 +746,21 @@ command isolation review, and bounded hardware submission checks.
   Apps RSC active-TCS path remains unverified on hardware.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
-- Do not assume CP APRIV can separate kernel and client mappings on this device: Qualcomm's KGSL
-  `a630v2` catalog entry does not advertise `ADRENO_APRIV`, unlike the deprecated A630v1 profile
-  ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)).
-  Kernel-owned SQE, ring and scratch pages now have privileged-only SMMU descriptors, and
-  `CP_RB_CNTL_NO_UPDATE` disables CP writes to the RPTR shadow. Per-client roots now map each
-  client's BOs separately, and the trusted ring switches TTBR0/ASID before its IBs. The local A630
-  SQE image's IB-level guards for `CP_SMMU_TABLE_UPDATE` and `CP_SET_PROTECTED_MODE` are confirmed
-  by disassembly. The userclient gate remains closed until hardware confirms privileged SMMU
-  enforcement, broader command isolation, and the new switch/teardown path on the phone.
+- Do not assume CP APRIV can separate kernel and client mappings on this device. The Polaris
+  SDM845 kernel's `a630v2` catalog entries omit `ADRENO_APRIV`, and its A6xx ring startup path does
+  not program `CP_APRIV_CNTL`
+  ([Polaris `adreno-gpulist.h`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno-gpulist.h),
+  [Polaris `adreno_a6xx.c`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno_a6xx.c)).
+  This is evidence that KGSL does not rely on APRIV for this profile; it does not by itself prove
+  whether the A630 emits privileged transactions or whether the SMMU enforces the descriptor
+  distinction for CP fetches. The current kernel-owned SQE, ring and scratch mappings therefore do
+  not yet demonstrate client isolation. `CP_RB_CNTL_NO_UPDATE` disables CP writes to the RPTR
+  shadow, per-client roots map each client's BOs separately, and the local SQE guards
+  `CP_SMMU_TABLE_UPDATE` and `CP_SET_PROTECTED_MODE` inside IBs, but these checks do not close the
+  privilege-boundary question. Keep the userclient gate closed until CP/SMMU privilege behavior,
+  broader command isolation, and the switch/teardown path are validated on Polaris hardware; if
+  privileged-only mappings are not enforceable for CP, redesign the CP-visible shared pages and
+  completion proof before enabling submissions.
 - A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence
   stage and is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
   legacy-HFI slumber; it then checks GMU/CX/GX state, asserts CM3 reset, shuts down PAS, detaches
