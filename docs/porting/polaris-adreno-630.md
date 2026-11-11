@@ -33,6 +33,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   `hakios.adreno.sdm845.o`, `hakios.adreno.o`, and the shared IOKit GPU service. The build script
   produced `hakios-kernel` and accepted the known XNU kext symbol-set check failures; this is
   compile evidence only, not a device boot or GPU runtime result.
+- The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
+  A completion wait of at least one second that expires blocks later GEM submissions before cache
+  maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory
+  remains retained. A ring-full report alone no longer short-circuits later fence waits. The A630
+  report also samples the selected SID0 SMMUv2 context FSR/FAR/FSYNR0 and global SMMU fault state
+  when its existing mappings and bounds permit; this read-only snapshot does not recover the GPU.
+  The offsets and Linux fault-read path follow upstream [`arm-smmu.h`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)
+  and [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
+  These changes have compile/source evidence only and still need a controlled Polaris run.
 - On 2026-11-12, Recovery ADB confirmed `/vendor` is the phone's `ext4 ro` mount from
   `/dev/block/sde47`. `devices/polaris/pull-firmware.sh` pulled the seven A630 files from
   `/vendor/firmware` and compared each pulled file's SHA-256 against the device-side hash. The
@@ -816,8 +825,9 @@ command isolation review, and bounded hardware submission checks.
    Adreno 642L profile) or zero. Its PM4, 512 KiB GMEM, texture and ir3 compiler tables are also
    built for that A635 profile; Polaris reports 1 MiB GMEM. The current Metal open path therefore
    refuses the A630 before command submission. Preserve the chip-ID gate until the A630-specific
-   hardware and compiler data are implemented and validated. Add hang timeout/recovery and
-   resource limits needed for persistent system use.
+   hardware and compiler data are implemented and validated. The shared service now gates new
+   submissions after a long completion timeout and retains in-flight resources; add and validate
+   an A630 hardware recovery/restart policy and the resource limits needed for persistent system use.
    **Gate:** sustained UI rendering, client teardown, repeated GPU start/stop, and software
    fallback all work on Polaris without kernel faults or GPU hangs.
 7. **Enable only proven support.** Update the Polaris config and device status only after the
@@ -845,7 +855,7 @@ command isolation review, and bounded hardware submission checks.
   `gfx.lvl`/`cx.lvl`/`mx.lvl` tables pair correctly with the live GPU/GMU operating points. The
   `adreno=12`/`adreno=13`/`adreno=14` write stages have not been invoked on the phone; the direct
   Apps RSC active-TCS path remains unverified on hardware.
-- Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
+- Cache coherency, interrupt availability, A630 hardware hang recovery/restart, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
 - The existing `hakios-metal` window-server client is A635/Adreno 642L-specific. It refuses the
   Polaris A630 chip ID (`0x06030001` versus its accepted `0x06030500`) and its command, GMEM,

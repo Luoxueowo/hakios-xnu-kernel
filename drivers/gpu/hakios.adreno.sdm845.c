@@ -209,6 +209,10 @@ extern bool HakiosGPUStart(void);
 #define SMMU_IDR1                       0x0024
 #define SMMU_IDR2                       0x0028
 #define SMMU_IDR7                       0x003c
+#define SMMU_GFSR                       0x0048u
+#define SMMU_GFSYNR0                    0x0050u
+#define SMMU_GFSYNR1                    0x0054u
+#define SMMU_GFSYNR2                    0x0058u
 #define SMMU_IDR0_S1TS                  (1u << 30)
 #define SMMU_IDR0_S2TS                  (1u << 29)
 #define SMMU_IDR0_SMS                   (1u << 27)
@@ -283,6 +287,9 @@ extern bool HakiosGPUStart(void);
 #define SMMU_CB_TLBIASID                0x0610u
 #define SMMU_CB_TLBSYNC                 0x07f0u
 #define SMMU_CB_TLBSTATUS               0x07f4u
+#define SMMU_CB_FAR_LO                  0x0060u
+#define SMMU_CB_FAR_HI                  0x0064u
+#define SMMU_CB_FSYNR0                  0x0068u
 #define SMMU_SCTLR_M                    (1u << 0)
 
 /* A6xx GMU register XML uses global word offsets; the Polaris GMU window begins at word 0x1a800. */
@@ -7909,27 +7916,61 @@ sdm845_gpu_report(const char *why)
 {
 	uint32_t completed_fence = 0;
 	volatile uint32_t *fence_word;
+	bool gpu_mapped;
 
 	if (why == NULL) {
 		why = "unspecified failure";
 	}
-	if (!map_block(&gpu)) {
-		printf("adreno-sdm845: GPU report: %s; MMIO window unavailable, last fence=%u\n", why,
-		    polaris_gpu_last_fence);
-		return;
-	}
-	if (polaris_gpu_ring_submit_ready && polaris_gpu_rptr_buffer.virtual != 0) {
+	gpu_mapped = map_block(&gpu);
+	if (gpu_mapped && polaris_gpu_ring_submit_ready && polaris_gpu_rptr_buffer.virtual != 0) {
 		fence_word = (volatile uint32_t *)(polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET);
 		polaris_cache_lines((vm_offset_t)fence_word, sizeof(*fence_word));
 		__asm__ volatile ("dsb sy" ::: "memory");
 		completed_fence = *fence_word;
 	}
-	printf("adreno-sdm845: GPU report: %s; last fence=%u done=%u RPTR=%#x WPTR=%#x software WPTR=%u status=%#x interrupt=%#x CP fault=%#x CP interrupt=%#x protection=%#x\n",
-	    why, polaris_gpu_last_fence, completed_fence,
-	    probe_read(&gpu, GPU_CP_RB_RPTR), probe_read(&gpu, GPU_CP_RB_WPTR),
-	    polaris_gpu_ring_write_pointer, probe_read(&gpu, GPU_RBBM_STATUS),
-	    probe_read(&gpu, GPU_RBBM_INT_0_STATUS), probe_read(&gpu, GPU_CP_HW_FAULT),
-	    probe_read(&gpu, GPU_CP_INTERRUPT_STATUS), probe_read(&gpu, GPU_CP_PROTECT_STATUS));
+	if (gpu_mapped) {
+		printf("adreno-sdm845: GPU report: %s; last fence=%u done=%u RPTR=%#x WPTR=%#x software WPTR=%u status=%#x interrupt=%#x CP fault=%#x CP interrupt=%#x protection=%#x\n",
+		    why, polaris_gpu_last_fence, completed_fence,
+		    probe_read(&gpu, GPU_CP_RB_RPTR), probe_read(&gpu, GPU_CP_RB_WPTR),
+		    polaris_gpu_ring_write_pointer, probe_read(&gpu, GPU_RBBM_STATUS),
+		    probe_read(&gpu, GPU_RBBM_INT_0_STATUS), probe_read(&gpu, GPU_CP_HW_FAULT),
+		    probe_read(&gpu, GPU_CP_INTERRUPT_STATUS), probe_read(&gpu, GPU_CP_PROTECT_STATUS));
+	} else {
+		printf("adreno-sdm845: GPU report: %s; GPU MMIO window unavailable, last fence=%u\n", why,
+		    polaris_gpu_last_fence);
+	}
+
+	/* Read the selected SID0 context's fault record without clearing its sticky status. */
+	if (smmu.virtual != 0 && polaris_smmu_context_page_size != 0 &&
+	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_bank < polaris_smmu_context_bank_count) {
+		uint32_t bank = polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_bank;
+		uint64_t context_offset = (uint64_t)polaris_smmu_context_base +
+		    (uint64_t)bank * polaris_smmu_context_page_size;
+
+		if (context_offset <= UINT32_MAX &&
+		    context_offset + SMMU_CB_FSYNR0 + sizeof(uint32_t) <= smmu.size) {
+			uint32_t context = (uint32_t)context_offset;
+			uint32_t fsr = probe_read(&smmu, context + SMMU_CB_FSR);
+			uint64_t far = (uint64_t)probe_read(&smmu, context + SMMU_CB_FAR_HI) << 32 |
+			    probe_read(&smmu, context + SMMU_CB_FAR_LO);
+			uint32_t fsynr0 = probe_read(&smmu, context + SMMU_CB_FSYNR0);
+			struct polaris_smmu_address_space *active = polaris_gpu_active_space;
+
+			printf("adreno-sdm845: SID0 SMMU fault snapshot: CB%u ASID=%u root=%s FSR=%#x FAR=%#llx FSYNR0=%#x\n",
+			    bank, active != NULL ? active->asid : 0u,
+			    active != NULL && active->name != NULL ? active->name : "unknown",
+			    fsr, (unsigned long long)far, fsynr0);
+		}
+	}
+	if (smmu.virtual != 0 && sizeof(uint32_t) <= smmu.size && SMMU_GFSYNR2 + sizeof(uint32_t) <= smmu.size) {
+		uint32_t gfsr = probe_read(&smmu, SMMU_GFSR);
+		uint32_t gfsynr0 = probe_read(&smmu, SMMU_GFSYNR0);
+		uint32_t gfsynr1 = probe_read(&smmu, SMMU_GFSYNR1);
+		uint32_t gfsynr2 = probe_read(&smmu, SMMU_GFSYNR2);
+
+		printf("adreno-sdm845: SMMU global fault snapshot: GFSR=%#x GFSYNR0=%#x GFSYNR1=%#x GFSYNR2=%#x\n",
+		    gfsr, gfsynr0, gfsynr1, gfsynr2);
+	}
 }
 
 static bool
