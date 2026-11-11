@@ -1,5 +1,7 @@
 # Port a device
 
+Device-specific implementation notes: [Polaris Adreno 630](polaris-adreno-630.md).
+
 What it takes to bring HakiOS to a phone that does not have it yet, in the order that works: first a repository and a
 configuration, then a boot with nothing of the phone's, then the drivers one at a time. Each step says how you know it is done.
 

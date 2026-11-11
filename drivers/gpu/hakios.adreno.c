@@ -3719,8 +3719,10 @@ out:
  * has its peripherals elsewhere -- not one register of the above is touched.
  */
 #define HAKIOS_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin (its "redwood") */
+#define HAKIOS_SDM845_SOC_BASE 0x00100000ul
 
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
+extern void hakios_adreno_sdm845_init(void);
 
 static bool
 start_by_itself(void)
@@ -3764,7 +3766,20 @@ hakios_adreno_init(void)
 	};
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
+	vm_offset_t soc_base = pe_arm_get_soc_base_phys();
 
+	if (soc_base == HAKIOS_SDM845_SOC_BASE) {
+		hakios_adreno_sdm845_init();
+		return;
+	}
+	if (soc_base != HAKIOS_SOC_BASE) {
+		if ((PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) ||
+		    (PE_parse_boot_argn("adreno", &only, sizeof(only)) && only)) {
+			printf("adreno: no backend for SoC peripheral base %#llx; GPU registers are left untouched\n",
+			    (uint64_t)soc_base);
+		}
+		return;
+	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}
