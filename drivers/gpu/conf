@@ -10,6 +10,10 @@ driver ADRENO
 	help    probes (adreno=1..6), explicit PAS ZAP staging (adreno=7), read-only RPMh discovery (adreno=8),
 	help    detached HFI memory preparation (adreno=9), reset-held GMU ITCM loading (adreno=10),
 	help    GMU-kernel SID5 attach (adreno=11), GMU/HFI startup (adreno=12), PERF_TBL (adreno=13),
-	help    and PERF_TBL/BW_VOTE_TBL submission (adreno=14). Do not invoke write stages on hardware
-	help    during current bring-up.
-	help    Polaris rendering is not enabled yet; both devices need their own firmware in fw-gpu/.
+	help    PERF_TBL/BW_VOTE_TBL submission (adreno=14), offline CP packet construction (adreno=15),
+	help    detached CP buffer preparation (adreno=16), guarded GX startup (adreno=17), core setup
+	help    (adreno=18), ZAP authentication and CP_ME_INIT (adreno=19), unsecured CP mode (adreno=20),
+	help    and a kernel-owned fence smoke test (adreno=21). Polaris write stages remain unverified
+	help    on hardware. Do not enable rendering until client-memory isolation, interrupt or bounded
+	help    completion, hang recovery, and safe GPU shutdown are implemented and validated.
+	help    Both devices need their own firmware in fw-gpu/.

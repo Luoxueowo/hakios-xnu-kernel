@@ -60,7 +60,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   a controlled device run.
 - Firmware has been extracted read-only from the Polaris Recovery vendor partition. The local
   `fw-gpu/` directory is ignored by Git; the blobs must stay out of the repository and be staged
-  into the image only by the existing firmware packaging path.
+  into the image only by the existing firmware packaging path. `devices/polaris/pull-firmware.sh`
+  verifies that the source is the vendor ext4 block device mounted read-only, supports the Recovery
+  `ro,noload` mount when needed, and records hashes in the ignored directory.
 - On 2026-11-11, the connected MIX 2S was in Recovery with its vendor partition mounted
   `ro,noload`. SHA-256 hashes for all seven A630 firmware files matched `fw-gpu/SHA256SUMS`.
   Its live device tree reported model `Xiaomi Technologies, Inc. Polaris MP v2.1`, chip ID
@@ -480,12 +482,12 @@ be assumed to serve the GMU stream. See the primary Qualcomm [`kgsl_hfi.h`](http
 [`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm.git/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_gmu.c) sources.
 
 The local firmware set is `a630_gmu.bin`, `a630_sqe.fw`, and `a630_zap.{mdt,b00,b01,b02,elf}`.
-I verified all seven SHA-256 hashes against the MIX 2S in Recovery: `/vendor` was mounted
-read-only from `/dev/block/sde47`, with fingerprint
+`devices/polaris/pull-firmware.sh` has now pulled all seven from the MIX 2S in Recovery: `/vendor`
+was mounted read-only from `/dev/block/sde47`, with fingerprint
 `Xiaomi/polaris/polaris:8.0.0/OPR1.170623.032/V9.5.19.0.ODGMIFA:user/release-keys` and
-incremental build `1793965292`. Every device file hash matches the corresponding local file and
-`fw-gpu/SHA256SUMS`; there was no need to replace or add firmware. `userland/build.sh` copies the
-ignored local `fw-gpu/*` set into the image's `fw/` directory when building.
+incremental build `1793965292`. Device-side and local SHA-256 hashes match for every file, and the
+script refreshed `fw-gpu/SHA256SUMS`. `userland/build.sh` copies the ignored local `fw-gpu/*` set
+into the image's `fw/` directory when building.
 The `mdt` describes three program headers, with a single loadable segment matching `b02`; the
 signed metadata/other chunks still need to follow the exact Qualcomm MDT/PAS loading contract.
 Do not assume that copying the Redwood `mdt` plus `b02` path is sufficient. Confirm SQE format

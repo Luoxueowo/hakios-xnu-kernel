@@ -119,8 +119,15 @@ first-time Data initialization, and the direct `fastboot flash boot` step, see [
 
 ## Firmware
 
-Pulled from your own phone, never committed: `devices/redwood/pull-firmware.sh`, or
-`pull-firmware-root.sh` where the firmware is readable by root only. Check with `make doctor`.
+With the MIX 2S in Recovery and visible to ADB, run:
+
+```sh
+ADB=/path/to/adb devices/polaris/pull-firmware.sh
+```
+
+The script reads `/vendor/firmware` only when the vendor mount is read-only. If Recovery has not mounted vendor, it mounts
+`/dev/block/by-name/vendor` at `/mnt/hakios-vendor` with `ro,noload`, pulls the seven A630 GMU, SQE and ZAP files into the ignored
+`fw-gpu/` directory, records their SHA-256 hashes locally, and unmounts only the mount it created. Vendor firmware stays out of Git.
 
 ## Before you open a pull request
 

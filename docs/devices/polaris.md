@@ -10,6 +10,7 @@
 | Configuration | `make polaris_defconfig` |
 | Maintainer | Luoxue |
 | Repository | [`devices/polaris/`](https://github.com/oosexgang/hakios-xnu-kernel/tree/main/devices/polaris) |
+| Firmware | `devices/polaris/pull-firmware.sh` pulls it from your own phone |
 
 ## What works
 
