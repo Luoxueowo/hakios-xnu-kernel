@@ -33,10 +33,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   are per address space: 3D and `gmu_user` use unprivileged mappings, while `gmu_kernel` keeps
   privileged mappings for HFI memory. `adreno=9` also allocates contiguous HFI memory, creates a
   write-combined CPU alias, initializes its legacy HFI table, and maps its five 4-KiB pages into the
-  detached `gmu_kernel` software root at `0x60000000`.
-  No context bank, stream route, SMMU register, GMU interrupt, or firmware state is changed; these
-  tables remain detached and `ready()` remains false. This preparation step has not been run on the
-  phone.
+  detached `gmu_kernel` software root at `0x60000000`. It also builds a detached AArch64 SMMUv2
+  context-register image from the root PA, ASID, decoded OAS and IDR0 coherent-walk capability.
+  Noncoherent walks use noncacheable outer-shareable TCR attributes while the mapper cleans table
+  pages. No context bank, stream route, SMMU register, GMU interrupt, or firmware state is changed;
+  these tables remain detached and `ready()` remains false. This preparation step has not been run
+  on the phone.
 - `adreno=5` checks the staged A630 firmware and PAS memory description without writing hardware.
   The local set contains a 32 KiB GMU image and a 6,684-byte ZAP MDT with three ELF program
   headers; its single relocatable `PT_LOAD` segment matches `a630_zap.b02` at 1,968 bytes. The
@@ -301,8 +303,10 @@ The Polaris probe uses SMMUv2 IDR2 to confirm 4K support and decode OAS using up
 [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
 The operations table includes software map, commit, unmap, cache-maintenance and bounded ASID
 invalidation callbacks; ASID invalidation is reachable only after a later bring-up stage marks a
-verified context active. The runtime SMMU probe now reads its stream IDs from the validated DT
-tuples instead of relying on a duplicate hardcoded list.
+verified context active. The detached HFI preparation now forms the stage-1 register image with
+the measured output-address encoding, AArch64 ASID tags in TTBR0/TTBR1, 39-bit input size and
+walk-coherency attributes; it still does not install that image. The runtime SMMU probe now reads
+its stream IDs from the validated DT tuples instead of relying on a duplicate hardcoded list.
 
 The backend boundary must carry at least: SoC/GPU identity, firmware file set, MMIO resources,
 GMEM and frequency capabilities, SMMU implementation and stream/context assignments, startup and
@@ -343,11 +347,12 @@ bring-up and a bounded test submission.
    maintenance are implemented, with OAS and PTFS_4K checks taken from the read-only ID registers.
    The local firmware probe validates the ZAP MDT layout and applies the upstream SQE check to the
    payload after its 4-byte file prefix; the extracted SQE passes the version floor. The read-only
-   SMMUv2 probe now scans stream routes and context registers and produces conditional CB/SMR
-   candidates; run that diagnostic under HakiOS before treating any assignment as live. Then
-   verify HYP ownership, program independent 3D/GMU contexts with verified attributes, validate
-   A630 CP register protection, bring up GMU and core mappings, ring and fences, and exercise the
-   mapper on-device. Keep the backend disabled until those pieces are verified.
+   SMMUv2 probe scans stream routes and context registers and produces conditional CB/SMR
+   candidates; step 9 now also builds, but does not install, the GMU-kernel stage-1 context image.
+   Run the diagnostics under HakiOS before treating any assignment or image as live. Then verify
+   HYP ownership, install independent 3D/GMU contexts with verified attributes, validate A630 CP
+   register protection, bring up GMU and core mappings, ring and fences, and exercise the mapper
+   on-device. Keep the backend disabled until those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
    command buffers; bounded test commands complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno

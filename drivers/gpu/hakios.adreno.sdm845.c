@@ -140,6 +140,7 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define SMMU_IDR0_S1TS                  (1u << 30)
 #define SMMU_IDR0_S2TS                  (1u << 29)
 #define SMMU_IDR0_SMS                   (1u << 27)
+#define SMMU_IDR0_CTTW                  (1u << 14)
 #define SMMU_IDR0_EXIDS                 (1u << 8)
 #define SMMU_IDR0_NUMSIDB_SHIFT         9
 #define SMMU_IDR0_NUMSIDB_MASK          0x0fu
@@ -177,6 +178,9 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define SMMU_CBAR_TYPE_MASK              0x3u
 #define SMMU_CBAR_TYPE_S1_S2_BYPASS      1u
 #define SMMU_CBA2R_RW64                  (1u << 0)
+#define SMMU_CBAR_S1_BPSHCFG_SHIFT       8u
+#define SMMU_CBAR_S1_MEMATTR_SHIFT       12u
+#define SMMU_CBAR_S1_MEMATTR_WB          0xfu
 #define SMMU_CB_SCTLR                   0x0000u
 #define SMMU_CB_ACTLR                   0x0004u
 #define SMMU_CB_TCR2                    0x0010u
@@ -187,6 +191,20 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define SMMU_CB_MAIR0                   0x0038u
 #define SMMU_CB_MAIR1                   0x003cu
 #define SMMU_CB_FSR                     0x0058u
+#define SMMU_CB_TCR_T0SZ_MASK            0x3fu
+#define SMMU_CB_TCR_IRGN0_SHIFT           8u
+#define SMMU_CB_TCR_ORGN0_SHIFT          10u
+#define SMMU_CB_TCR_SH0_SHIFT            12u
+#define SMMU_CB_TCR_EPD1                 (1u << 23)
+#define SMMU_CB_TCR2_PASIZE_MASK          0x0fu
+#define SMMU_CB_TCR2_AS                  (1u << 4)
+#define SMMU_CB_TCR2_SEP_SHIFT           15u
+#define SMMU_CB_TCR2_SEP_UPSTREAM         7u
+#define SMMU_CB_SCTLR_TRE                (1u << 1)
+#define SMMU_CB_SCTLR_AFE                (1u << 2)
+#define SMMU_CB_SCTLR_CFRE               (1u << 5)
+#define SMMU_CB_SCTLR_S1_ASIDPNE          (1u << 12)
+#define SMMU_CB_MAIR0_LPAE               0xf404ff44u
 #define SMMU_CB_TLBIASID                0x0610u
 #define SMMU_CB_TLBSYNC                 0x07f0u
 #define SMMU_CB_TLBSTATUS               0x07f4u
@@ -279,6 +297,18 @@ struct polaris_smmu_address_space {
 	bool context_active;
 };
 
+struct polaris_smmu_context_image {
+	uint32_t cbar;
+	uint32_t cba2r;
+	uint32_t tcr;
+	uint32_t tcr2;
+	uint32_t mair0;
+	uint32_t mair1;
+	uint32_t sctlr;
+	uint64_t ttbr0;
+	uint64_t ttbr1;
+};
+
 static struct polaris_smmu_table polaris_smmu_tables[POLARIS_SMMU_MAX_TABLES];
 static uint32_t polaris_smmu_table_count;
 static vm_offset_t polaris_smmu_table_chunk;
@@ -310,7 +340,9 @@ static struct polaris_smmu_address_space polaris_smmu_spaces[POLARIS_SMMU_ADDRES
 	},
 };
 static uint32_t polaris_smmu_oas_bits;
+static uint32_t polaris_smmu_oas_encoding;
 static bool polaris_smmu_supports_4k;
+static bool polaris_smmu_coherent_walk;
 static uint32_t polaris_smmu_context_page_size;
 static uint32_t polaris_smmu_context_base;
 static uint32_t polaris_smmu_context_bank_count;
@@ -536,6 +568,7 @@ static void sdm845_gpu_mapped(void);
 static void sdm845_gpu_unmap(uint64_t address, uint64_t size);
 static void sdm845_gpu_to_memory(void *start, uint64_t size);
 static void sdm845_gpu_stop(void);
+static uint32_t smmu_id_size_to_bits(uint32_t encoding);
 
 static bool
 sdm845_gpu_ready(void)
@@ -1477,6 +1510,45 @@ polaris_smmu_space_map_page(struct polaris_smmu_address_space *space, uint64_t a
 	return ok;
 }
 
+/* Build the AArch64 stage-1 register image; this helper never touches the SMMU. */
+static bool
+polaris_smmu_context_image_build(const struct polaris_smmu_address_space *space,
+	struct polaris_smmu_context_image *image)
+{
+	uint32_t tcr;
+
+	if (space == NULL || image == NULL || space->root == NULL || space->asid == 0 || space->asid > 0xffffu ||
+	    !polaris_smmu_supports_4k || polaris_smmu_oas_bits < 32 || polaris_smmu_oas_bits > 48 ||
+	    polaris_smmu_oas_encoding > 5u ||
+	    polaris_smmu_oas_bits != smmu_id_size_to_bits(polaris_smmu_oas_encoding) ||
+	    !polaris_smmu_phys_valid(space->root->phys, POLARIS_SMMU_TABLE_BYTES) ||
+	    (space->root->phys & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0) {
+		return false;
+	}
+	memset(image, 0, sizeof(*image));
+	image->cbar = (SMMU_CBAR_TYPE_S1_S2_BYPASS << SMMU_CBAR_TYPE_SHIFT) |
+	    (3u << SMMU_CBAR_S1_BPSHCFG_SHIFT) | (SMMU_CBAR_S1_MEMATTR_WB << SMMU_CBAR_S1_MEMATTR_SHIFT);
+	image->cba2r = SMMU_CBA2R_RW64;
+	tcr = (64u - 39u) & SMMU_CB_TCR_T0SZ_MASK;
+	tcr |= SMMU_CB_TCR_EPD1;
+	if (polaris_smmu_coherent_walk) {
+		tcr |= (1u << SMMU_CB_TCR_IRGN0_SHIFT) | (1u << SMMU_CB_TCR_ORGN0_SHIFT) |
+		    (3u << SMMU_CB_TCR_SH0_SHIFT);
+	} else {
+		/* Noncoherent walks use outer-shareable, noncacheable table accesses; PTEs are cleaned. */
+		tcr |= (2u << SMMU_CB_TCR_SH0_SHIFT);
+	}
+	image->tcr = tcr;
+	image->tcr2 = (polaris_smmu_oas_encoding & SMMU_CB_TCR2_PASIZE_MASK) | SMMU_CB_TCR2_AS |
+	    (SMMU_CB_TCR2_SEP_UPSTREAM << SMMU_CB_TCR2_SEP_SHIFT);
+	image->mair0 = SMMU_CB_MAIR0_LPAE;
+	image->sctlr = SMMU_SCTLR_M | SMMU_CB_SCTLR_TRE | SMMU_CB_SCTLR_AFE |
+	    SMMU_CB_SCTLR_CFRE | SMMU_CB_SCTLR_S1_ASIDPNE;
+	image->ttbr0 = space->root->phys | ((uint64_t)space->asid << 48);
+	image->ttbr1 = (uint64_t)space->asid << 48;
+	return true;
+}
+
 static void
 polaris_smmu_unmap_locked(struct polaris_smmu_address_space *space, uint64_t address, uint64_t size)
 {
@@ -1570,6 +1642,7 @@ static bool
 polaris_hfi_software_prepare(void)
 {
 	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL];
+	struct polaris_smmu_context_image context_image;
 	vm_size_t allocation_size;
 	vm_offset_t allocation = 0, uncached;
 	uint64_t phys;
@@ -1637,10 +1710,16 @@ polaris_hfi_software_prepare(void)
 		sdm845_gpu_mapped();
 		polaris_hfi_space_mapped = true;
 	}
+	if (!polaris_smmu_context_image_build(space, &context_image)) {
+		printf("adreno-sdm845: step 9 cannot build an AArch64 SMMUv2 context image for the detached GMU-kernel root\n");
+		return false;
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
-	printf("adreno-sdm845: step 9 GMU-kernel HFI software map: phys=%#llx, GMU VA=%#x, %u bytes; page tables are detached, no SMMU or GMU registers were written\n",
+	printf("adreno-sdm845: step 9 GMU-kernel HFI software map: phys=%#llx, GMU VA=%#x, %u bytes; detached context CBAR=%#x CBA2R=%#x TCR=%#x TCR2=%#x TTBR0=%#llx TTBR1=%#llx MAIR0=%#x SCTLR=%#x; no SMMU or GMU registers were written\n",
 	    polaris_hfi_physical, POLARIS_A630_HFI_GMU_KERNEL_BASE,
-	    (uint32_t)POLARIS_A630_HFI_ALLOCATION_BYTES);
+	    (uint32_t)POLARIS_A630_HFI_ALLOCATION_BYTES, context_image.cbar, context_image.cba2r,
+	    context_image.tcr, context_image.tcr2, context_image.ttbr0, context_image.ttbr1,
+	    context_image.mair0, context_image.sctlr);
 	return true;
 }
 
@@ -1737,6 +1816,10 @@ polaris_smmu_routes_reset(void)
 	polaris_smmu_context_page_size = 0;
 	polaris_smmu_context_base = 0;
 	polaris_smmu_context_bank_count = 0;
+	polaris_smmu_oas_bits = 0;
+	polaris_smmu_oas_encoding = 0;
+	polaris_smmu_supports_4k = false;
+	polaris_smmu_coherent_walk = false;
 	polaris_smmu_free_smr_count = 0;
 }
 
@@ -2102,9 +2185,12 @@ probe_smmu(void)
 	    (idr2 >> SMMU_IDR2_UBS_SHIFT) & SMMU_IDR2_SIZE_MASK, (unsigned)!!(idr2 & SMMU_IDR2_PTFS_4K),
 	    (unsigned)!!(idr2 & SMMU_IDR2_PTFS_16K), (unsigned)!!(idr2 & SMMU_IDR2_PTFS_64K));
 	polaris_smmu_oas_bits = smmu_id_size_to_bits((idr2 >> SMMU_IDR2_OAS_SHIFT) & SMMU_IDR2_SIZE_MASK);
+	polaris_smmu_oas_encoding = (idr2 >> SMMU_IDR2_OAS_SHIFT) & SMMU_IDR2_SIZE_MASK;
 	polaris_smmu_supports_4k = (idr0 & SMMU_IDR0_S1TS) != 0 && (idr2 & SMMU_IDR2_PTFS_4K) != 0;
-	printf("adreno-sdm845: SMMU stage-1 table prerequisites: 4K=%s, OAS=%u bits\n",
-	    polaris_smmu_supports_4k ? "supported" : "unavailable", polaris_smmu_oas_bits);
+	polaris_smmu_coherent_walk = (idr0 & SMMU_IDR0_CTTW) != 0;
+	printf("adreno-sdm845: SMMU stage-1 table prerequisites: 4K=%s, OAS=%u bits (encoding=%u), coherent table walk=%s\n",
+	    polaris_smmu_supports_4k ? "supported" : "unavailable", polaris_smmu_oas_bits,
+	    polaris_smmu_oas_encoding, polaris_smmu_coherent_walk ? "yes" : "no");
 	if (idr0 & SMMU_IDR0_SMS) {
 		if (stream_groups == 0) {
 			printf("adreno-sdm845: SMMU advertises stream matching but reports no SMR groups\n");
