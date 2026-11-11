@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/time.h>
 #include <time.h>
 #include <stdlib.h>
@@ -241,13 +242,18 @@ NONE(drmSyncobjExportSyncFile, __attribute__((unused)) int fd, __attribute__((un
  * Not here: syncobjs and sync files as file descriptors (nothing outside this process waits for them).
  */
 #define SYNCOBJS        4096
-#define PENDING         16
+#define SYNC_POLL_BATCH  16
+
+struct syncobj_point {
+	uint64_t point;
+	uint32_t fence;
+};
 
 struct syncobj {
 	bool used;
 	uint64_t reached;                       /* the last point known reached */
-	unsigned pending;
-	struct { uint64_t point; uint32_t fence; } on_the_way[PENDING];
+	size_t pending, reserved, capacity;
+	struct syncobj_point *on_the_way;
 };
 static struct syncobj syncobjs[SYNCOBJS];
 static pthread_mutex_t syncobj_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -283,9 +289,9 @@ now_ns(void)
 static void
 syncobj_poll(struct syncobj *s)
 {
-	unsigned kept = 0;
+	size_t kept = 0;
 
-	for (unsigned i = 0; i < s->pending; i++) {
+	for (size_t i = 0; i < s->pending; i++) {
 		if (fence_done(s->on_the_way[i].fence, 0)) {
 			if (s->on_the_way[i].point > s->reached) s->reached = s->on_the_way[i].point;
 		} else {
@@ -295,22 +301,43 @@ syncobj_poll(struct syncobj *s)
 	s->pending = kept;
 }
 
-static void
+/* Grow the pending-fence list without losing points that have not completed. */
+static bool
+syncobj_reserve(struct syncobj *s, size_t additional)
+{
+	size_t needed, capacity;
+	struct syncobj_point *points;
+
+	if (s->reserved > SIZE_MAX - s->pending || additional > SIZE_MAX - s->pending - s->reserved) return false;
+	needed = s->pending + s->reserved + additional;
+	if (needed <= s->capacity) return true;
+	capacity = s->capacity != 0 ? s->capacity : SYNC_POLL_BATCH;
+	while (capacity < needed) {
+		if (capacity > SIZE_MAX / 2) {
+			capacity = needed;
+			break;
+		}
+		capacity *= 2;
+	}
+	if (capacity > SIZE_MAX / sizeof(*points)) return false;
+	points = realloc(s->on_the_way, capacity * sizeof(*points));
+	if (points == NULL) return false;
+	s->on_the_way = points;
+	s->capacity = capacity;
+	return true;
+}
+
+static bool
 syncobj_add(struct syncobj *s, uint64_t point, uint32_t fence)
 {
-	if (s->pending == PENDING) {
+	if (s->pending >= SYNC_POLL_BATCH && s->pending % SYNC_POLL_BATCH == 0) {
 		syncobj_poll(s);
 	}
-	if (s->pending == PENDING) {
-		/* (full: the oldest is waited for, its point taken as reached) */
-		fence_done(s->on_the_way[0].fence, now_ns() + 10000000000LL);
-		if (s->on_the_way[0].point > s->reached) s->reached = s->on_the_way[0].point;
-		memmove(&s->on_the_way[0], &s->on_the_way[1], (PENDING - 1) * sizeof(s->on_the_way[0]));
-		s->pending--;
-	}
+	if (!syncobj_reserve(s, 1)) return false;
 	s->on_the_way[s->pending].point = point;
 	s->on_the_way[s->pending].fence = fence;
 	s->pending++;
+	return true;
 }
 
 int
@@ -319,7 +346,7 @@ drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 	(void)fd;
 	pthread_mutex_lock(&syncobj_lock);
 	for (uint32_t h = 1; h < SYNCOBJS; h++) {
-		if (!syncobjs[h].used) {
+		if (!syncobjs[h].used && syncobjs[h].reserved == 0) {
 			memset(&syncobjs[h], 0, sizeof(syncobjs[h]));
 			syncobjs[h].used = true;
 			syncobjs[h].reached = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? 1 : 0;
@@ -341,9 +368,17 @@ drmSyncobjDestroy(int fd, uint32_t handle)
 	(void)fd;
 	pthread_mutex_lock(&syncobj_lock);
 	s = syncobj_of(handle);
-	if (s != NULL) s->used = false;
+	if (s == NULL) {
+		pthread_mutex_unlock(&syncobj_lock);
+		return -EINVAL;
+	}
+	s->used = false;
+	if (s->reserved == 0) {
+		free(s->on_the_way);
+		memset(s, 0, sizeof(*s));
+	}
 	pthread_mutex_unlock(&syncobj_lock);
-	return s != NULL ? 0 : -EINVAL;
+	return 0;
 }
 
 int
@@ -431,7 +466,7 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned cou
 				return -EINVAL;
 			}
 			syncobj_poll(s);
-			for (unsigned k = 0; k < s->pending; k++) {
+			for (size_t k = 0; k < s->pending; k++) {
 				if (s->on_the_way[k].point >= point) {
 					on_the_way = true;
 					if (!have_fence || (int32_t)(s->on_the_way[k].fence - wait_fence) < 0) wait_fence = s->on_the_way[k].fence;
@@ -510,9 +545,12 @@ drmSyncobjTransfer(int fd, uint32_t dst, uint64_t dst_point, uint32_t src, uint6
 	if (s->reached >= want) {
 		if (to > d->reached) d->reached = to;
 	} else {
-		for (unsigned k = 0; k < s->pending; k++) {
+		for (size_t k = 0; k < s->pending; k++) {
 			if (s->on_the_way[k].point >= want) {
-				syncobj_add(d, to, s->on_the_way[k].fence);
+				if (!syncobj_add(d, to, s->on_the_way[k].fence)) {
+					pthread_mutex_unlock(&syncobj_lock);
+					return -ENOMEM;
+				}
 				break;
 			}
 		}
@@ -525,25 +563,136 @@ drmSyncobjTransfer(int fd, uint32_t dst, uint64_t dst_point, uint32_t src, uint6
 static uint32_t last_fence;     /* the fence of the last submission the kernel took */
 
 static int
+syncobj_copy_entries(uint64_t address, uint32_t count, uint32_t stride,
+    struct drm_msm_gem_submit_syncobj **entries)
+{
+	uintptr_t base = (uintptr_t)address;
+	size_t span, bytes;
+
+	*entries = NULL;
+	if (count == 0) return 0;
+	if (address == 0 || (uint64_t)base != address || stride < sizeof(**entries)) return -EINVAL;
+	if ((size_t)(count - 1) > (SIZE_MAX - sizeof(**entries)) / stride ||
+	    (size_t)count > SIZE_MAX / sizeof(**entries)) return -EINVAL;
+	span = (size_t)(count - 1) * stride + sizeof(**entries);
+	if (base > UINTPTR_MAX - (span - 1)) return -EINVAL;
+	bytes = (size_t)count * sizeof(**entries);
+	*entries = malloc(bytes);
+	if (*entries == NULL) return -ENOMEM;
+	for (uint32_t i = 0; i < count; i++) {
+		memcpy(&(*entries)[i], (const void *)(base + (size_t)i * stride), sizeof(**entries));
+	}
+	return 0;
+}
+
+static int
+syncobj_output_counts_locked(const struct drm_msm_gem_submit_syncobj *entries, uint32_t count,
+    uint16_t additions[SYNCOBJS])
+{
+	memset(additions, 0, SYNCOBJS * sizeof(*additions));
+
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t handle = entries[i].handle;
+		if (handle == 0 || handle >= SYNCOBJS) return -EINVAL;
+		additions[handle]++;
+	}
+	return 0;
+}
+
+/* Validate and reserve all output points before a submit can reach the GPU. */
+static int
+syncobj_reserve_outputs_locked(const struct drm_msm_gem_submit_syncobj *entries, uint32_t count)
+{
+	uint16_t additions[SYNCOBJS];
+	int error = syncobj_output_counts_locked(entries, count, additions);
+
+	if (error != 0) return error;
+	for (uint32_t handle = 1; handle < SYNCOBJS; handle++) {
+		if (additions[handle] != 0 && syncobj_of(handle) == NULL) return -EINVAL;
+	}
+	for (uint32_t handle = 1; handle < SYNCOBJS; handle++) {
+		if (additions[handle] != 0 &&
+		    !syncobj_reserve(&syncobjs[handle], additions[handle])) return -ENOMEM;
+	}
+	for (uint32_t handle = 1; handle < SYNCOBJS; handle++) {
+		syncobjs[handle].reserved += additions[handle];
+	}
+	return 0;
+}
+
+static void
+syncobj_release_outputs_locked(const struct drm_msm_gem_submit_syncobj *entries, uint32_t count)
+{
+	uint16_t additions[SYNCOBJS];
+	if (syncobj_output_counts_locked(entries, count, additions) != 0) return;
+	for (uint32_t handle = 1; handle < SYNCOBJS; handle++) {
+		if (additions[handle] != 0 && syncobjs[handle].reserved >= additions[handle]) {
+			syncobjs[handle].reserved -= additions[handle];
+			if (!syncobjs[handle].used && syncobjs[handle].reserved == 0) {
+				free(syncobjs[handle].on_the_way);
+				memset(&syncobjs[handle], 0, sizeof(syncobjs[handle]));
+			}
+		}
+	}
+}
+
+static bool
+syncobj_commit_outputs_locked(const struct drm_msm_gem_submit_syncobj *entries, uint32_t count, uint32_t fence)
+{
+	uint16_t additions[SYNCOBJS];
+	if (syncobj_output_counts_locked(entries, count, additions) != 0) return false;
+	for (uint32_t handle = 1; handle < SYNCOBJS; handle++) {
+		if (syncobjs[handle].reserved < additions[handle]) return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		struct syncobj *s = &syncobjs[entries[i].handle];
+		s->reserved--;
+		if (entries[i].point == 0) s->reached = 0, s->pending = 0;
+		if (s->pending >= SYNC_POLL_BATCH && s->pending % SYNC_POLL_BATCH == 0) syncobj_poll(s);
+		s->on_the_way[s->pending].point = entries[i].point != 0 ? entries[i].point : 1;
+		s->on_the_way[s->pending].fence = fence;
+		s->pending++;
+		if (!s->used && s->reserved == 0) {
+			free(s->on_the_way);
+			memset(s, 0, sizeof(*s));
+		}
+	}
+	return true;
+}
+
+static int
 submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
 {
-	const struct drm_msm_gem_submit_syncobj *in = (const void *)(uintptr_t)submit->in_syncobjs;
-	const struct drm_msm_gem_submit_syncobj *out = (const void *)(uintptr_t)submit->out_syncobjs;
+	struct drm_msm_gem_submit_syncobj *in = NULL, *out = NULL;
 	const uint32_t stride = submit->syncobj_stride ? submit->syncobj_stride : sizeof(*in);
 	const uint32_t nin = (submit->flags & MSM_SUBMIT_SYNCOBJ_IN) ? submit->nr_in_syncobjs : 0;
 	const uint32_t nout = (submit->flags & MSM_SUBMIT_SYNCOBJ_OUT) ? submit->nr_out_syncobjs : 0;
-	int error;
+	int error = 0;
+	bool outputs_reserved = false;
+
+	if (nin >= SYNCOBJS || nout >= SYNCOBJS) return -EINVAL;
+	error = syncobj_copy_entries(submit->in_syncobjs, nin, stride, &in);
+	if (error != 0) goto done;
+	error = syncobj_copy_entries(submit->out_syncobjs, nout, stride, &out);
+	if (error != 0) goto done;
 
 	/* what it waits for first (this queue's own submissions are in order on the one ring anyway) */
 	for (uint32_t i = 0; i < nin; i++) {
-		const struct drm_msm_gem_submit_syncobj *x = (const void *)((const uint8_t *)in + i * stride);
-		uint32_t h = x->handle;
-		uint64_t p = x->point;
+		uint32_t h = in[i].handle;
+		uint64_t p = in[i].point;
 		int r = drmSyncobjTimelineWait(0, &h, &p, 1, now_ns() + 10000000000LL,
 		    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
-		if (r != 0) return r;
-		if (x->flags & MSM_SUBMIT_SYNCOBJ_RESET) drmSyncobjReset(0, &h, 1);
+		if (r != 0) {
+			error = r;
+			goto done;
+		}
+		if (in[i].flags & MSM_SUBMIT_SYNCOBJ_RESET) drmSyncobjReset(0, &h, 1);
 	}
+	pthread_mutex_lock(&syncobj_lock);
+	error = syncobj_reserve_outputs_locked(out, nout);
+	pthread_mutex_unlock(&syncobj_lock);
+	if (error != 0) goto done;
+	outputs_reserved = true;
 	submit->flags &= ~(uint32_t)(MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT);
 	submit->in_syncobjs = submit->out_syncobjs = 0;
 	submit->nr_in_syncobjs = submit->nr_out_syncobjs = 0;
@@ -555,20 +704,26 @@ submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
 		submit->fence = __atomic_load_n(&last_fence, __ATOMIC_ACQUIRE);
 	} else {
 		error = call((unsigned)(DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT), submit, size);
-		if (error != 0) return -error;
+		if (error != 0) {
+			error = -error;
+			goto done;
+		}
 		__atomic_store_n(&last_fence, submit->fence, __ATOMIC_RELEASE);
 	}
 	pthread_mutex_lock(&syncobj_lock);
-	for (uint32_t i = 0; i < nout; i++) {
-		const struct drm_msm_gem_submit_syncobj *x = (const void *)((const uint8_t *)out + i * stride);
-		struct syncobj *s = syncobj_of(x->handle);
-		if (s == NULL) continue;
-		if (x->point == 0) s->reached = 0, s->pending = 0;   /* a binary one: what it holds now is this submission */
-		syncobj_add(s, x->point != 0 ? x->point : 1, submit->fence);
-	}
+	if (!syncobj_commit_outputs_locked(out, nout, submit->fence)) error = -ENOMEM;
+	else outputs_reserved = false;
 	pthread_cond_broadcast(&syncobj_submitted);
 	pthread_mutex_unlock(&syncobj_lock);
-	return 0;
+done:
+	if (outputs_reserved) {
+		pthread_mutex_lock(&syncobj_lock);
+		syncobj_release_outputs_locked(out, nout);
+		pthread_mutex_unlock(&syncobj_lock);
+	}
+	free(in);
+	free(out);
+	return error;
 }
 
 /* Linux's device nodes, which Turnip's lists of devices ask about: one GPU, a render node 128 */

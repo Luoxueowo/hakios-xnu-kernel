@@ -42,6 +42,13 @@ allow it. A successful firmware boot alone is not a completed driver.
   The offsets and Linux fault-read path follow upstream [`arm-smmu.h`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)
   and [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
   These changes have compile/source evidence only and still need a controlled Polaris run.
+- The Turnip DRM shim's timeline syncobjs now grow their pending-fence list as needed. When a
+  fence queue reaches its polling interval, it only advances a point after a nonblocking kernel
+  wait confirms completion; it no longer discards the oldest point after an unchecked 10-second
+  wait. Submit syncobj arrays are copied and bounds-checked, and output handles/capacity slots are
+  reserved before submission so concurrent syncobj operations cannot consume them before the
+  returned fence is recorded. This prevents a timed-out fence from being reported complete. The
+  shim compiled to an arm64 iOS object on 2026-11-12; no Vulkan workload has run on the phone.
 - On 2026-11-12, Recovery ADB confirmed `/vendor` is the phone's `ext4 ro` mount from
   `/dev/block/sde47`. `devices/polaris/pull-firmware.sh` pulled the seven A630 files from
   `/vendor/firmware` and compared each pulled file's SHA-256 against the device-side hash. The
