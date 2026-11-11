@@ -331,6 +331,10 @@ HakiosGPUStart(void)
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	gGPULock = IOLockAlloc();
+	if (gGPULock == NULL) {
+		IOLog("HakiosGPU: cannot allocate the service lock\n");
+		return;
+	}
 	gpu = OSTypeAlloc(HakiosGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);
@@ -348,6 +352,11 @@ HakiosGPUStart(void)
 void
 HakiosGPUStop(void)
 {
+	if (gGPULock == NULL) {
+		/* No service or clients exist yet; staged backends still need their stop callback. */
+		hakios_gpu_stop();
+		return;
+	}
 	IOLockLock(gGPULock);
 	hakios_gpu_stop();
 	IOLockUnlock(gGPULock);

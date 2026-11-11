@@ -271,15 +271,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   is not implemented yet, so stop deliberately refuses to tear resources down underneath a live
   CP. This is a safety guard, not a completed power-down path; runtime start/stop and recovery
   remain unavailable.
-- There is an earlier lifecycle gap: the shared `hakios_adreno_stop()` only calls `HakiosGPUStop()`
-  when `hakios_gpu_ready()` is true, while A630 deliberately keeps `ready()` false and its backend
-  has no `quiesce` callback. Therefore the A630 stop guard is not reached through the normal stop
-  entry, and `loader_return()` does not quiesce this backend before returning memory to the loader.
-  After a write stage has started GMU/HFI or attached SMMU streams, this can leave live hardware
-  referencing kernel-owned queues or page tables. Do not run those stages on-device or treat a
-  return to the loader as safe until lifecycle dispatch and a verified A630 quiesce path are in
-  place. Do not fix this by merely removing the readiness check: A630 needs a stage-aware shutdown
-  that proves the GMU and CP are idle before releasing votes, routes, or backing memory.
+- The orderly stop entry now dispatches backend `stop()` even while `ready()` is false; this is
+  required to clean up a partial start. If HakiosGPU has not created its client lock yet, the stop
+  path dispatches directly because no clients can exist. A630's stop hook now preserves all state
+  whenever GMU/GX/PAS or any SMMU context may still be active, and only releases detached SQE/CP
+  buffers while the backend is inactive. Its panic/loader-return `quiesce` hook is still missing,
+  and the active stop path does not yet perform the verified idle/slumber/reset sequence. A write
+  stage can therefore leave live hardware referencing kernel-owned queues or page tables; do not
+  run those stages on-device or treat a return to the loader as safe until verified shutdown and
+  quiesce are implemented.
 
 ## Polaris hardware facts
 

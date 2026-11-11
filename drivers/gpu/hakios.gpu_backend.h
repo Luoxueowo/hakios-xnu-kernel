@@ -24,7 +24,7 @@ struct hakios_gpu_backend_ops {
 	uint32_t (*last)(void);
 	void (*worked)(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
 	void (*report)(const char *why);
-	void (*stop)(void);
+	void (*stop)(void); /* orderly shutdown calls this even when ready() is false */
 };
 
 extern const struct hakios_gpu_backend_ops hakios_gpu_redwood_backend_ops;

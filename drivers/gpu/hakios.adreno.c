@@ -3245,7 +3245,7 @@ static struct {
 static unsigned gpu_free_count;
 
 extern void HakiosGPUStart(void);
-extern void HakiosGPUStop(void);       /* takes the clients' lock, then calls hakios_gpu_stop() */
+extern void HakiosGPUStop(void);       /* locks clients when the service exists, then dispatches stop */
 static void gpu_block_stop(void);
 
 /*
@@ -3286,7 +3286,8 @@ hakios_adreno_stop(void)
 {
 	uint32_t dirty = 0;
 
-	if (hakios_gpu_ready() && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
+	/* Readiness gates clients, not lifecycle: a backend may need to unwind a partial start. */
+	if (!(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
 		HakiosGPUStop();
 	}
 }

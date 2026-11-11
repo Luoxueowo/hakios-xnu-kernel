@@ -5472,37 +5472,26 @@ stage_zap_shader(void)
 static void
 sdm845_gpu_stop(void)
 {
-	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
 	bool cp_buffers_present = polaris_gpu_sqe_buffer.virtual != 0 || polaris_gpu_ring_buffer.virtual != 0 ||
 	    polaris_gpu_rptr_buffer.virtual != 0;
+	bool smmu_contexts_active = polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
+	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active;
 
-	/* Never remove GX/PAS resources underneath an SQE that has been released from halt. */
-	if (polaris_gpu_cp_started || polaris_pas_image_active) {
-		printf("adreno-sdm845: GPU stop retains CP/GX/SMMU/PAS state; A630 idle, ring stop, and reset sequencing is not implemented\n");
+	/* This hook is reachable before ready(); preserve every resource the hardware may still use. */
+	if (polaris_gmu_firmware_started || polaris_gmu_hfi_ready || polaris_gmu_domain_ready ||
+	    polaris_gmu_boot_rail_active || polaris_gmu_temp_bus_vote_active || polaris_gpu_oob_active ||
+	    polaris_gpu_core_ready || polaris_gpu_core_configured || polaris_gpu_cp_started ||
+	    polaris_gpu_cp_initialized || polaris_pas_image_active || smmu_contexts_active) {
+		printf("adreno-sdm845: GPU stop retains active GMU/GX/PAS/SMMU state; verified A630 shutdown and loader quiesce are not implemented\n");
 		return;
 	}
 
-	polaris_gmu_gpu_oob_release();
-	if (polaris_gmu_boot_rail_active) {
-		polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
-		polaris_gmu_boot_rail_active = false;
-	}
-	polaris_gpu_core_configured = false;
-	if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
-		printf("adreno-sdm845: GPU stop could not confirm release of the temporary Apps RSC DDR vote\n");
-	}
-	if (polaris_pas_image_active && !polaris_pas_shutdown()) {
-		printf("adreno-sdm845: GPU stop could not shut down PAS image 13; metadata remains allocated\n");
-	}
 	if (cp_buffers_present) {
-		if (space->context_active || polaris_gpu_core_ready) {
-			printf("adreno-sdm845: GPU stop retains SQE/CP buffers while the 3D context or core is active\n");
-		} else {
-			polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
-			polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
-			polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
-			printf("adreno-sdm845: GPU stop released detached SQE/CP buffers with the 3D context and core inactive\n");
-		}
+		polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
+		polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
+		printf("adreno-sdm845: GPU stop released SQE/CP buffers from a detached, inactive backend\n");
 	}
 }
 
