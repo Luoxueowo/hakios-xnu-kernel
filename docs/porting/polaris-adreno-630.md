@@ -591,18 +591,24 @@ switch sequence
 [`adreno_iommu.c`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_iommu.c)).
 Client close queues and waits for a trusted switch back to the kernel root before reclaiming the
 client root. If client BO fences or that switch cannot be proven complete, the mappings and root
-are retained. The protected-mode bracket does not validate client IB opcodes or prove that the
-A630 SQE rejects a client-issued table switch or protected-mode change. Keep the public-client gate
-closed until the SQE command-stream boundary and private-page isolation are confirmed; both that
-boundary and all runtime behavior remain unverified on the phone.
+are retained. The protected-mode bracket is paired with an inspection of the local A630 SQE image
+(`fw-gpu/a630_sqe.fw`, version `0x016ee19a`) using Mesa 25.0.7's `afuc-disasm`. Its IB dispatcher
+tracks nesting depth in `$12`: the ring starts at level 0, `CP_INDIRECT_BUFFER` increments the level
+before entering an IB, and `IN_IB_END` decrements it. The `CP_SET_PROTECTED_MODE` handler at SQE word
+`0x376` and `CP_SMMU_TABLE_UPDATE` handler at word `0x92c` both branch to the `CP_NOP` packet-skip
+path when `$12 != 0`. This confirms that client IBs cannot use those two packets to change CP
+register-protection mode or SID0's translation table in this firmware image. The inspection is
+source-level evidence only: retain the public-client gate until privileged-page isolation, the SQE
+guard, and the switch/teardown path have been validated on Polaris hardware.
 
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
 software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use the private range
 `[0x00010000, 0x40000000)`; the shared service receives client allocations only from
 `[0x40000000, 0x100000000)`. Both allocators round to 64-KiB extents and accept exact frees. This
 address partition complements per-client stage-1 roots: each root contains the backend mappings
-and only one client's BOs. The implementation builds on the 4K LPAE tables and active SID0 context,
-but user submissions remain disabled pending command-stream security review and device validation.
+and only one client's BOs. The implementation builds on the 4K LPAE tables and active SID0 context.
+User submissions remain disabled until privileged-page isolation and runtime command submission
+are validated on the device.
 
 The table descriptor format follows the existing project mapper and the ARM LPAE definitions in
 upstream Linux [`io-pgtable-arm.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c).
@@ -626,10 +632,11 @@ GMEM and frequency capabilities, SMMU implementation and stream/context assignme
 stop operations, and the GPU address/map/submit/fence operations consumed by `hakios.gpu.cpp`.
 The shared `HakiosGPUUserClient::submit()` rejects zero-byte command buffers before forming an IB
 entry, in addition to its existing alignment, relocation and bounds checks. The A630 backend accepts
-at most 128 IBs and only client IOVAs in `[0x40000000, 0x100000000)`; per-client roots isolate BO
-mappings, but IB contents and table-switch packet access are not yet validated. The public `HakiosGPU` service
-must only start after its selected backend has completed CP bring-up, command isolation review, and
-bounded hardware submission checks.
+at most 128 IBs and only client IOVAs in `[0x40000000, 0x100000000)`. The local A630 SQE image rejects
+client-IB `CP_SMMU_TABLE_UPDATE` and `CP_SET_PROTECTED_MODE` packets based on IB nesting depth; this
+does not establish that all other privileged commands or private-page accesses are blocked. The
+public `HakiosGPU` service must only start after its selected backend has completed CP bring-up,
+command isolation review, and bounded hardware submission checks.
 
 ## Work and acceptance gates
 
@@ -732,10 +739,10 @@ bounded hardware submission checks.
   ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)).
   Kernel-owned SQE, ring and scratch pages now have privileged-only SMMU descriptors, and
   `CP_RB_CNTL_NO_UPDATE` disables CP writes to the RPTR shadow. Per-client roots now map each
-  client's BOs separately, and the trusted ring switches TTBR0/ASID before its IBs. The userclient
-  gate remains closed until the A630 is checked for user IBs that could issue their own table-switch
-  packets or reach kernel private pages. Hardware enforcement of the privileged SMMU mappings and
-  the new switch/teardown path also remain unverified on the phone.
+  client's BOs separately, and the trusted ring switches TTBR0/ASID before its IBs. The local A630
+  SQE image's IB-level guards for `CP_SMMU_TABLE_UPDATE` and `CP_SET_PROTECTED_MODE` are confirmed
+  by disassembly. The userclient gate remains closed until hardware confirms privileged SMMU
+  enforcement, broader command isolation, and the new switch/teardown path on the phone.
 - A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence
   stage and is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
   legacy-HFI slumber; it then checks GMU/CX/GX state, asserts CM3 reset, shuts down PAS, detaches
