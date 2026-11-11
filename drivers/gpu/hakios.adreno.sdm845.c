@@ -193,7 +193,11 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define GMU_ALWAYS_ON_COUNTER_L         GMU_WORD(0x5088)
 #define GMU_ALWAYS_ON_COUNTER_H         GMU_WORD(0x5089)
 #define GMU_CM3_FW_INIT_RESULT          GMU_WORD(0x501c)
+#define GMU_CM3_SYSRESET                GMU_WORD(0x5000)
+#define GMU_CM3_ITCM_START              GMU_WORD(0x0c00)
 #define GMU_HFI_VERSION_INFO            GMU_WORD(0x5181)
+#define A630_GMU_FW_MAX_BYTES           0x8000u
+#define A630_GMU_FW_READY                0xbabefaceu
 
 /* A6xx GPU offsets are in 32-bit words in the register XML. */
 #define GPU_WORD(n)                     (4u * (n))
@@ -2337,6 +2341,56 @@ probe_firmware(void)
 	return valid;
 }
 
+/*
+ * Load only the legacy A630 GMU image into ITCM. Qualcomm KGSL writes this raw image while CM3
+ * is held in reset; releasing reset, programming HFI, and starting firmware are separate stages.
+ */
+static bool
+polaris_gmu_firmware_load(void)
+{
+	const uint8_t *firmware;
+	uint64_t firmware_size = 0;
+	uint32_t reset, init_result;
+
+	if (!polaris_gmu_domain_ready || polaris_gpu_core_ready || gmu.virtual == 0) {
+		printf("adreno-sdm845: step 10 requires CX/GMU clock on, the 3D core off, and a mapped GMU window\n");
+		return false;
+	}
+	firmware = hakios_image_file("fw", "a630_gmu.bin", &firmware_size, NULL);
+	if (firmware == NULL || firmware_size == 0 || firmware_size > A630_GMU_FW_MAX_BYTES ||
+	    (firmware_size & 3u) != 0) {
+		printf("adreno-sdm845: step 10 refuses missing, unaligned, or oversized A630 GMU firmware (%llu bytes)\n",
+		    firmware_size);
+		return false;
+	}
+	init_result = probe_read(&gmu, GMU_CM3_FW_INIT_RESULT);
+	reset = probe_read(&gmu, GMU_CM3_SYSRESET);
+	if (init_result == A630_GMU_FW_READY || (reset & 1u) == 0) {
+		printf("adreno-sdm845: step 10 refuses to replace a live or non-reset GMU (init=%#x reset=%#x)\n",
+		    init_result, reset);
+		return false;
+	}
+	printf("adreno-sdm845: step 10: load %llu bytes of raw A630 GMU firmware to ITCM while CM3 reset remains asserted\n",
+	    firmware_size);
+	for (uint32_t offset = 0; offset < firmware_size; offset += sizeof(uint32_t)) {
+		probe_write(&gmu, GMU_CM3_ITCM_START + offset, read_le32(firmware + offset));
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t offset = 0; offset < firmware_size; offset += sizeof(uint32_t)) {
+		uint32_t expected = read_le32(firmware + offset);
+		uint32_t actual = probe_read(&gmu, GMU_CM3_ITCM_START + offset);
+
+		if (actual != expected) {
+			printf("adreno-sdm845: step 10 ITCM readback failed at %#x: expected %#x, got %#x; CM3 remains in reset\n",
+			    offset, expected, actual);
+			return false;
+		}
+	}
+	printf("adreno-sdm845: step 10 verified %llu ITCM bytes; reset is still asserted and GMU/HFI remain stopped\n",
+	    firmware_size);
+	return true;
+}
+
 /* A bounded copy of the Qualcomm SCM call convention used by this kernel's other PAS drivers. */
 static bool
 polaris_scm_call(uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
@@ -2735,9 +2789,22 @@ hakios_adreno_sdm845_init(void)
 		printf("adreno-sdm845: detached HFI software preparation finished; no SMMU context, HFI message, GMU startup, or rendering was enabled\n");
 		return;
 	}
+	if (last_step == 10) {
+		printf("adreno-sdm845: step 10 explicitly loads the raw A630 GMU image into ITCM; it runs read-only GPUCC/GMU/core/firmware checks and does not release reset or start HFI\n");
+		if (!probe_gpucc() || !probe_gmu() || !probe_core() || !probe_firmware()) {
+			printf("adreno-sdm845: a read-only precondition failed; GMU ITCM is not written\n");
+			return;
+		}
+		if (!polaris_gmu_firmware_load()) {
+			printf("adreno-sdm845: step 10 failed; the GMU remains stopped\n");
+			return;
+		}
+		printf("adreno-sdm845: step 10 finished; firmware is loaded but the GMU is not running and rendering remains disabled\n");
+		return;
+	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, and step 9 prepares detached HFI memory; "
-		    "requested step %u is capped at %zu\n",
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, step 9 prepares detached HFI memory, and step 10 loads GMU ITCM; "
+		    "requested step %u is capped at %zu in the sequential probe path\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);
 	}

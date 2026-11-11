@@ -78,6 +78,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   `adreno=9` runs steps 1–6, skips PAS staging, and prepares the detached HFI allocation and GMU
   kernel software page tables. This allocates kernel memory but does not write SMMU/GMU registers,
   send an HFI message, or start firmware. Neither diagnostic has run under HakiOS on the phone.
+  `adreno=10` is an explicit GMU ITCM load stage. It runs read-only GPUCC, GMU, core, and firmware
+  checks, requires CX/GMU clock on with the 3D core off and CM3 already held in reset, loads the
+  raw A630 image word-by-word, and verifies the ITCM readback. It leaves reset asserted; it does
+  not write the SMMU, release CM3, start HFI, or enable rendering. The load contract follows
+  Qualcomm's A630 `_load_legacy_gmu_fw()` path in
+  [`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/815ef3fd67546132532651279885563ff35a4605/drivers/gpu/msm/adreno_a6xx_gmu.c).
 - `adreno=6` now asks TrustZone whether the SCM availability query and PAS 13 calls are exposed,
   then asks whether GPU image 13 is supported. It does not submit a firmware header or image and
   does not write GPU registers. This query has not yet run under HakiOS on the phone.

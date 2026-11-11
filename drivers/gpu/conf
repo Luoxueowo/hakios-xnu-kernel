@@ -6,7 +6,7 @@ driver ADRENO
 	file    bsd/dev/hakios.adreno.c
 	file    bsd/dev/hakios.adreno.sdm845.c
 	file    iokit/Kernel/hakios.gpu.cpp iokitcpp
-	help    the Redwood Adreno 642L rendering backend (gpu=1), the shared HakiosGPU service, and read-only Polaris Adreno 630
-	help    probes (adreno=1..4), firmware/DT checks (adreno=5), read-only PAS queries (adreno=6),
-	help    and explicit PAS ZAP metadata/segment staging plus shutdown (adreno=7; requires CX/GX).
+	help    the Redwood Adreno 642L rendering backend (gpu=1), the shared HakiosGPU service, and Polaris Adreno 630
+	help    probes (adreno=1..6), explicit PAS ZAP staging (adreno=7), read-only RPMh discovery (adreno=8),
+	help    detached HFI memory preparation (adreno=9), and explicit reset-held GMU ITCM loading (adreno=10).
 	help    Polaris rendering is not enabled yet; both devices need their own firmware in fw-gpu/.
