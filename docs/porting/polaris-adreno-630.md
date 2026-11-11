@@ -43,10 +43,14 @@ allow it. A successful firmware boot alone is not a completed driver.
   header is 148 bytes and its 6,536-byte signed metadata segment is `a630_zap.b01`; both copies
   match Qualcomm's split-firmware contract
   ([`mdt_loader.c`](https://android.googlesource.com/kernel/common/+/d3d009847a119db499094aca61bd8a9935bc94ef/drivers/soc/qcom/mdt_loader.c)).
-  The extracted SQE starts with version word `0`, which fails upstream Linux's A630 minimum of
-  `0x190` or patched-firmware marker ([`a6xx_gpu.c`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)).
-  This SQE must not be started through a user-command path; the full driver remains gated until
-  suitable SQE firmware is available. Qualcomm's A6xx KGSL loader explicitly routes A630 through
+  Upstream MSM strips the first 4-byte file prefix before creating the SQE GPU buffer
+  ([`adreno_gpu.c`](https://linux.googlesource.com/linux/kernel/git/torvalds/linux/+/1f57f68c4dd101e5e8ffc9ffa6428f45bcdd776a/drivers/gpu/drm/msm/adreno/adreno_gpu.c)).
+  The extracted file prefix is `0`; the actual payload version word is `0x016ee19a` (low 12 bits
+  `0x19a`), and its patch marker also matches upstream's A630 acceptance rule
+  ([`a6xx_gpu.c`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)).
+  The SQE therefore passes that firmware version gate. This alone does not establish CP register
+  protection or make command submission safe; the backend remains disabled until those and the
+  runtime bring-up gates are verified. Qualcomm's A6xx KGSL loader explicitly routes A630 through
   the legacy raw-image path, writes it to GMU ITCM, and caps the image at `0x8000` bytes
   ([`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm-modules/graphics/%2B/refs/heads/android-msm-p11-5.15-tm-wear-kr3-dr-p11/adreno_a6xx_gmu.c)).
   The device's 32 KiB `a630_gmu.bin` matches that contract; actual HakiOS GMU startup still needs
@@ -307,11 +311,12 @@ bring-up and a bounded test submission.
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
    maintenance are implemented, with OAS and PTFS_4K checks taken from the read-only ID registers.
-   The local firmware probe validates the ZAP MDT layout and SQE security floor; the extracted SQE
-   currently fails that floor. Still discover and validate the v2 stream-match/context-bank
-   assignments, program independent 3D/GMU contexts with verified attributes, find acceptable
-   A630 SQE firmware, then bring up GMU and core mappings, ring, CP protection and fences and
-   exercise the mapper on-device. Keep the backend disabled until those pieces are verified.
+   The local firmware probe validates the ZAP MDT layout and applies the upstream SQE check to the
+   payload after its 4-byte file prefix; the extracted SQE passes the version floor. Still discover
+   and validate the v2 stream-match/context-bank assignments, program independent 3D/GMU contexts
+   with verified attributes, validate A630 CP register protection, then bring up GMU and core
+   mappings, ring and fences and exercise the mapper on-device. Keep the backend disabled until
+   those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
    command buffers; bounded test commands complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno
@@ -334,9 +339,9 @@ bring-up and a bounded test submission.
   environment. Qualcomm's MDT loader consumes the `.mdt` ELF header, the indexed `.b01` hash
   metadata, and `.b02` as the sole `PT_LOAD` segment; `.b00` and the combined `.elf` are not part
   of that loader path.
-- The local A630 SQE is below upstream's A630 safety floor; find an acceptable firmware version,
-  then validate its register protection table and the MSM submission path against the 630's
-  GMEM/UBWC configuration.
+- The extracted A630 SQE passes upstream's version floor after the 4-byte file prefix is removed;
+  its register-protection table and the MSM submission path still need validation against the
+  630's GMEM/UBWC configuration.
 - Whether TrustZone PAS calls for GPU firmware are permitted from this boot environment.
 - Whether A630 GMU HFI initializes and accepts DCVS requests under HakiOS and the Polaris
   hypervisor, and whether the runtime `gfx.lvl`/`cx.lvl` tables pair correctly with the live GPU/GMU

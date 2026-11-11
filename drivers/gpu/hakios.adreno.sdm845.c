@@ -2299,7 +2299,7 @@ probe_firmware(void)
 {
 	uint64_t gmu_size = 0, sqe_size = 0, zap_size = 0;
 	const uint8_t *gmu_firmware, *sqe_firmware, *zap_header;
-	uint32_t sqe_word0;
+	uint32_t sqe_word0, sqe_word2;
 	bool sqe_safe = false, valid = true;
 
 	polaris_sqe_safe = false;
@@ -2322,16 +2322,19 @@ probe_firmware(void)
 		printf("adreno-sdm845: GMU raw image is outside the legacy 32-KiB TCM loader bounds\n");
 		valid = false;
 	}
-	if (sqe_size < 12 || sqe_size > 0x40000 || (sqe_size & 3u) != 0) {
+	/* Linux's adreno_fw_create_bo() strips the first file dword before checking/loading the SQE. */
+	if (sqe_size < 16 || sqe_size > 0x40000 || (sqe_size & 3u) != 0) {
 		printf("adreno-sdm845: A630 SQE image size/alignment is invalid\n");
 		valid = false;
 	} else {
-		sqe_word0 = read_le32(sqe_firmware);
-		/* Match Linux a6xx_ucode_check_version()'s A630 security and WHERE_AM_I floor. */
-		sqe_safe = ((((sqe_word0 & 0xfu) == 0xau) && ((read_le32(sqe_firmware + 8) & 0xfu) >= 1u)) ||
+		sqe_word0 = read_le32(sqe_firmware + sizeof(uint32_t));
+		sqe_word2 = read_le32(sqe_firmware + sizeof(uint32_t) + 2u * sizeof(uint32_t));
+		/* Match Linux's post-header a6xx_ucode_check_version() payload and A630 security floor. */
+		sqe_safe = (((sqe_word0 & 0xfu) == 0xau && (sqe_word2 & 0xfu) >= 1u) ||
 		    ((sqe_word0 & 0xfffu) >= 0x190u));
 		polaris_sqe_safe = sqe_safe;
-		printf("adreno-sdm845: A630 SQE first word=%#x; upstream safety floor %s\n", sqe_word0,
+		printf("adreno-sdm845: A630 SQE file prefix=%#x payload version word=%#x patch word=%#x; upstream safety floor %s\n",
+		    read_le32(sqe_firmware), sqe_word0, sqe_word2,
 		    sqe_safe ? "passes" : "FAILS (need version >= 0x190 or the patched marker)");
 	}
 	if (!probe_zap_mdt(zap_header, zap_size)) {
