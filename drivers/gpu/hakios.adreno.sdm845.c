@@ -6581,9 +6581,9 @@ polaris_a630_hwcg_start(void)
 	uint32_t clock_control, sptprac;
 	bool configured;
 
-	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_MODE_WORD), 0x00020222u);
+	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_MODE_WORD), 0x00020202u);
 	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_DELAY_WORD), 0x00010111u);
-	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_HYST_WORD), 0x00050555u);
+	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_HYST_WORD), 0x00005555u);
 	clock_control = probe_read(&gpu, GPU_RBBM_CLOCK_CNTL);
 	if (clock_control == A630_RBBM_CLOCK_CNTL_ON) {
 		return true;

@@ -283,8 +283,8 @@ allow it. A successful firmware boot alone is not a completed driver.
   UCHE trap/write-through/1-MiB GMEM ranges, CP thresholds and pool size, address-mode attributes
   derived from the runtime `highest-bank-bit`, `min-access-length` and `ubwc-mode`, hang detection,
   and the A630 CP register-protection table. A source recheck against Polaris's own
-  [`a630_hwcg_regs`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno_a6xx.c)
-  corrected five HWCG values for RAC, TSE/RAS, and GPC registers. It also converts Polaris's validated
+  [`a630_hwcg_regs` and A6xx HWCG helpers](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno_a6xx.c)
+  corrected seven values: five RAC/TSE-RAS/GPC registers and two GMU AO CGC settings. It also converts Polaris's validated
   `qcom,protect = <0x40000 0xc000>` aperture using KGSL's IOMMU encoding and adds its SMMU range
   to the 27 fixed A630 protection groups, for 28 of the 32 available descriptors. Selected core,
   VBIF, UCHE, CP and protection registers are read back; a mismatch faults the backend and leaves
