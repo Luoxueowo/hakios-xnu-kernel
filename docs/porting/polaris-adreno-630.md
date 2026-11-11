@@ -42,6 +42,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   The offsets and Linux fault-read path follow upstream [`arm-smmu.h`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)
   and [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
   These changes have compile/source evidence only and still need a controlled Polaris run.
+- The in-tree `metal2vulkan` route has a matching Mesa/Turnip device profile for Polaris: Mesa 25.0.7 maps GPU ID 630 to
+  A6xx gen1, and the Polaris kernel profile reports GPU ID 630, chip ID `0x06030001`, GMEM base `0x00100000`, and 1 MiB GMEM.
+  Mesa's A630 device data specifies two CCUs, 32 VSC pipes, 32 KiB shared compute memory, and 2048 fibers per SP. This makes
+  metal2vulkan/Turnip the first existing Metal path to validate on the MIX 2S. It is a profile match only: no Vulkan workload,
+  Metal compositor, or command stream has been validated on Polaris. The separate `hakios-metal` backend remains A635-specific
+  (`0x06030500`) and rejects the A630.
 - The Turnip DRM shim's timeline syncobjs now grow their pending-fence list as needed. When a
   fence queue reaches its polling interval, it only advances a point after a nonblocking kernel
   wait confirms completion; it no longer discards the oldest point after an unchecked 10-second
