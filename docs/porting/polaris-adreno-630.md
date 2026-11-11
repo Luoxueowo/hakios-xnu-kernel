@@ -13,10 +13,15 @@ allow it. A successful firmware boot alone is not a completed driver.
 - `drivers/gpu/hakios.gpu.cpp` and `tools/mesa/hakios-drm/` provide the existing HakiosGPU
   IOKit service and the MSM interface used by Mesa. This service is a candidate shared client
   interface; the A630 backend must report its own hardware capabilities and lifecycle.
-- The Dipper reference was checked at upstream `main` commit `17077d07`. Its
-  `xnu/files/bsd/dev/hakios.adreno.c` follows the Redwood/SC7280 register path; the Polaris
-  implementation therefore stays in this repository's separate SDM845 backend, with Dipper used
-  for lifecycle and service comparisons.
+- The supplied [Dipper reference](https://github.com/manysuq/hakios-xnu-kernel-dipper) was checked
+  at `main` commit `17077d07`. Despite the repository name, the checked-in tree contains
+  `devices/poco-x5-pro/`, and its
+  [`hakios.adreno.c`](https://github.com/manysuq/hakios-xnu-kernel-dipper/blob/17077d07e0b0b6a09760f95f4ff544c3387e2460/xnu/files/bsd/dev/hakios.adreno.c)
+  identifies the POCO X5 Pro / Redwood Adreno 642L, chip ID `0x06030500`, and `a660_*` firmware.
+  It does not contain a Polaris A630 backend. Use it only to compare general HakiOS service and
+  lifecycle structure; its register, clock, power, firmware, PAS, and SMMU assumptions do not
+  apply here. The Polaris backend stays separate and follows the MIX 2S tree plus A630-specific
+  Qualcomm sources.
 - `CONFIG_HAKIOS_ADRENO` remains disabled in `devices/polaris/configs/polaris.config` until the
   Polaris path has passed staged hardware bring-up.
 - A separate `hakios.adreno.sdm845.c` probe is now wired into the driver configuration. On an
@@ -475,9 +480,11 @@ matching Qualcomm's A630 `hfi_init` (`num_active_q = HFI_QUEUE_MAX`); HakiOS pre
 contract ([`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_hfi.c)).
 
 Qualcomm's matching A630 KGSL implementation gives the GMU separate `gmu_user` and `gmu_kernel`
-SMMU contexts and allocates HFI memory through the GMU-kernel context. Polaris preflight currently
-validates their stream IDs (4 and 5), but does not discover or establish either context bank. The
-HFI queue must be mapped into the verified GMU-kernel address space; the GPU user page table cannot
+SMMU contexts and allocates HFI memory through the GMU-kernel context. HakiOS now prepares separate
+detached roots and route candidates for SIDs 5 and 4; explicit steps 11 and 12 can install the
+GMU-kernel and GMU-user contexts, with the HFI queues mapped only into GMU-kernel. Those write
+stages have not run under HakiOS, so live ownership and hypervisor permission are still unverified;
+the runtime-DT checks and read-only route scan only make candidates. The GPU user page table cannot
 be assumed to serve the GMU stream. See the primary Qualcomm [`kgsl_hfi.h`](https://android.googlesource.com/kernel/msm.git/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_hfi.h) and
 [`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm.git/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_gmu.c) sources.
 
