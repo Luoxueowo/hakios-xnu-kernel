@@ -57,6 +57,9 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_GPU_GX_GDSC_DT_PATH     "/soc/qcom,gdsc@0x509100c"
 #define POLARIS_GCC_DT_PATH             "/soc/qcom,gcc@100000"
 #define POLARIS_CPUCC_DT_PATH           "/soc/qcom,cpucc@0x17d41000"
+#define POLARIS_RPMH_DRV_DT_PATH        "/soc/mailbox@179e0000"
+#define POLARIS_CMD_DB_DT_PATH          "/soc/qcom,cmd-db@861e0000"
+#define POLARIS_CMD_DB_RESERVATION_PATH "/reserved-memory/removed_region@85fc0000"
 #define POLARIS_SMMU_DT_PATH            "/soc/arm,smmu-kgsl@5040000"
 #define POLARIS_PIL_GPU_DT_PATH         "/soc/qcom,kgsl-hyp"
 #define POLARIS_GPU_MEMORY_DT_PATH      "/reserved-memory/gpu_region@0x8c415000"
@@ -75,6 +78,40 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_GCC_GPU_CLOCKS_SIZE      0x00001000ul
 #define GCC_GPU_CFG_AHB_CBCR             0x0004u
 #define GCC_GPU_MEMNOC_GFX_CBCR          0x000cu
+
+/* SDM845's AOP command database, reserved by the SoC DT. */
+#define POLARIS_CMD_DB_PHYS               0x85fe0000ul
+#define POLARIS_CMD_DB_SIZE               0x00020000ul
+#define POLARIS_CMD_DB_HEADER_SIZE        0x90u
+#define POLARIS_CMD_DB_SLAVE_COUNT        8u
+#define POLARIS_CMD_DB_SLAVE_SIZE         16u
+#define POLARIS_CMD_DB_ENTRY_SIZE         24u
+#define POLARIS_CMD_DB_MAX_ENTRIES        512u
+#define POLARIS_CMD_DB_MAX_LEVELS         16u
+
+/* SDM845 Apps RSC DRV2; resource windows and TCS counts come from the live DT. */
+#define POLARIS_RPMH_DRV_ID                0x0000u
+#define POLARIS_RPMH_DRV_SOLVER_CONFIG    0x0004u
+#define POLARIS_RPMH_DRV_CONFIG           0x000cu
+#define POLARIS_RPMH_ID_MAJOR_SHIFT       16u
+#define POLARIS_RPMH_ID_MINOR_SHIFT       8u
+#define POLARIS_RPMH_ID_VERSION_MASK      0xffu
+#define POLARIS_RPMH_TCS_IRQ_STATUS       0x0004u
+#define POLARIS_RPMH_TCS_STATUS_V27       0x0018u
+#define POLARIS_RPMH_TCS_CONTROL_V27      0x0014u
+#define POLARIS_RPMH_TCS_CMD_ENABLE_V27   0x001cu
+#define POLARIS_RPMH_TCS_STATUS_V30       0x0028u
+#define POLARIS_RPMH_TCS_CONTROL_V30      0x0024u
+#define POLARIS_RPMH_TCS_CMD_ENABLE_V30   0x002cu
+#define POLARIS_RPMH_TCS_STRIDE           0x02a0u
+#define POLARIS_RPMH_TCS_ACTIVE_TYPE      2u
+#define POLARIS_RPMH_TCS_SLEEP_TYPE       0u
+#define POLARIS_RPMH_TCS_WAKE_TYPE        1u
+#define POLARIS_RPMH_TCS_CONTROL_TYPE     3u
+#define POLARIS_RPMH_DRV_NUM_TCS_SHIFT    6u
+#define POLARIS_RPMH_DRV_NUM_TCS_MASK     0x3fu
+#define POLARIS_RPMH_DRV_NCPT_SHIFT       27u
+#define POLARIS_RPMH_DRV_NCPT_MASK        0x1fu
 
 /* SDM845 GPUCC offsets, from gpucc-sdm845.c. */
 #define GPUCC_GX_GDSCR                  0x100c
@@ -219,6 +256,11 @@ struct polaris_zap_segment {
 	uint32_t flags;
 	const uint8_t *data;
 };
+struct polaris_cmd_db_resource {
+	uint32_t address;
+	uint16_t levels[POLARIS_CMD_DB_MAX_LEVELS];
+	uint32_t level_count;
+};
 static struct polaris_zap_segment polaris_zap_segments[A630_MDT_MAX_SEGMENTS];
 static uint32_t polaris_zap_segment_count;
 static const uint8_t *polaris_zap_mdt;
@@ -239,6 +281,15 @@ static bool polaris_pas_calls_ready;
 static bool polaris_pas_gpu_supported;
 static bool polaris_pas_image_active;
 static uint64_t polaris_pas_scm_width;
+static uint32_t polaris_rpmh_drv_id;
+static uint32_t polaris_rpmh_drv_base;
+static uint32_t polaris_rpmh_drv_size;
+static uint32_t polaris_rpmh_tcs_base;
+static uint32_t polaris_rpmh_tcs_size;
+static uint32_t polaris_rpmh_tcs_offset;
+static uint32_t polaris_rpmh_tcs_counts[4];
+static uint32_t polaris_rpmh_total_tcs;
+static const uint8_t *polaris_cmd_db;
 static bool polaris_gmu_domain_ready;
 static bool polaris_gpu_core_ready;
 static bool polaris_smmu_core_context_active;
@@ -381,6 +432,7 @@ static struct probe_block smmu = { "kgsl-smmu-v2", POLARIS_SMMU_PHYS, POLARIS_SM
 static struct probe_block gpu = { "3d-core", POLARIS_GPU_PHYS, POLARIS_GPU_SIZE, 0 };
 static struct probe_block gcc_gpu_clocks = { "gcc-gpu-clocks", POLARIS_GCC_GPU_CLOCKS_PHYS,
 	POLARIS_GCC_GPU_CLOCKS_SIZE, 0 };
+static struct probe_block polaris_rpmh_drv = { "apps-rpmh-drv2", 0, 0, 0 };
 
 static bool sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only);
 static void sdm845_gpu_mapped(void);
@@ -573,12 +625,146 @@ polaris_dt_has_reg64(DTEntry node, uint64_t address, uint64_t length)
 }
 
 static bool
+polaris_dt_reg64_contains(DTEntry node, uint64_t address, uint64_t length)
+{
+	const uint8_t *reg;
+	unsigned int size = 0;
+	uint64_t end;
+
+	if (length == 0 || address > UINT64_MAX - length ||
+	    SecureDTGetProperty(node, "reg", (const void **)&reg, &size) != kSuccess || reg == NULL || size == 0 ||
+	    (size & 15u) != 0) {
+		return false;
+	}
+	end = address + length;
+	for (unsigned int offset = 0; offset < size; offset += 16) {
+		uint64_t start = (uint64_t)polaris_dt_be32(reg + offset) << 32 | polaris_dt_be32(reg + offset + 4);
+		uint64_t bytes = (uint64_t)polaris_dt_be32(reg + offset + 8) << 32 | polaris_dt_be32(reg + offset + 12);
+
+		if (bytes != 0 && start <= UINT64_MAX - bytes && address >= start && end <= start + bytes) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+polaris_dt_get_reg32(DTEntry node, uint32_t index, uint32_t *address, uint32_t *length)
+{
+	const uint8_t *reg;
+	unsigned int size = 0;
+
+	if (address == NULL || length == NULL ||
+	    SecureDTGetProperty(node, "reg", (const void **)&reg, &size) != kSuccess || reg == NULL || size == 0 ||
+	    (size & 7u) != 0 || index >= size / 8u) {
+		return false;
+	}
+	*address = polaris_dt_be32(reg + index * 8u);
+	*length = polaris_dt_be32(reg + index * 8u + 4u);
+	return *length != 0;
+}
+
+static bool
+polaris_dt_mboxes_match(const char *path, uint32_t provider_phandle)
+{
+	DTEntry node = NULL;
+	const uint8_t *mboxes;
+	unsigned int size = 0;
+
+	if (SecureDTLookupEntry(NULL, path, &node) != kSuccess || node == NULL ||
+	    SecureDTGetProperty(node, "mboxes", (const void **)&mboxes, &size) != kSuccess || mboxes == NULL ||
+	    size != 8u) {
+		return false;
+	}
+	return polaris_dt_be32(mboxes) == provider_phandle && polaris_dt_be32(mboxes + 4) == 0;
+}
+
+static bool
 polaris_dt_has_empty_property(DTEntry node, const char *name)
 {
 	const void *property = NULL;
 	unsigned int size = 0;
 
 	return SecureDTGetProperty(node, name, &property, &size) == kSuccess && size == 0;
+}
+
+static bool
+polaris_runtime_rpmh_validate(void)
+{
+	static const uint32_t expected_types[] = {
+		POLARIS_RPMH_TCS_ACTIVE_TYPE, POLARIS_RPMH_TCS_SLEEP_TYPE,
+		POLARIS_RPMH_TCS_WAKE_TYPE, POLARIS_RPMH_TCS_CONTROL_TYPE,
+	};
+	static const uint32_t expected_counts[] = { 2, 3, 3, 1 };
+	DTEntry drv_node = NULL, cmd_db_node = NULL, reservation_node = NULL;
+	DTEntry cx_rpmh_node = NULL, gfx_rpmh_node = NULL;
+	const uint8_t *tcs_config;
+	unsigned int tcs_config_size = 0;
+	uint32_t drv_id, drv_phandle, drv_base, drv_size, tcs_base, tcs_size, total_tcs = 0;
+	uint64_t tcs_end;
+
+	if (SecureDTLookupEntry(NULL, POLARIS_RPMH_DRV_DT_PATH, &drv_node) != kSuccess || drv_node == NULL ||
+	    !polaris_dt_has_compatible(drv_node, "qcom,tcs-drv") ||
+	    !polaris_dt_string_equals(drv_node, "label", "apps_rsc") ||
+	    !polaris_dt_get_u32(drv_node, "qcom,drv-id", &drv_id) || drv_id != 2 ||
+	    !polaris_dt_get_u32(drv_node, "phandle", &drv_phandle) ||
+	    !polaris_dt_get_reg32(drv_node, 0, &drv_base, &drv_size) ||
+	    !polaris_dt_get_reg32(drv_node, 1, &tcs_base, &tcs_size) ||
+	    SecureDTLookupEntry(NULL, "/soc/rpmh-regulator-cxlvl", &cx_rpmh_node) != kSuccess || cx_rpmh_node == NULL ||
+	    SecureDTLookupEntry(NULL, "/soc/rpmh-regulator-gfxlvl", &gfx_rpmh_node) != kSuccess || gfx_rpmh_node == NULL ||
+	    !polaris_dt_string_equals(cx_rpmh_node, "qcom,resource-name", "cx.lvl") ||
+	    !polaris_dt_string_equals(gfx_rpmh_node, "qcom,resource-name", "gfx.lvl") ||
+	    drv_base != 0x179e0000u || drv_size != 0x100u || tcs_base != 0x179e0d00u || tcs_size != 0x3000u ||
+	    tcs_base <= drv_base || !polaris_dt_mboxes_match("/soc/rpmh-regulator-cxlvl", drv_phandle) ||
+	    !polaris_dt_mboxes_match("/soc/rpmh-regulator-gfxlvl", drv_phandle) ||
+	    SecureDTGetProperty(drv_node, "qcom,tcs-config", (const void **)&tcs_config, &tcs_config_size) != kSuccess ||
+	    tcs_config == NULL || tcs_config_size != 4u * 8u ||
+	    SecureDTLookupEntry(NULL, POLARIS_CMD_DB_DT_PATH, &cmd_db_node) != kSuccess || cmd_db_node == NULL ||
+	    !polaris_dt_has_compatible(cmd_db_node, "qcom,cmd-db") ||
+	    SecureDTLookupEntry(NULL, POLARIS_CMD_DB_RESERVATION_PATH, &reservation_node) != kSuccess ||
+	    reservation_node == NULL || !polaris_dt_has_empty_property(reservation_node, "no-map") ||
+	    !polaris_dt_reg64_contains(reservation_node, POLARIS_CMD_DB_PHYS, POLARIS_CMD_DB_SIZE)) {
+		printf("adreno-sdm845: runtime RPMh DRV2 or AOP command-database reservation differs from Polaris; probe refused\n");
+		return false;
+	}
+
+	for (uint32_t i = 0; i < 4; i++) {
+		uint32_t type = polaris_dt_be32(tcs_config + i * 8u);
+		uint32_t count = polaris_dt_be32(tcs_config + i * 8u + 4u);
+
+		if (type != expected_types[i] || count != expected_counts[i]) {
+			printf("adreno-sdm845: runtime RPMh TCS group %u is type=%u count=%u; expected type=%u count=%u\n",
+			    i, type, count, expected_types[i], expected_counts[i]);
+			return false;
+		}
+		polaris_rpmh_tcs_counts[type] = count;
+		if (type != POLARIS_RPMH_TCS_CONTROL_TYPE) {
+			total_tcs += count;
+		}
+	}
+	tcs_end = (uint64_t)tcs_base + tcs_size;
+	if (total_tcs == 0 || total_tcs > (tcs_size - 0x10u) / POLARIS_RPMH_TCS_STRIDE ||
+	    tcs_end <= drv_base || tcs_end - drv_base > UINT32_MAX) {
+		printf("adreno-sdm845: runtime RPMh TCS window is too small for its declared groups\n");
+		return false;
+	}
+
+	polaris_rpmh_drv_id = drv_id;
+	polaris_rpmh_drv_base = drv_base;
+	polaris_rpmh_drv_size = drv_size;
+	polaris_rpmh_tcs_base = tcs_base;
+	polaris_rpmh_tcs_size = tcs_size;
+	polaris_rpmh_tcs_offset = tcs_base - drv_base;
+	polaris_rpmh_total_tcs = total_tcs;
+	polaris_rpmh_drv.physical = drv_base;
+	polaris_rpmh_drv.size = (vm_size_t)(tcs_end - drv_base);
+	printf("adreno-sdm845: runtime DT identifies Apps RPMh DRV%u at %#x/%#x, TCS at %#x/%#x "
+	    "(active/sleep/wake/control=%u/%u/%u/%u); AOP CMD_DB %#llx/%#llx is inside no-map reservation\n",
+	    drv_id, drv_base, drv_size, tcs_base, tcs_size, polaris_rpmh_tcs_counts[POLARIS_RPMH_TCS_ACTIVE_TYPE],
+	    polaris_rpmh_tcs_counts[POLARIS_RPMH_TCS_SLEEP_TYPE], polaris_rpmh_tcs_counts[POLARIS_RPMH_TCS_WAKE_TYPE],
+	    polaris_rpmh_tcs_counts[POLARIS_RPMH_TCS_CONTROL_TYPE], (uint64_t)POLARIS_CMD_DB_PHYS,
+	    (uint64_t)POLARIS_CMD_DB_SIZE);
+	return true;
 }
 
 static bool
@@ -787,6 +973,9 @@ polaris_runtime_power_validate(DTEntry gpu_node, DTEntry gmu_node)
 	    gpucc_vddcx == gpucc_vddmx || cx_clk_dis_wait != 8 ||
 	    gfxcc_vddgfx == gpucc_vddcx || gfxcc_vddgfx == gpucc_vddmx) {
 		printf("adreno-sdm845: runtime GPU power/clock dependencies are incomplete or differ from Polaris; probe refused\n");
+		return false;
+	}
+	if (!polaris_runtime_rpmh_validate()) {
 		return false;
 	}
 	printf("adreno-sdm845: runtime DT matches the SDM845 GPU/GFXCC clock tree, GPU/GMU supply domains, and CX/MX/GFX rails\n");
@@ -1428,6 +1617,81 @@ read_le32(const uint8_t *data)
 }
 
 static bool
+polaris_cmd_db_resource_lookup(const char *name, struct polaris_cmd_db_resource *resource)
+{
+	char resource_id[8] = { 0 };
+	static const uint8_t magic[] = { 0xdb, 0x30, 0x03, 0x0c };
+
+	if (name == NULL || resource == NULL || strlen(name) > sizeof(resource_id)) {
+		return false;
+	}
+	if (polaris_cmd_db == NULL) {
+		vm_offset_t mapping = ml_io_map_wcomb(POLARIS_CMD_DB_PHYS, POLARIS_CMD_DB_SIZE);
+
+		if (mapping == 0) {
+			printf("adreno-sdm845: cannot map the validated AOP CMD_DB window\n");
+			return false;
+		}
+		polaris_cmd_db = (const uint8_t *)mapping;
+	}
+	if (memcmp(polaris_cmd_db + 4, magic, sizeof(magic)) != 0) {
+		printf("adreno-sdm845: AOP CMD_DB magic is invalid\n");
+		return false;
+	}
+	memcpy(resource_id, name, strlen(name));
+	memset(resource, 0, sizeof(*resource));
+
+	for (uint32_t slave_index = 0; slave_index < POLARIS_CMD_DB_SLAVE_COUNT; slave_index++) {
+		const uint8_t *slave = polaris_cmd_db + 8u + slave_index * POLARIS_CMD_DB_SLAVE_SIZE;
+		uint32_t slave_id = read_le16(slave);
+		uint32_t header_offset = read_le16(slave + 2);
+		uint32_t data_offset = read_le16(slave + 4);
+		uint32_t entry_count = read_le16(slave + 6);
+		uint64_t entry_bytes = (uint64_t)entry_count * POLARIS_CMD_DB_ENTRY_SIZE;
+
+		if (slave_id == 0) {
+			continue;
+		}
+		if (entry_count > POLARIS_CMD_DB_MAX_ENTRIES || header_offset > POLARIS_CMD_DB_SIZE - POLARIS_CMD_DB_HEADER_SIZE ||
+		    entry_bytes > POLARIS_CMD_DB_SIZE - POLARIS_CMD_DB_HEADER_SIZE - header_offset ||
+		    data_offset > POLARIS_CMD_DB_SIZE - POLARIS_CMD_DB_HEADER_SIZE) {
+			printf("adreno-sdm845: AOP CMD_DB slave %u has out-of-range entry/data offsets\n", slave_index);
+			return false;
+		}
+		for (uint32_t entry_index = 0; entry_index < entry_count; entry_index++) {
+			const uint8_t *entry = polaris_cmd_db + POLARIS_CMD_DB_HEADER_SIZE + header_offset +
+			    entry_index * POLARIS_CMD_DB_ENTRY_SIZE;
+			uint32_t aux_length, aux_offset;
+			uint64_t aux_start;
+
+			if (memcmp(entry, resource_id, sizeof(resource_id)) != 0) {
+				continue;
+			}
+			aux_length = read_le16(entry + 20);
+			aux_offset = read_le16(entry + 22);
+			aux_start = (uint64_t)POLARIS_CMD_DB_HEADER_SIZE + data_offset + aux_offset;
+			if (aux_length == 0 || (aux_length & 1u) != 0 || aux_length > POLARIS_CMD_DB_MAX_LEVELS * 2u ||
+			    aux_start > POLARIS_CMD_DB_SIZE || aux_length > POLARIS_CMD_DB_SIZE - aux_start) {
+				printf("adreno-sdm845: CMD_DB resource %s has invalid level metadata\n", name);
+				return false;
+			}
+			resource->address = read_le32(entry + 16);
+			for (uint32_t level_index = 0; level_index < aux_length / 2u; level_index++) {
+				uint16_t level = read_le16(polaris_cmd_db + aux_start + level_index * 2u);
+
+				if (level_index != 0 && level == 0) {
+					break;
+				}
+				resource->levels[level_index] = level;
+				resource->level_count++;
+			}
+			return resource->address != 0 && resource->level_count != 0 && resource->levels[0] != 0;
+		}
+	}
+	return false;
+}
+
+static bool
 probe_zap_mdt(const uint8_t *header, uint64_t size)
 {
 	uint32_t phoff, hash_index = UINT32_MAX, loadable = 0, header_size;
@@ -1743,6 +2007,73 @@ probe_pas_capabilities(void)
 }
 
 static bool
+probe_rpmh(void)
+{
+	struct polaris_cmd_db_resource cx_level, gfx_level;
+	uint32_t revision, major, minor, solver, drv_config, irq_status, hardware_tcs, commands_per_tcs;
+	uint32_t tcs_status_offset, tcs_control_offset, tcs_cmd_enable_offset;
+
+	printf("adreno-sdm845: step 8: inspect Apps RPMh DRV2 and AOP CMD_DB (read-only; no RPMh requests)\n");
+	if (polaris_rpmh_drv.physical == 0 || polaris_rpmh_drv.size == 0 || !map_block(&polaris_rpmh_drv)) {
+		return false;
+	}
+	revision = probe_read(&polaris_rpmh_drv, POLARIS_RPMH_DRV_ID);
+	major = (revision >> POLARIS_RPMH_ID_MAJOR_SHIFT) & POLARIS_RPMH_ID_VERSION_MASK;
+	minor = (revision >> POLARIS_RPMH_ID_MINOR_SHIFT) & POLARIS_RPMH_ID_VERSION_MASK;
+	solver = probe_read(&polaris_rpmh_drv, POLARIS_RPMH_DRV_SOLVER_CONFIG);
+	drv_config = probe_read(&polaris_rpmh_drv, POLARIS_RPMH_DRV_CONFIG);
+	irq_status = probe_read(&polaris_rpmh_drv, polaris_rpmh_tcs_offset + POLARIS_RPMH_TCS_IRQ_STATUS);
+	hardware_tcs = (drv_config >> (POLARIS_RPMH_DRV_NUM_TCS_SHIFT * polaris_rpmh_drv_id)) &
+	    POLARIS_RPMH_DRV_NUM_TCS_MASK;
+	commands_per_tcs = (drv_config >> POLARIS_RPMH_DRV_NCPT_SHIFT) & POLARIS_RPMH_DRV_NCPT_MASK;
+	printf("adreno-sdm845: Apps RPMh DRV%u v%u.%u solver=%u hardware TCS=%u/%u commands-per-TCS, "
+	    "DT TCS=%u IRQ-status=%#x\n", polaris_rpmh_drv_id, major, minor,
+	    (unsigned)!!(solver & (1u << 24)), hardware_tcs, commands_per_tcs, polaris_rpmh_total_tcs, irq_status);
+	if (major == 2 && minor == 7) {
+		tcs_status_offset = POLARIS_RPMH_TCS_STATUS_V27;
+		tcs_control_offset = POLARIS_RPMH_TCS_CONTROL_V27;
+		tcs_cmd_enable_offset = POLARIS_RPMH_TCS_CMD_ENABLE_V27;
+	} else if (major == 3 && minor == 0) {
+		tcs_status_offset = POLARIS_RPMH_TCS_STATUS_V30;
+		tcs_control_offset = POLARIS_RPMH_TCS_CONTROL_V30;
+		tcs_cmd_enable_offset = POLARIS_RPMH_TCS_CMD_ENABLE_V30;
+	} else {
+		printf("adreno-sdm845: unsupported RPMh DRV register revision %u.%u; no TCS details are read\n", major, minor);
+		return false;
+	}
+	if (hardware_tcs != polaris_rpmh_total_tcs || commands_per_tcs == 0) {
+		printf("adreno-sdm845: RPMh hardware TCS layout disagrees with the validated device tree; no request will be sent\n");
+		return false;
+	}
+	for (uint32_t tcs = 0; tcs < polaris_rpmh_tcs_counts[POLARIS_RPMH_TCS_ACTIVE_TYPE]; tcs++) {
+		uint32_t offset = polaris_rpmh_tcs_offset + POLARIS_RPMH_TCS_STRIDE * tcs;
+		uint32_t status = probe_read(&polaris_rpmh_drv, offset + tcs_status_offset);
+		uint32_t control = probe_read(&polaris_rpmh_drv, offset + tcs_control_offset);
+		uint32_t enabled = probe_read(&polaris_rpmh_drv, offset + tcs_cmd_enable_offset);
+
+		printf("adreno-sdm845: RPMh active TCS%u status=%#x%s control=%#x commands=%#x irq=%u\n", tcs, status,
+		    status == 0 ? " (busy)" : " (idle)", control, enabled, (unsigned)!!(irq_status & (1u << tcs)));
+	}
+	if (!polaris_cmd_db_resource_lookup("cx.lvl", &cx_level) ||
+	    !polaris_cmd_db_resource_lookup("gfx.lvl", &gfx_level)) {
+		printf("adreno-sdm845: CMD_DB lacks a valid CX or GFX ARC level table; GPU power votes remain unavailable\n");
+		return false;
+	}
+	printf("adreno-sdm845: CMD_DB cx.lvl address=%#x levels:", cx_level.address);
+	for (uint32_t i = 0; i < cx_level.level_count; i++) {
+		printf(" %u", cx_level.levels[i]);
+	}
+	printf("\n");
+	printf("adreno-sdm845: CMD_DB gfx.lvl address=%#x levels:", gfx_level.address);
+	for (uint32_t i = 0; i < gfx_level.level_count; i++) {
+		printf(" %u", gfx_level.levels[i]);
+	}
+	printf("\n");
+	printf("adreno-sdm845: RPMh discovery complete; no TCS registers or rail votes were written\n");
+	return true;
+}
+
+static bool
 polaris_pas_command(const char *name, uint64_t command, uint64_t arguments, uint64_t first, uint64_t second,
 	uint64_t third)
 {
@@ -1925,8 +2256,24 @@ hakios_adreno_sdm845_init(void)
 		}
 		return;
 	}
+	if (last_step == 8) {
+		printf("adreno-sdm845: step 8 is a separate read-only RPMh/CMD_DB probe; it runs steps 1..6 and skips PAS staging step 7\n");
+		for (uint32_t i = 0; i < 6; i++) {
+			if (!probes[i]()) {
+				printf("adreno-sdm845: step %u failed; RPMh registers and CMD_DB are not read\n", i + 1);
+				return;
+			}
+		}
+		if (!probe_rpmh()) {
+			printf("adreno-sdm845: step 8 failed; no RPMh request was sent\n");
+			return;
+		}
+		printf("adreno-sdm845: read-only RPMh discovery finished; no GPU acceleration was started\n");
+		return;
+	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only and step 7 is the explicit PAS image loader; "
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, and step 8 is the separate "
+		    "read-only RPMh probe; "
 		    "requested step %u is capped at %zu\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);

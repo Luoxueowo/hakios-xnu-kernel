@@ -63,6 +63,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   GPU offset, and the user/secure/GMU stream tuples. Missing or mismatched entries abort the
   request before GPU MMIO access. The SMMU probe uses the validated runtime stream IDs when
   hardware reports indexed stream routing.
+- The same preflight now validates the Polaris Apps RPMh DRV2 node, its separate DRV/TCS windows,
+  its active/sleep/wake/control TCS counts, and the `cx.lvl`/`gfx.lvl` regulator mailbox links.
+  `adreno=8` runs the existing read-only steps 1–6, skips PAS staging step 7, then reads DRV2
+  revision/configuration/status and the AOP CMD_DB CX/GFX level tables. It accepts only the
+  register layouts documented for RPMh RSC v2.7 and v3.0, and sends no request or TCS write.
+  This probe has not yet run under HakiOS on the phone.
 - `adreno=6` now asks TrustZone whether the SCM availability query and PAS 13 calls are exposed,
   then asks whether GPU image 13 is supported. It does not submit a firmware header or image and
   does not write GPU registers. This query has not yet run under HakiOS on the phone.
@@ -133,6 +139,23 @@ Qualcomm's SDM845 GPUCC source marks CX GDSC as votable and gives GX GDSC a no-o
 callback because the GMU controls GX; HakiOS must preserve that ownership rather than force the GX
 switch from the CPU
 ([`gpucc-sdm845.c`](https://android.googlesource.com/kernel/common/+/b4ec805464a4a0299216a003278351d0b4806450/drivers/clk/qcom/gpucc-sdm845.c)).
+
+The Polaris runtime tree exposes Apps RSC DRV2 as `/soc/mailbox@179e0000` (`qcom,tcs-drv`):
+DRV registers at `0x179e0000/0x100`, TCS registers at `0x179e0d00/0x3000`, `drv-id = 2`, and
+active/sleep/wake/control counts of `2/3/3/1`. Both RPMh regulators used by the GPU point to
+that mailbox provider on channel 0. Qualcomm's SDM845 DTS and RPMh binding define the same DRV2
+layout and TCS classes ([SDM845 DTS](https://android.googlesource.com/kernel/common/+/4b95dc87362aa57bdd0dcbad109ca5e5ef3cbb6c/arch/arm64/boot/dts/qcom/sdm845.dtsi),
+[`qcom,rpmh-rsc.yaml`](https://android.googlesource.com/kernel/common/+/4cb1fc6fffe4910845e183d1a2dfe9509ba1062c/Documentation/devicetree/bindings/soc/qcom/qcom,rpmh-rsc.yaml)).
+The AOP command database's standard reserved range is `0x85fe0000/0x20000`. Polaris' runtime DT
+folds that range into a larger `no-map` `removed_region`; its `/soc/qcom,cmd-db@861e0000` marker
+has `reg = <0x0c3f000c 8>`, while Recovery `/proc/iomem` reports the mapped CMD_DB at
+`0x85fe0000-0x85fe0dc0`. The preflight checks that the standard CMD_DB range lies inside the
+runtime reservation before mapping it for the explicit read-only probe. Qualcomm's CMD_DB parser defines
+the header, resource tables, and auxiliary level data consumed by that probe
+([SDM845 DTS](https://android.googlesource.com/kernel/common/+/f40f97aaf7fa6222f4ec073c24fb14f04ffb6f80/arch/arm64/boot/dts/qcom/sdm845.dtsi),
+[`cmd-db.c`](https://android.googlesource.com/kernel/common/+/29d66b3902962d0a89408abaf6d24a3df5eef518/drivers/soc/qcom/cmd-db.c)).
+No active rail voting is implemented yet; the discovered table contents and live TCS state must
+still be checked under HakiOS before the driver can issue any RPMh command.
 
 The local firmware set is `a630_gmu.bin`, `a630_sqe.fw`, and `a630_zap.{mdt,b00,b01,b02,elf}`.
 The `mdt` describes three program headers, with a single loadable segment matching `b02`; the
@@ -218,7 +241,9 @@ bring-up and a bounded test submission.
 4. **Power, clocks and secure firmware.** The A630 raw GMU image path and size limit are now
    source-confirmed, and the local image fits. The signed ZAP metadata/segment loader and PAS 13
    shutdown path are implemented behind explicit `adreno=7`, gated on live DT and already-on
-   domains. Implement SDM845 CX/GX sequencing, clocks and required RPMh votes; then exercise the
+  domains. The Apps RSC DRV2 and AOP CMD_DB windows are now validated from the runtime DT; an
+  explicit read-only step 8 inspects the TCS and CX/GFX ARC tables. Implement SDM845 CX/GX
+  sequencing, clocks and required RPMh votes; then exercise the
    PAS stage, verify the secure stream/context, authenticate ZAP, and bring up GMU firmware/HFI.
    Clean up in reverse on every failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
@@ -256,6 +281,8 @@ bring-up and a bounded test submission.
   then validate its register protection table and the MSM submission path against the 630's
   GMEM/UBWC configuration.
 - Whether TrustZone PAS calls for GPU firmware are permitted from this boot environment.
+- Whether HakiOS can safely own the Apps RSC active TCS slots under the Polaris hypervisor, and
+  the exact voltage vote required for each A630 operating point. No RPMh writes have been issued.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
 
