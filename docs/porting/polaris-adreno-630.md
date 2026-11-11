@@ -22,6 +22,21 @@ allow it. A successful firmware boot alone is not a completed driver.
   SMR/S2CR stream routing (or the device-tree KGSL stream IDs when stream indexing is active),
   and the IDR1-sized context-bank window and its nonzero registers.
   It does not write registers or expose rendering. This probe has not been run on the phone yet.
+- The A630 backend now builds software 4K, three-level ARM LPAE stage-1 tables for the shared
+  `map/mapped/unmap` calls and performs the same cache maintenance as the existing GPU mapper.
+  Table pages are suballocated from XNU pages, checked against the SMMU output-address size, and
+  kept allocated for the backend lifetime. The diagnostic's IDR2 read supplies the OAS and 4K
+  page-table capability; mapping fails closed until both have been observed. These tables are not
+  connected to a live SMMU context or stream, and the backend `ready()` gate remains false.
+- `adreno=5` checks the staged A630 firmware without writing hardware. The local set contains a
+  32 KiB GMU image and a ZAP MDT with three ELF program headers; its single loadable segment
+  matches `a630_zap.b02` at 1,968 bytes, and the embedded signed-hash area matches the MDT size.
+  The extracted SQE starts with version word `0`, which fails upstream Linux's A630 minimum of
+  `0x190` or patched-firmware marker ([`a6xx_gpu.c`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)).
+  This SQE must not be started through a user-command path; the full driver remains gated until
+  suitable SQE firmware is available. Linux's [`a6xx_gmu.c`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gmu.c)
+  treats raw firmware as a legacy path with a 32 KiB TCM size limit; the Polaris GMU loader mode
+  still needs confirmation.
 - Firmware has been extracted read-only from the Polaris Recovery vendor partition. The local
   `fw-gpu/` directory is ignored by Git; the blobs must stay out of the repository and be staged
   into the image only by the existing firmware packaging path.
@@ -110,18 +125,26 @@ backend ready or expose GPU rendering.
 Keep the existing MSM/HakiosGPU client contract where it is genuinely hardware independent.
 `hakios.gpu_backend.h` now defines the operations boundary, and `hakios.adreno.c` dispatches the
 shared service and lifecycle hooks through the selected backend. Redwood keeps its existing
-implementation behind that boundary. Polaris selects its own profile and an intentionally
-not-ready operations table; unimplemented map, submit, fence, stop and thermal hooks therefore
-cannot fall through into Redwood's SMMUv500 or register state. The A630 implementation must fill
-those operations with SDM845/A630 register, clock, power, RPMh/GMU, PAS firmware, SMMUv2 and core
-logic. Shared code may own page-table allocation where formats match, ring primitives and the
-IOKit service only after each shared operation has an explicit compatibility reason.
+implementation behind that boundary. Polaris selects its own profile and a not-ready operations
+table. Its software map, commit, unmap and cache-maintenance callbacks are implemented; power,
+firmware startup, active SMMU context/stream attachment, command submission, fences, stop and
+thermal hooks are still missing. The permanent `ready()` gate prevents calls from reaching the
+unfinished path. No callback falls through into Redwood's SMMUv500 or register state.
 
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
 software-only, locked 32-bit IOVA allocator: the lower 1 GiB is reserved for backend-owned
 firmware/ring mappings, while client allocations use `[0x40000000, 0x100000000)`. It records each
-allocation and accepts only exact frees. This does not install SMMU mappings or enable rendering;
-the backend remains not ready until its translation and submission paths are implemented.
+allocation and accepts only exact frees. The new 4K LPAE stage-1 tables can describe those IOVAs,
+but no context bank or stream is programmed, so the SMMU does not consume them and rendering
+remains disabled.
+
+The table descriptor format follows the existing project mapper and the ARM LPAE definitions in
+upstream Linux [`io-pgtable-arm.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c).
+The Polaris probe uses SMMUv2 IDR2 to confirm 4K support and decode OAS using upstream Linux
+[`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
+The operations table includes software map, commit, unmap, cache-maintenance and bounded ASID
+invalidation callbacks; ASID invalidation is reachable only after a later bring-up stage marks a
+verified context active.
 
 The backend boundary must carry at least: SoC/GPU identity, firmware file set, MMIO resources,
 GMEM and frequency capabilities, SMMU implementation and stream/context assignments, startup and
@@ -151,9 +174,13 @@ bring-up and a bounded test submission.
    load. Clean up in reverse on every failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
-5. **SMMUv2 and command processor.** Implement the v2 stream-match/context-bank layout using
-   Polaris DT assignments, a 4K page-table format verified against the v2 registers, correct DMA
-   cache maintenance, GMU and core mappings, A630 SQE, ring, CP protection and fences.
+5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
+   maintenance are implemented, with OAS and PTFS_4K checks taken from the read-only ID registers.
+   The local firmware probe validates the ZAP MDT layout and SQE security floor; the extracted SQE
+   currently fails that floor. Still implement and validate the v2 stream-match/context-bank
+   attachment using Polaris DT assignments, find acceptable A630 SQE firmware, then bring up GMU
+   and core mappings, ring, CP protection and fences and exercise the mapper on-device. Keep the
+   backend disabled until those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
    command buffers; bounded test commands complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno
@@ -172,10 +199,12 @@ bring-up and a bounded test submission.
 
 - The Polaris SMMU's assigned stream IDs/masks and whether secure/GMU streams are accessible to
   this kernel under the phone's hypervisor.
-- The exact GMU firmware memory contract and whether `a630_zap.b00/.b01/.elf` are needed by the
-  kernel's package or PAS path in addition to `.mdt/.b02`.
-- The A630 SQE firmware version/features, register protection table and compatibility of the
-  current MSM submission path with the 630's GMEM/UBWC configuration.
+- Whether the A630 GMU's device-specific loader uses the legacy raw 32 KiB image contract in this
+  boot environment, and whether `a630_zap.b00/.b01/.elf` are needed by the kernel's package or PAS
+  path in addition to `.mdt/.b02`.
+- The local A630 SQE is below upstream's A630 safety floor; find an acceptable firmware version,
+  then validate its register protection table and the MSM submission path against the 630's
+  GMEM/UBWC configuration.
 - Whether TrustZone PAS calls for GPU firmware are permitted from this boot environment.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
