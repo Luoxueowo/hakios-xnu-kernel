@@ -209,8 +209,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   [`adreno_pm4types.h`](https://android.googlesource.com/kernel/msm/%2B/android-8.1.0_r0.78/drivers/gpu/msm/adreno_pm4types.h)).
 - `adreno=16` runs read-only steps 1–6, then allocates and maps the validated SQE payload (after
   its 4-byte file prefix), a 32 KiB CP ring containing the 12-dword `CP_ME_INIT`, and a one-page
-  RPTR scratch buffer into the detached GPU SID0 page table. The SQE and ring are GPU read-only;
-  the RPTR page is GPU writable. It cleans the CPU cache lines and commits the software page tables,
+  CP scratch/fence buffer into the detached GPU SID0 page table. All three buffers use SMMU
+  descriptors without unprivileged access; the SQE and ring are read-only and scratch is writable.
+  It cleans the CPU cache lines and commits the software page tables,
   but does not attach SID0, write SMMU/GPU registers, start the SQE/CP, call PAS, or enable rendering.
   Buffers remain allocated for review until the backend stop path confirms that the 3D context
   is detached and the core is inactive. The 32 KiB ring size follows the A630 KGSL definitions
@@ -242,7 +243,8 @@ allow it. A successful firmware boot alone is not a completed driver.
   It stops before SQE/ring register programming, `CP_ME_INIT`, ZAP authentication or submission.
   This write stage has not been run on the phone; `ready()` remains false.
 - `adreno=19` repeats the guarded GMU/GX startup and step 18 core setup, programs the SQE,
-  read-only 32-KiB CP ring and writable RPTR page, then restages the validated ZAP image and calls
+  read-only 32-KiB CP ring and writable CP scratch page, sets `CP_RB_CNTL_NO_UPDATE` so CP does
+  not write the RPTR shadow to memory, then restages the validated ZAP image and calls
   PAS `AUTH_AND_RESET` before releasing SQE halt and publishing the 12-dword `CP_ME_INIT` packet.
   An authenticated image remains active until GPU shutdown. It verifies
   the programmed IOVAs and ring control, verifies the published WPTR, then waits up to two seconds
@@ -261,9 +263,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   It still does not enable fences, user submissions or rendering. This write stage has not been run
   on the phone; `ready()` remains false.
 - `adreno=21` repeats the guarded setup through unsecured CP mode, then submits one kernel-owned
-  `CP_MEM_WRITE` to IOVA `RPTR + 64`, followed by `CP_WAIT_MEM_WRITES`. The destination is a
-  dedicated writable cache line in the existing SID0 scratch page, separate from the CP RPTR word;
-  the command ring remains GPU read-only. It waits for RPTR/WPTR 19, CP/AHB idle and clear CP error
+  `CP_MEM_WRITE` to IOVA `CP scratch + 64`, followed by `CP_WAIT_MEM_WRITES`. The destination is a
+  dedicated writable cache line in the existing SID0 scratch page. The command ring remains GPU
+  read-only. It waits for the MMIO CP RPTR/WPTR registers to reach 19, CP/AHB idle and clear CP error
   status, invalidates the CPU cache line and checks the fence magic value. This exercises a bounded
   GPU write and fence readback without opening the ring to clients. It follows the A630 PM4 packet
   definitions and KGSL fence-write ordering in [`adreno_pm4types.h`](https://android.googlesource.com/kernel/msm/%2B/f5996ba85abd9d67bdb9506421177a9625ce29c4/drivers/gpu/msm/adreno_pm4types.h) and
@@ -710,7 +712,13 @@ bounded hardware submission checks.
   client-memory isolation on the actual phone.
 - Do not assume CP APRIV can separate kernel and client mappings on this device: Qualcomm's KGSL
   `a630v2` catalog entry does not advertise `ADRENO_APRIV`, unlike the deprecated A630v1 profile
-  ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)). The current IOVA ranges are disjoint but share the same SID0 page table; a safe command-stream/private-memory isolation design remains a readiness blocker.
+  ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)).
+  Kernel-owned SQE, ring and scratch pages now have privileged-only SMMU descriptors, and
+  `CP_RB_CNTL_NO_UPDATE` disables CP writes to the RPTR shadow. These controls do not isolate
+  client buffers: all current client BOs still share the SID0 page table, so clients can address
+  one another's mapped BOs. Establish and validate per-client address spaces or a kernel-validated
+  submission model before enabling public submissions; hardware enforcement of the privileged
+  SMMU mappings also remains unverified on the phone.
 - A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence
   stage and is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
   legacy-HFI slumber; it then checks GMU/CX/GX state, asserts CM3 reset, shuts down PAS, detaches

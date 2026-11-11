@@ -117,6 +117,7 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_SUBMIT_FIXED_DWORDS      9u
 #define A630_CP_SUBMIT_MAX_DWORDS        (A630_CP_SUBMIT_FIXED_DWORDS + 4u * A630_CP_SUBMIT_MAX_IBS)
 #define A630_CP_RB_CNTL_DEFAULT         0x0000020cu
+#define A630_CP_RB_CNTL_NO_UPDATE       0x08000000u
 #define A630_CP_INIT_TIMEOUT_US         2000000u
 #define A630_CP_INIT_POLL_US            100u
 #define A630_CP_INTERRUPT_ERROR_MASK    0x000000f7u
@@ -484,6 +485,7 @@ struct polaris_gpu_dma_buffer {
 	uint64_t physical;
 	uint64_t gpu_address;
 	bool gpu_read_only;
+	bool gpu_privileged;
 };
 
 enum polaris_smmu_address_space_id {
@@ -1952,7 +1954,7 @@ polaris_smmu_tlbi(struct polaris_smmu_address_space *space)
 
 static bool
 polaris_smmu_map_page_locked(struct polaris_smmu_address_space *space, uint64_t address, uint64_t phys,
-	bool read_only)
+	bool read_only, bool privileged)
 {
 	uint32_t l1_index, l2_index, l3_index;
 	struct polaris_smmu_table *l2, *l3;
@@ -1996,7 +1998,9 @@ polaris_smmu_map_page_locked(struct polaris_smmu_address_space *space, uint64_t 
 	if (l3 == NULL || l3->entries[l3_index] != 0) {
 		return false;
 	}
-	descriptor = phys | space->pte_attributes | POLARIS_SMMU_PTE_PAGE;
+	descriptor = phys | (privileged ?
+	    (space->pte_attributes & ~POLARIS_SMMU_PTE_UNPRIVILEGED) : space->pte_attributes) |
+	    POLARIS_SMMU_PTE_PAGE;
 	if (read_only) {
 		descriptor |= POLARIS_SMMU_PTE_READ_ONLY;
 	}
@@ -2012,7 +2016,20 @@ polaris_smmu_space_map_page(struct polaris_smmu_address_space *space, uint64_t a
 	bool ok;
 
 	lck_mtx_lock(&polaris_smmu_pt_lock);
-	ok = polaris_smmu_map_page_locked(space, address, phys, read_only);
+	ok = polaris_smmu_map_page_locked(space, address, phys, read_only, false);
+	lck_mtx_unlock(&polaris_smmu_pt_lock);
+	return ok;
+}
+
+/* Kernel CP firmware/ring/fence memory must not be accessible to unprivileged IB traffic. */
+static bool
+polaris_smmu_space_map_page_privileged(struct polaris_smmu_address_space *space, uint64_t address,
+	uint64_t phys, bool read_only)
+{
+	bool ok;
+
+	lck_mtx_lock(&polaris_smmu_pt_lock);
+	ok = polaris_smmu_map_page_locked(space, address, phys, read_only, true);
 	lck_mtx_unlock(&polaris_smmu_pt_lock);
 	return ok;
 }
@@ -2736,8 +2753,9 @@ polaris_gpu_dma_buffer_allocate(struct polaris_gpu_dma_buffer *buffer, uint64_t 
 	buffer->physical = physical;
 	buffer->gpu_address = gpu_address;
 	buffer->gpu_read_only = gpu_read_only;
+	buffer->gpu_privileged = true;
 	for (uint64_t offset = 0; offset < allocation_size; offset += POLARIS_SMMU_TABLE_BYTES) {
-		if (!polaris_smmu_space_map_page(space, gpu_address + offset,
+		if (!polaris_smmu_space_map_page_privileged(space, gpu_address + offset,
 		    physical + offset, gpu_read_only)) {
 			if (mapped_size != 0) {
 				polaris_smmu_space_unmap(space, gpu_address, mapped_size);
@@ -2771,6 +2789,12 @@ polaris_gpu_cp_software_prepare(void)
 	all_present = polaris_gpu_sqe_buffer.virtual != 0 && polaris_gpu_ring_buffer.virtual != 0 &&
 	    polaris_gpu_rptr_buffer.virtual != 0;
 	if (all_present) {
+		if (!polaris_gpu_sqe_buffer.gpu_privileged || !polaris_gpu_ring_buffer.gpu_privileged ||
+		    !polaris_gpu_rptr_buffer.gpu_privileged || !polaris_gpu_sqe_buffer.gpu_read_only ||
+		    !polaris_gpu_ring_buffer.gpu_read_only || polaris_gpu_rptr_buffer.gpu_read_only) {
+			printf("adreno-sdm845: step 16 rejected CP buffers with unsafe SMMU permissions\n");
+			return false;
+		}
 		printf("adreno-sdm845: step 16 CP buffers are already prepared at SQE=%#llx ring=%#llx RPTR=%#llx\n",
 		    polaris_gpu_sqe_buffer.gpu_address, polaris_gpu_ring_buffer.gpu_address,
 		    polaris_gpu_rptr_buffer.gpu_address);
@@ -2799,7 +2823,7 @@ polaris_gpu_cp_software_prepare(void)
 	polaris_cache_lines(polaris_gpu_rptr_buffer.virtual, polaris_gpu_rptr_buffer.allocation_size);
 	sdm845_gpu_mapped();
 	__asm__ volatile ("dsb sy" ::: "memory");
-	printf("adreno-sdm845: step 16 prepared SQE=%llu bytes at IOVA=%#llx, CP ring=%u bytes at IOVA=%#llx, RPTR scratch at IOVA=%#llx; SQE/ring are GPU read-only, RPTR scratch is GPU writable; no SMMU registers or CP were touched\n",
+	printf("adreno-sdm845: step 16 prepared SQE=%llu bytes at IOVA=%#llx, CP ring=%u bytes at IOVA=%#llx, RPTR/fence scratch at IOVA=%#llx; all CP pages are privileged-only, SQE/ring are read-only, and scratch is GPU writable; no SMMU registers or CP were touched\n",
 	    sqe_payload_size, polaris_gpu_sqe_buffer.gpu_address, A630_CP_RING_BYTES,
 	    polaris_gpu_ring_buffer.gpu_address, polaris_gpu_rptr_buffer.gpu_address);
 	return true;
@@ -6173,8 +6197,12 @@ polaris_a630_cp_idle_for_stop(void)
 	uint32_t rptr, wptr;
 	volatile uint32_t *fence;
 
-	if (gpu.virtual == 0 || polaris_gpu_ring_buffer.virtual == 0 ||
+	if (gpu.virtual == 0 || polaris_gpu_sqe_buffer.virtual == 0 ||
+	    polaris_gpu_ring_buffer.virtual == 0 ||
 	    polaris_gpu_rptr_buffer.virtual == 0 ||
+	    !polaris_gpu_sqe_buffer.gpu_privileged || !polaris_gpu_ring_buffer.gpu_privileged ||
+	    !polaris_gpu_rptr_buffer.gpu_privileged || !polaris_gpu_sqe_buffer.gpu_read_only ||
+	    !polaris_gpu_ring_buffer.gpu_read_only || polaris_gpu_rptr_buffer.gpu_read_only ||
 	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
 	    polaris_gpu_rptr_buffer.requested_size < A630_CP_FENCE_TEST_OFFSET + sizeof(uint32_t)) {
 		return false;
@@ -6437,6 +6465,9 @@ polaris_a630_cp_ring_start(void)
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active || polaris_smmu_backend_faulted ||
 	    !map_block(&gpu) || polaris_gpu_sqe_buffer.virtual == 0 ||
 	    polaris_gpu_ring_buffer.virtual == 0 || polaris_gpu_rptr_buffer.virtual == 0 ||
+	    !polaris_gpu_sqe_buffer.gpu_privileged || !polaris_gpu_ring_buffer.gpu_privileged ||
+	    !polaris_gpu_rptr_buffer.gpu_privileged || !polaris_gpu_sqe_buffer.gpu_read_only ||
+	    !polaris_gpu_ring_buffer.gpu_read_only || polaris_gpu_rptr_buffer.gpu_read_only ||
 	    polaris_gpu_sqe_buffer.requested_size == 0 ||
 	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
 	    polaris_gpu_rptr_buffer.requested_size < sizeof(uint32_t) ||
@@ -6462,7 +6493,7 @@ polaris_a630_cp_ring_start(void)
 		return false;
 	}
 
-	/* The CP fetches only these read-only packets; its RPTR shadow is a separate writable page. */
+	/* CP firmware/ring and the RPTR/fence scratch use privileged-only SMMU pages. */
 	*(volatile uint32_t *)polaris_gpu_rptr_buffer.virtual = 0;
 	polaris_cache_lines(polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
 	polaris_cache_lines(polaris_gpu_rptr_buffer.virtual, sizeof(uint32_t));
@@ -6470,7 +6501,7 @@ polaris_a630_cp_ring_start(void)
 
 	probe_write(&gpu, GPU_CP_RB_RPTR_ADDR_LO, (uint32_t)rptr_address);
 	probe_write(&gpu, GPU_CP_RB_RPTR_ADDR_HI, (uint32_t)(rptr_address >> 32));
-	probe_write(&gpu, GPU_CP_RB_CNTL, A630_CP_RB_CNTL_DEFAULT);
+	probe_write(&gpu, GPU_CP_RB_CNTL, A630_CP_RB_CNTL_DEFAULT | A630_CP_RB_CNTL_NO_UPDATE);
 	probe_write(&gpu, GPU_CP_RB_BASE, (uint32_t)ring_address);
 	probe_write(&gpu, GPU_CP_RB_BASE_HI, (uint32_t)(ring_address >> 32));
 	probe_write(&gpu, GPU_CP_SQE_INSTR_BASE_LO, (uint32_t)sqe_address);
@@ -6478,7 +6509,7 @@ polaris_a630_cp_ring_start(void)
 	__asm__ volatile ("dsb sy" ::: "memory");
 	if (probe_read(&gpu, GPU_CP_RB_RPTR_ADDR_LO) != (uint32_t)rptr_address ||
 	    probe_read(&gpu, GPU_CP_RB_RPTR_ADDR_HI) != (uint32_t)(rptr_address >> 32) ||
-	    probe_read(&gpu, GPU_CP_RB_CNTL) != A630_CP_RB_CNTL_DEFAULT ||
+	    probe_read(&gpu, GPU_CP_RB_CNTL) != (A630_CP_RB_CNTL_DEFAULT | A630_CP_RB_CNTL_NO_UPDATE) ||
 	    probe_read(&gpu, GPU_CP_RB_BASE) != (uint32_t)ring_address ||
 	    probe_read(&gpu, GPU_CP_RB_BASE_HI) != (uint32_t)(ring_address >> 32) ||
 	    probe_read(&gpu, GPU_CP_SQE_INSTR_BASE_LO) != (uint32_t)sqe_address ||
@@ -6634,14 +6665,17 @@ polaris_a630_cp_fence_smoke_test(void)
 	    !polaris_gpu_core_configured || !polaris_gpu_oob_active || !polaris_gmu_hfi_ready ||
 	    !polaris_gmu_hfi_sealed || !polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready ||
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
-	    polaris_smmu_backend_faulted || polaris_gpu_ring_buffer.virtual == 0 ||
-	    polaris_gpu_rptr_buffer.virtual == 0 ||
+	    polaris_smmu_backend_faulted || polaris_gpu_sqe_buffer.virtual == 0 ||
+	    polaris_gpu_ring_buffer.virtual == 0 || polaris_gpu_rptr_buffer.virtual == 0 ||
 	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
 	    polaris_gpu_rptr_buffer.requested_size < A630_CP_FENCE_TEST_OFFSET + sizeof(uint32_t) ||
-	    !polaris_gpu_ring_buffer.gpu_read_only || polaris_gpu_rptr_buffer.gpu_read_only ||
+	    !polaris_gpu_sqe_buffer.gpu_read_only || !polaris_gpu_ring_buffer.gpu_read_only ||
+	    polaris_gpu_rptr_buffer.gpu_read_only ||
+	    !polaris_gpu_sqe_buffer.gpu_privileged || !polaris_gpu_ring_buffer.gpu_privileged ||
+	    !polaris_gpu_rptr_buffer.gpu_privileged ||
 	    fence_address > UINT32_MAX || (fence_address & (sizeof(uint32_t) - 1u)) != 0 ||
 	    A630_CP_FENCE_TEST_OFFSET % POLARIS_SMMU_CACHE_LINE != 0) {
-		printf("adreno-sdm845: step 21 requires the authenticated/unsecured CP, active SID0 and a writable fence word separate from the RPTR cache line\n");
+		printf("adreno-sdm845: step 21 requires the authenticated/unsecured CP, active SID0 and privileged-only kernel CP pages\n");
 		return false;
 	}
 	if (!map_block(&gpu)) {
@@ -6741,10 +6775,14 @@ sdm845_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	    !polaris_gpu_fence_smoke_test_done || !polaris_zap_authenticated ||
 	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active || polaris_smmu_backend_faulted ||
 	    count > A630_CP_SUBMIT_MAX_IBS || (count != 0 && (addresses == NULL || words == NULL)) ||
-	    polaris_gpu_ring_buffer.virtual == 0 || polaris_gpu_rptr_buffer.virtual == 0 ||
+	    polaris_gpu_sqe_buffer.virtual == 0 || polaris_gpu_ring_buffer.virtual == 0 ||
+	    polaris_gpu_rptr_buffer.virtual == 0 ||
 	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
 	    polaris_gpu_rptr_buffer.requested_size < A630_CP_FENCE_TEST_OFFSET + sizeof(uint32_t) ||
-	    !polaris_gpu_ring_buffer.gpu_read_only || polaris_gpu_rptr_buffer.gpu_read_only) {
+	    !polaris_gpu_sqe_buffer.gpu_read_only || !polaris_gpu_ring_buffer.gpu_read_only ||
+	    polaris_gpu_rptr_buffer.gpu_read_only ||
+	    !polaris_gpu_sqe_buffer.gpu_privileged || !polaris_gpu_ring_buffer.gpu_privileged ||
+	    !polaris_gpu_rptr_buffer.gpu_privileged) {
 		return 0;
 	}
 	for (uint32_t i = 0; i < count; i++) {
