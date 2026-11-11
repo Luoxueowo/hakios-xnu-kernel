@@ -527,8 +527,10 @@ The A630 backend now has dormant `submit`, `done`, `last`, and `report` callback
 the A6xx CCU-invalidate / `CP_INDIRECT_BUFFER_PFE` / `CACHE_FLUSH_TS` sequence, validates each IB
 against the client IOVA aperture, handles ring wrap and bounded space polling, and keeps the
 completion word in the private RPTR allocation. These callbacks remain unreachable from the public
-service because the current `ready()` gate is false; no callback falls through into Redwood's
-SMMUv500 or register state.
+service because the current `ready()` gate requires an active SID0 context, ready/sealed GMU/HFI,
+GPU OOB/core setup, authenticated PAS/ZAP, initialized CP in unsecured mode, and the completed
+step 21 fence smoke test. The separate backend-enabled flag still has no writer, so `ready()` stays
+false. No callback falls through into Redwood's SMMUv500 or register state.
 
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
 software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use the private range
@@ -659,6 +661,9 @@ bounded hardware submission checks.
   Apps RSC active-TCS path remains unverified on hardware.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
+- Do not assume CP APRIV can separate kernel and client mappings on this device: Qualcomm's KGSL
+  `a630v2` catalog entry does not advertise `ADRENO_APRIV`, unlike the deprecated A630v1 profile
+  ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)). The current IOVA ranges are disjoint but share the same SID0 page table; a safe command-stream/private-memory isolation design remains a readiness blocker.
 - A630 shutdown after SQE startup: the current stop hook conservatively retains hardware votes,
   PAS and buffers. Implement and validate the GMU idle/slumber and CP stop/reset sequence before
   enabling client submissions or claiming recoverable power-down.

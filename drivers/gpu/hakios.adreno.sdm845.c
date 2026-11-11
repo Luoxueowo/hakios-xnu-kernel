@@ -961,7 +961,12 @@ static uint32_t smmu_id_size_to_bits(uint32_t encoding);
 static bool
 sdm845_gpu_ready(void)
 {
-	return polaris_smmu_backend_enabled && !polaris_smmu_backend_faulted && polaris_sqe_safe;
+	return polaris_smmu_backend_enabled && !polaris_smmu_backend_faulted && polaris_sqe_safe &&
+	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active && polaris_gmu_hfi_ready &&
+	    polaris_gmu_hfi_sealed && polaris_gpu_oob_active && polaris_gpu_core_ready &&
+	    polaris_gpu_core_configured && polaris_zap_authenticated && polaris_pas_image_active &&
+	    polaris_gpu_cp_started && polaris_gpu_cp_initialized && polaris_gpu_unsecured_mode &&
+	    polaris_gpu_fence_smoke_test_done && polaris_gpu_ring_submit_ready;
 }
 
 const struct hakios_gpu_backend_ops hakios_gpu_sdm845_backend_ops = {
