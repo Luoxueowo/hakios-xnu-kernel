@@ -13,6 +13,10 @@ allow it. A successful firmware boot alone is not a completed driver.
 - `drivers/gpu/hakios.gpu.cpp` and `tools/mesa/hakios-drm/` provide the existing HakiosGPU
   IOKit service and the MSM interface used by Mesa. This service is a candidate shared client
   interface; the A630 backend must report its own hardware capabilities and lifecycle.
+- The Dipper reference was checked at upstream `main` commit `17077d07`. Its
+  `xnu/files/bsd/dev/hakios.adreno.c` follows the Redwood/SC7280 register path; the Polaris
+  implementation therefore stays in this repository's separate SDM845 backend, with Dipper used
+  for lifecycle and service comparisons.
 - `CONFIG_HAKIOS_ADRENO` remains disabled in `devices/polaris/configs/polaris.config` until the
   Polaris path has passed staged hardware bring-up.
 - A separate `hakios.adreno.sdm845.c` probe is now wired into the driver configuration. On an
@@ -22,12 +26,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   SMR/S2CR stream routing (or the device-tree KGSL stream IDs when stream indexing is active),
   and the IDR1-sized context-bank window and its nonzero registers.
   It does not write registers or expose rendering. This probe has not been run on the phone yet.
-- The A630 backend now builds software 4K, three-level ARM LPAE stage-1 tables for the shared
-  `map/mapped/unmap` calls and performs the same cache maintenance as the existing GPU mapper.
-  Table pages are suballocated from XNU pages, checked against the SMMU output-address size, and
-  kept allocated for the backend lifetime. The diagnostic's IDR2 read supplies the OAS and 4K
-  page-table capability; mapping fails closed until both have been observed. These tables are not
-  connected to a live SMMU context or stream, and the backend `ready()` gate remains false.
+- The A630 backend now has separate software stage-1 page-table roots for the 3D core,
+  `gmu_kernel`, and `gmu_user`; table pages are suballocated from XNU pages, checked against the
+  SMMU output-address size, and kept for the backend lifetime. The diagnostic's IDR2 read supplies
+  the OAS and 4-KiB table capability. Shared `map/mapped/unmap` uses the 3D root. `adreno=9` also
+  allocates contiguous HFI memory, creates a write-combined CPU alias, initializes its legacy HFI
+  table, and maps its five 4-KiB pages into the detached `gmu_kernel` software root at `0x60000000`.
+  No context bank, stream route, SMMU register, GMU interrupt, or firmware state is changed; these
+  tables remain detached and `ready()` remains false. This preparation step has not been run on the
+  phone.
 - `adreno=5` checks the staged A630 firmware and PAS memory description without writing hardware.
   The local set contains a 32 KiB GMU image and a 6,684-byte ZAP MDT with three ELF program
   headers; its single relocatable `PT_LOAD` segment matches `a630_zap.b02` at 1,968 bytes. The
@@ -68,7 +75,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   `adreno=8` runs the existing read-only steps 1–6, skips PAS staging step 7, then reads DRV2
   revision/configuration/status and the AOP CMD_DB CX/GFX level tables. It accepts only the
   register layouts documented for RPMh RSC v2.7 and v3.0, and sends no request or TCS write.
-  This probe has not yet run under HakiOS on the phone.
+  `adreno=9` runs steps 1–6, skips PAS staging, and prepares the detached HFI allocation and GMU
+  kernel software page tables. This allocates kernel memory but does not write SMMU/GMU registers,
+  send an HFI message, or start firmware. Neither diagnostic has run under HakiOS on the phone.
 - `adreno=6` now asks TrustZone whether the SCM availability query and PAS 13 calls are exposed,
   then asks whether GPU image 13 is supported. It does not submit a firmware header or image and
   does not write GPU registers. This query has not yet run under HakiOS on the phone.
@@ -183,8 +192,9 @@ sequence-number generation, the GMU init command, and v1 ACK matching. The queue
 dwords, the queue table is 54 dwords, and each queue contains 1024 dwords. A630's legacy queue IDs
 are 0/4/5/1 for command/message/debug/dispatch; the dispatch queue remains disabled. The host
 allocation is page-rounded to 20 KiB and its GMU virtual address belongs to the noncached kernel
-range beginning at `0x60000000`. `adreno=3` checks and reports this protocol layout, but the helpers
-do not map or cache-maintain memory, attach a GMU SMMU context, ring interrupts, or start HFI.
+range beginning at `0x60000000`. `adreno=3` checks and reports this protocol layout. The HFI
+helpers manage the wire format only; step 9 supplies the detached software mapping, while context
+attachment, register programming, cache-policy setup, interrupts, and HFI startup remain pending.
 
 Qualcomm's matching A630 KGSL implementation gives the GMU separate `gmu_user` and `gmu_kernel`
 SMMU contexts and allocates HFI memory through the GMU-kernel context. Polaris preflight currently
@@ -287,10 +297,10 @@ bring-up and a bounded test submission.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
    maintenance are implemented, with OAS and PTFS_4K checks taken from the read-only ID registers.
    The local firmware probe validates the ZAP MDT layout and SQE security floor; the extracted SQE
-   currently fails that floor. Still implement and validate the v2 stream-match/context-bank
-   attachment using Polaris DT assignments, find acceptable A630 SQE firmware, then bring up GMU
-   and core mappings, ring, CP protection and fences and exercise the mapper on-device. Keep the
-   backend disabled until those pieces are verified.
+   currently fails that floor. Still discover and validate the v2 stream-match/context-bank
+   assignments, program independent 3D/GMU contexts with verified attributes, find acceptable
+   A630 SQE firmware, then bring up GMU and core mappings, ring, CP protection and fences and
+   exercise the mapper on-device. Keep the backend disabled until those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
    command buffers; bounded test commands complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno

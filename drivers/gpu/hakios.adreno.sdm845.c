@@ -214,7 +214,10 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_GPU_VA_MAX_ALLOCS        POLARIS_GPU_VA_GRANULES
 #define POLARIS_SMMU_MAX_STREAM_IDS      8u
 #define POLARIS_SMMU_TABLE_BYTES         4096u
-#define POLARIS_SMMU_MAX_TABLES          2053u /* one L1, four L2, 2048 L3 tables cover 4 GiB */
+#define POLARIS_SMMU_ADDRESS_SPACE_COUNT 3u
+#define POLARIS_SMMU_TABLES_PER_SPACE    2053u /* one L1, four L2, 2048 L3 tables cover 4 GiB */
+#define POLARIS_SMMU_MAX_TABLES          (POLARIS_SMMU_ADDRESS_SPACE_COUNT * POLARIS_SMMU_TABLES_PER_SPACE)
+#define POLARIS_SMMU_CACHE_INDEX_NONE    UINT32_MAX
 #define POLARIS_SMMU_PTE_TABLE           3ull
 #define POLARIS_SMMU_PTE_PAGE            3ull
 #define POLARIS_SMMU_PTE_UNPRIVILEGED    (1ull << 6)
@@ -248,22 +251,56 @@ struct polaris_smmu_table {
 	bool dirty;
 };
 
+enum polaris_smmu_address_space_id {
+	POLARIS_SMMU_SPACE_GPU,
+	POLARIS_SMMU_SPACE_GMU_KERNEL,
+	POLARIS_SMMU_SPACE_GMU_USER,
+};
+
+struct polaris_smmu_address_space {
+	const char *name;
+	struct polaris_smmu_table *root;
+	struct polaris_smmu_table *cached_l2;
+	struct polaris_smmu_table *cached_l3;
+	uint32_t cached_l1_index;
+	uint32_t cached_l2_index;
+	uint32_t context_bank;
+	uint32_t asid;
+	bool context_active;
+};
+
 static struct polaris_smmu_table polaris_smmu_tables[POLARIS_SMMU_MAX_TABLES];
 static uint32_t polaris_smmu_table_count;
 static vm_offset_t polaris_smmu_table_chunk;
 static uint32_t polaris_smmu_chunk_slots;
-static struct polaris_smmu_table *polaris_smmu_root;
-static struct polaris_smmu_table *polaris_smmu_cached_l2;
-static struct polaris_smmu_table *polaris_smmu_cached_l3;
-static uint32_t polaris_smmu_cached_l1_index = UINT32_MAX;
-static uint32_t polaris_smmu_cached_l2_index = UINT32_MAX;
+static struct polaris_smmu_address_space polaris_smmu_spaces[POLARIS_SMMU_ADDRESS_SPACE_COUNT] = {
+	[POLARIS_SMMU_SPACE_GPU] = {
+		.name = "3D core",
+		.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE,
+		.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE,
+		.context_bank = UINT32_MAX,
+		.asid = 1,
+	},
+	[POLARIS_SMMU_SPACE_GMU_KERNEL] = {
+		.name = "GMU kernel",
+		.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE,
+		.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE,
+		.context_bank = UINT32_MAX,
+		.asid = 2,
+	},
+	[POLARIS_SMMU_SPACE_GMU_USER] = {
+		.name = "GMU user",
+		.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE,
+		.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE,
+		.context_bank = UINT32_MAX,
+		.asid = 3,
+	},
+};
 static uint32_t polaris_smmu_oas_bits;
 static bool polaris_smmu_supports_4k;
 static uint32_t polaris_smmu_context_page_size;
 static uint32_t polaris_smmu_context_base;
 static uint32_t polaris_smmu_context_bank_count;
-static uint32_t polaris_smmu_core_context;
-static uint32_t polaris_smmu_core_asid;
 static uint32_t polaris_smmu_stream_ids[POLARIS_SMMU_MAX_STREAM_IDS];
 static uint32_t polaris_smmu_stream_count;
 struct polaris_smmu_stream_route {
@@ -324,9 +361,14 @@ static struct polaris_gpu_operating_point polaris_gpu_pwrlevels[POLARIS_MAX_GPU_
 static uint32_t polaris_gpu_pwrlevel_count;
 static uint32_t polaris_gmu_pwrlevels[POLARIS_MAX_GMU_PWRLEVELS];
 static uint32_t polaris_gmu_pwrlevel_count;
+static struct polaris_a630_hfi_state polaris_hfi_state;
+static vm_offset_t polaris_hfi_allocation;
+static vm_size_t polaris_hfi_allocation_size;
+static vm_offset_t polaris_hfi_uncached;
+static uint64_t polaris_hfi_physical;
+static bool polaris_hfi_space_mapped;
 static bool polaris_gmu_domain_ready;
 static bool polaris_gpu_core_ready;
-static bool polaris_smmu_core_context_active;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
 static bool polaris_sqe_safe;
@@ -1294,24 +1336,24 @@ polaris_smmu_commit_locked(void)
 }
 
 static bool
-polaris_smmu_tlbi_core(void)
+polaris_smmu_tlbi(struct polaris_smmu_address_space *space)
 {
 	uint64_t context_offset;
 	uint32_t context;
 
-	if (!polaris_smmu_core_context_active) {
+	if (space == NULL || !space->context_active) {
 		return true;
 	}
 	context_offset = (uint64_t)polaris_smmu_context_base +
-	    (uint64_t)polaris_smmu_core_context * polaris_smmu_context_page_size;
+	    (uint64_t)space->context_bank * polaris_smmu_context_page_size;
 	if (smmu.virtual == 0 || polaris_smmu_context_page_size == 0 ||
-	    polaris_smmu_core_context >= polaris_smmu_context_bank_count ||
+	    space->context_bank >= polaris_smmu_context_bank_count ||
 	    context_offset + polaris_smmu_context_page_size > smmu.size || context_offset > UINT32_MAX) {
 		return false;
 	}
 	context = (uint32_t)context_offset;
 	__asm__ volatile ("dsb sy" ::: "memory");
-	probe_write(&smmu, context + SMMU_CB_TLBIASID, polaris_smmu_core_asid);
+	probe_write(&smmu, context + SMMU_CB_TLBIASID, space->asid);
 	probe_write(&smmu, context + SMMU_CB_TLBSYNC, 1);
 	for (uint32_t retry = 0; retry < 10000; retry++) {
 		if ((probe_read(&smmu, context + SMMU_CB_TLBSTATUS) & 1u) == 0) {
@@ -1319,19 +1361,21 @@ polaris_smmu_tlbi_core(void)
 			return true;
 		}
 	}
-	printf("adreno-sdm845: SMMU context %u did not finish TLB invalidation\n", polaris_smmu_core_context);
+	printf("adreno-sdm845: SMMU %s context %u did not finish TLB invalidation\n",
+	    space->name, space->context_bank);
 	return false;
 }
 
 static bool
-sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+polaris_smmu_map_page_locked(struct polaris_smmu_address_space *space, uint64_t address, uint64_t phys,
+	bool read_only)
 {
 	uint32_t l1_index, l2_index, l3_index;
 	struct polaris_smmu_table *l2, *l3;
 	uint64_t descriptor;
-	bool ok = false;
 
-	if (address >= POLARIS_GPU_VA_END || (address & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 ||
+	if (space == NULL || address >= POLARIS_GPU_VA_END ||
+	    (address & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 ||
 	    (phys & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 ||
 	    !polaris_smmu_phys_valid(phys, POLARIS_SMMU_TABLE_BYTES)) {
 		return false;
@@ -1340,34 +1384,33 @@ sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 	l2_index = (uint32_t)(address >> 21) & 0x1ffu;
 	l3_index = (uint32_t)(address >> 12) & 0x1ffu;
 
-	lck_mtx_lock(&polaris_smmu_pt_lock);
-	if (polaris_smmu_root == NULL && (polaris_smmu_root = polaris_smmu_table_new()) == NULL) {
-		goto out;
+	if (space->root == NULL && (space->root = polaris_smmu_table_new()) == NULL) {
+		return false;
 	}
-	if (polaris_smmu_cached_l1_index == l1_index && polaris_smmu_cached_l2 != NULL &&
-	    polaris_smmu_root->entries[l1_index] == (polaris_smmu_cached_l2->phys | POLARIS_SMMU_PTE_TABLE)) {
-		l2 = polaris_smmu_cached_l2;
+	if (space->cached_l1_index == l1_index && space->cached_l2 != NULL &&
+	    space->root->entries[l1_index] == (space->cached_l2->phys | POLARIS_SMMU_PTE_TABLE)) {
+		l2 = space->cached_l2;
 	} else {
-		l2 = polaris_smmu_table_child(polaris_smmu_root, l1_index, true);
-		polaris_smmu_cached_l1_index = l1_index;
-		polaris_smmu_cached_l2_index = UINT32_MAX;
-		polaris_smmu_cached_l2 = l2;
-		polaris_smmu_cached_l3 = NULL;
+		l2 = polaris_smmu_table_child(space->root, l1_index, true);
+		space->cached_l1_index = l1_index;
+		space->cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+		space->cached_l2 = l2;
+		space->cached_l3 = NULL;
 	}
 	if (l2 == NULL) {
-		goto out;
+		return false;
 	}
-	if (polaris_smmu_cached_l1_index == l1_index && polaris_smmu_cached_l2_index == l2_index &&
-	    polaris_smmu_cached_l3 != NULL &&
-	    l2->entries[l2_index] == (polaris_smmu_cached_l3->phys | POLARIS_SMMU_PTE_TABLE)) {
-		l3 = polaris_smmu_cached_l3;
+	if (space->cached_l1_index == l1_index && space->cached_l2_index == l2_index &&
+	    space->cached_l3 != NULL &&
+	    l2->entries[l2_index] == (space->cached_l3->phys | POLARIS_SMMU_PTE_TABLE)) {
+		l3 = space->cached_l3;
 	} else {
 		l3 = polaris_smmu_table_child(l2, l2_index, true);
-		polaris_smmu_cached_l2_index = l2_index;
-		polaris_smmu_cached_l3 = l3;
+		space->cached_l2_index = l2_index;
+		space->cached_l3 = l3;
 	}
 	if (l3 == NULL || l3->entries[l3_index] != 0) {
-		goto out;
+		return false;
 	}
 	descriptor = phys | POLARIS_SMMU_PTE_CORE | POLARIS_SMMU_PTE_PAGE;
 	if (read_only) {
@@ -1375,10 +1418,86 @@ sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 	}
 	l3->entries[l3_index] = descriptor;
 	l3->dirty = true;
-	ok = true;
-out:
+	return true;
+}
+
+static bool
+polaris_smmu_space_map_page(struct polaris_smmu_address_space *space, uint64_t address, uint64_t phys,
+	bool read_only)
+{
+	bool ok;
+
+	lck_mtx_lock(&polaris_smmu_pt_lock);
+	ok = polaris_smmu_map_page_locked(space, address, phys, read_only);
 	lck_mtx_unlock(&polaris_smmu_pt_lock);
 	return ok;
+}
+
+static void
+polaris_smmu_unmap_locked(struct polaris_smmu_address_space *space, uint64_t address, uint64_t size)
+{
+	for (uint64_t offset = 0; offset < size; offset += POLARIS_SMMU_TABLE_BYTES) {
+		uint64_t iova = address + offset;
+		uint32_t l1_index = (uint32_t)(iova >> 30) & 0x1ffu;
+		uint32_t l2_index = (uint32_t)(iova >> 21) & 0x1ffu;
+		uint32_t l3_index = (uint32_t)(iova >> 12) & 0x1ffu;
+		struct polaris_smmu_table *l2, *l3;
+
+		if (space->root == NULL) {
+			break;
+		}
+		if (space->cached_l1_index == l1_index && space->cached_l2 != NULL &&
+		    space->root->entries[l1_index] == (space->cached_l2->phys | POLARIS_SMMU_PTE_TABLE)) {
+			l2 = space->cached_l2;
+		} else {
+			l2 = polaris_smmu_table_child(space->root, l1_index, false);
+			space->cached_l1_index = l1_index;
+			space->cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+			space->cached_l2 = l2;
+			space->cached_l3 = NULL;
+		}
+		if (l2 == NULL) {
+			continue;
+		}
+		if (space->cached_l1_index == l1_index && space->cached_l2_index == l2_index &&
+		    space->cached_l3 != NULL &&
+		    l2->entries[l2_index] == (space->cached_l3->phys | POLARIS_SMMU_PTE_TABLE)) {
+			l3 = space->cached_l3;
+		} else {
+			l3 = polaris_smmu_table_child(l2, l2_index, false);
+			space->cached_l2_index = l2_index;
+			space->cached_l3 = l3;
+		}
+		if (l3 != NULL && l3->entries[l3_index] != 0) {
+			l3->entries[l3_index] = 0;
+			l3->dirty = true;
+		}
+	}
+}
+
+static void
+polaris_smmu_space_unmap(struct polaris_smmu_address_space *space, uint64_t address, uint64_t size)
+{
+	if (space == NULL || size == 0 || address >= POLARIS_GPU_VA_END ||
+	    (address & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 ||
+	    (size & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 || size > POLARIS_GPU_VA_END - address) {
+		return;
+	}
+	lck_mtx_lock(&polaris_smmu_pt_lock);
+	polaris_smmu_unmap_locked(space, address, size);
+	polaris_smmu_commit_locked();
+	if (!polaris_smmu_tlbi(space)) {
+		/* A timed-out invalidation prevents safe IOVA reuse; keep the backend disabled. */
+		polaris_smmu_backend_faulted = true;
+		printf("adreno-sdm845: A630 backend disabled after %s SMMU TLB invalidation failure\n", space->name);
+	}
+	lck_mtx_unlock(&polaris_smmu_pt_lock);
+}
+
+static bool
+sdm845_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+{
+	return polaris_smmu_space_map_page(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], address, phys, read_only);
 }
 
 static void
@@ -1392,55 +1511,7 @@ sdm845_gpu_mapped(void)
 static void
 sdm845_gpu_unmap(uint64_t address, uint64_t size)
 {
-	if (size == 0 || address >= POLARIS_GPU_VA_END || (address & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 ||
-	    size > POLARIS_GPU_VA_END - address) {
-		return;
-	}
-	lck_mtx_lock(&polaris_smmu_pt_lock);
-	for (uint64_t offset = 0; offset < size; offset += POLARIS_SMMU_TABLE_BYTES) {
-		uint64_t iova = address + offset;
-		uint32_t l1_index = (uint32_t)(iova >> 30) & 0x1ffu;
-		uint32_t l2_index = (uint32_t)(iova >> 21) & 0x1ffu;
-		uint32_t l3_index = (uint32_t)(iova >> 12) & 0x1ffu;
-		struct polaris_smmu_table *l2, *l3;
-
-		if (polaris_smmu_root == NULL) {
-			break;
-		}
-		if (polaris_smmu_cached_l1_index == l1_index && polaris_smmu_cached_l2 != NULL &&
-		    polaris_smmu_root->entries[l1_index] == (polaris_smmu_cached_l2->phys | POLARIS_SMMU_PTE_TABLE)) {
-			l2 = polaris_smmu_cached_l2;
-		} else {
-			l2 = polaris_smmu_table_child(polaris_smmu_root, l1_index, false);
-			polaris_smmu_cached_l1_index = l1_index;
-			polaris_smmu_cached_l2_index = UINT32_MAX;
-			polaris_smmu_cached_l2 = l2;
-			polaris_smmu_cached_l3 = NULL;
-		}
-		if (l2 == NULL) {
-			continue;
-		}
-		if (polaris_smmu_cached_l1_index == l1_index && polaris_smmu_cached_l2_index == l2_index &&
-		    polaris_smmu_cached_l3 != NULL &&
-		    l2->entries[l2_index] == (polaris_smmu_cached_l3->phys | POLARIS_SMMU_PTE_TABLE)) {
-			l3 = polaris_smmu_cached_l3;
-		} else {
-			l3 = polaris_smmu_table_child(l2, l2_index, false);
-			polaris_smmu_cached_l2_index = l2_index;
-			polaris_smmu_cached_l3 = l3;
-		}
-		if (l3 != NULL && l3->entries[l3_index] != 0) {
-			l3->entries[l3_index] = 0;
-			l3->dirty = true;
-		}
-	}
-	polaris_smmu_commit_locked();
-	if (!polaris_smmu_tlbi_core()) {
-		/* A timed-out invalidation prevents safe IOVA reuse; keep the backend disabled. */
-		polaris_smmu_backend_faulted = true;
-		printf("adreno-sdm845: A630 backend disabled after SMMU TLB invalidation failure\n");
-	}
-	lck_mtx_unlock(&polaris_smmu_pt_lock);
+	polaris_smmu_space_unmap(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], address, size);
 }
 
 static void
@@ -1448,6 +1519,85 @@ sdm845_gpu_to_memory(void *start, uint64_t size)
 {
 	polaris_cache_lines((vm_offset_t)start, size);
 	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Prepare an HFI allocation and GMU-kernel page tables without attaching or enabling the SMMU. */
+static bool
+polaris_hfi_software_prepare(void)
+{
+	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL];
+	vm_size_t allocation_size;
+	vm_offset_t allocation = 0, uncached;
+	uint64_t phys;
+	uint64_t mapped = 0;
+
+	if (!polaris_smmu_supports_4k || polaris_smmu_oas_bits < 32 || polaris_smmu_oas_bits > 48 ||
+	    polaris_smmu_context_page_size == 0 || polaris_smmu_context_bank_count == 0) {
+		printf("adreno-sdm845: step 9 requires a validated SMMUv2 4-KiB stage-1 configuration\n");
+		return false;
+	}
+	if (polaris_hfi_allocation == 0) {
+		allocation_size = (vm_size_t)round_page(POLARIS_A630_HFI_ALLOCATION_BYTES);
+		if (allocation_size < POLARIS_A630_HFI_ALLOCATION_BYTES ||
+		    kmem_alloc_contig(kernel_map, &allocation, allocation_size, PAGE_MASK, 0, 0,
+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			printf("adreno-sdm845: step 9 could not allocate contiguous GMU HFI memory (%u bytes)\n",
+			    (uint32_t)POLARIS_A630_HFI_ALLOCATION_BYTES);
+			return false;
+		}
+		phys = kvtophys(allocation);
+		if ((phys & (POLARIS_SMMU_TABLE_BYTES - 1)) != 0 ||
+		    !polaris_smmu_phys_valid(phys, allocation_size)) {
+			kmem_free(kernel_map, allocation, allocation_size);
+			printf("adreno-sdm845: step 9 HFI allocation is outside the SMMU output address range or is misaligned\n");
+			return false;
+		}
+		for (vm_size_t offset = POLARIS_SMMU_TABLE_BYTES; offset < allocation_size;
+		    offset += POLARIS_SMMU_TABLE_BYTES) {
+			if (kvtophys(allocation + offset) != phys + offset) {
+				kmem_free(kernel_map, allocation, allocation_size);
+				printf("adreno-sdm845: step 9 HFI pages are not physically contiguous\n");
+				return false;
+			}
+		}
+		uncached = ml_io_map_wcomb((vm_offset_t)phys, allocation_size);
+		if (uncached == 0) {
+			kmem_free(kernel_map, allocation, allocation_size);
+			printf("adreno-sdm845: step 9 could not create a write-combined CPU mapping for HFI memory\n");
+			return false;
+		}
+		polaris_hfi_allocation = allocation;
+		polaris_hfi_allocation_size = allocation_size;
+		polaris_hfi_uncached = uncached;
+		polaris_hfi_physical = phys;
+	}
+	if (polaris_hfi_uncached == 0 || polaris_hfi_allocation_size < POLARIS_A630_HFI_ALLOCATION_BYTES ||
+	    !polaris_a630_hfi_init(&polaris_hfi_state, (volatile void *)polaris_hfi_uncached,
+	    polaris_hfi_allocation_size, POLARIS_A630_HFI_GMU_KERNEL_BASE)) {
+		printf("adreno-sdm845: step 9 A630 HFI table initialization failed\n");
+		return false;
+	}
+	if (!polaris_hfi_space_mapped) {
+		for (uint64_t offset = 0; offset < POLARIS_A630_HFI_ALLOCATION_BYTES;
+		    offset += POLARIS_SMMU_TABLE_BYTES) {
+			if (!polaris_smmu_space_map_page(space, POLARIS_A630_HFI_GMU_KERNEL_BASE + offset,
+			    polaris_hfi_physical + offset, false)) {
+				if (mapped != 0) {
+					polaris_smmu_space_unmap(space, POLARIS_A630_HFI_GMU_KERNEL_BASE, mapped);
+				}
+				printf("adreno-sdm845: step 9 could not construct the GMU-kernel HFI mappings\n");
+				return false;
+			}
+			mapped += POLARIS_SMMU_TABLE_BYTES;
+		}
+		sdm845_gpu_mapped();
+		polaris_hfi_space_mapped = true;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	printf("adreno-sdm845: step 9 GMU-kernel HFI software map: phys=%#llx, GMU VA=%#x, %u bytes; page tables are detached, no SMMU or GMU registers were written\n",
+	    polaris_hfi_physical, POLARIS_A630_HFI_GMU_KERNEL_BASE,
+	    (uint32_t)POLARIS_A630_HFI_ALLOCATION_BYTES);
+	return true;
 }
 
 /* GPUCC accesses can stall when its configuration AHB branch is halted. */
@@ -2570,9 +2720,23 @@ hakios_adreno_sdm845_init(void)
 		printf("adreno-sdm845: read-only RPMh discovery finished; no GPU acceleration was started\n");
 		return;
 	}
+	if (last_step == 9) {
+		printf("adreno-sdm845: step 9 prepares a detached GMU-kernel HFI software map; it runs steps 1..6 and skips PAS staging step 7\n");
+		for (uint32_t i = 0; i < 6; i++) {
+			if (!probes[i]()) {
+				printf("adreno-sdm845: step %u failed; HFI memory and page tables are not prepared\n", i + 1);
+				return;
+			}
+		}
+		if (!polaris_hfi_software_prepare()) {
+			printf("adreno-sdm845: step 9 failed; the SMMU context and GMU remain untouched\n");
+			return;
+		}
+		printf("adreno-sdm845: detached HFI software preparation finished; no SMMU context, HFI message, GMU startup, or rendering was enabled\n");
+		return;
+	}
 	if (last_step > sizeof(probes) / sizeof(probes[0])) {
-		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, and step 8 is the separate "
-		    "read-only RPMh probe; "
+		printf("adreno-sdm845: steps 1..6 are read-only, step 7 stages ZAP through PAS, step 8 probes RPMh, and step 9 prepares detached HFI memory; "
 		    "requested step %u is capped at %zu\n",
 		    last_step, sizeof(probes) / sizeof(probes[0]));
 		last_step = sizeof(probes) / sizeof(probes[0]);
