@@ -221,9 +221,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   [`adreno_pm4types.h`](https://android.googlesource.com/kernel/msm/%2B/android-8.1.0_r0.78/drivers/gpu/msm/adreno_pm4types.h)).
 - `adreno=16` runs read-only steps 1–6, then allocates and maps the validated SQE payload (after
   its 4-byte file prefix), a 32 KiB CP ring containing the 12-dword `CP_ME_INIT`, and a one-page
-  CP scratch/fence buffer into the detached GPU SID0 page table. All three buffers use SMMU
-  descriptors without unprivileged access; the SQE and ring are read-only and scratch is writable.
-  It cleans the CPU cache lines and commits the software page tables,
+  CP scratch/fence buffer into the detached GPU SID0 page table. The SQE and ring use ordinary
+  unprivileged, read-only SMMU mappings; the writable scratch is mapped only in the kernel GPU
+  root. This matches the Polaris A630v2 profile, which does not advertise APRIV. It cleans the CPU
+  cache lines and commits the software page tables,
   but does not attach SID0, write SMMU/GPU registers, start the SQE/CP, call PAS, or enable rendering.
   Buffers remain allocated for review until the backend stop path confirms that the 3D context
   is detached and the core is inactive. The 32 KiB ring size follows the A630 KGSL definitions
@@ -582,45 +583,52 @@ firmware/HFI startup and initial ARC/DCVS requests are staged, while complete CX
 hardware validation of GMU-user/3D SMMU attachment, hardware-validated orderly stop and quiesce,
 recovery and thermal hooks are still missing. The orderly stop path handles the fully initialized
 kernel-owned fence stage, but has not been run on a phone.
-The A630 backend now has dormant `submit`, `done`, `last`, and `report` callbacks: submit builds
-the A6xx CCU-invalidate / `CP_INDIRECT_BUFFER_PFE` / `CACHE_FLUSH_TS` sequence, validates each IB
-against the client IOVA aperture, handles ring wrap and bounded space polling, and keeps the
-completion word in the private RPTR allocation. These callbacks remain unreachable from the public
-service because the current `ready()` gate requires an active SID0 context, ready/sealed GMU/HFI,
-GPU OOB/core setup, authenticated PAS/ZAP, initialized CP in unsecured mode, and the completed
-step 21 fence smoke test. The separate backend-enabled flag still has no writer, so `ready()` stays
-false. No callback falls through into Redwood's SMMUv500 or register state.
+The A630 backend has dormant `submit`, `done`, `last`, and `report` callbacks for its kernel-root
+fence path. `submit()` now rejects every client address-space handle: without APRIV, writing the
+completion scratch while the CP uses a client root would make that writable page available to the
+client IB too. The client roots currently map only SQE and ring pages, both unprivileged and
+read-only; writable scratch remains in the kernel GPU root. Public calls also remain blocked by
+the `ready()` gate, which requires an active SID0 context, ready/sealed GMU/HFI, GPU OOB/core setup,
+authenticated PAS/ZAP, initialized CP in unsecured mode, and the completed step 21 fence smoke
+test. The separate backend-enabled flag still has no writer, so `ready()` stays false. No callback
+falls through into Redwood's SMMUv500 or register state.
 
 The shared service now passes an opaque address-space handle through client create/destroy,
 map/commit/unmap and submit. Polaris allocates up to 64 client roots with ASIDs 4–67; client BOs
-are mapped only in that client's root, while each root maps the kernel SQE, ring and fence pages
-at the same privileged-only IOVAs. The A6xx submit packet switches SID0 from the trusted ring
-using `CP_SMMU_TABLE_UPDATE` (TTBR0, ASID, ContextIDR and context-bank number) before dispatching
-the client's IBs, then invalidates GPU caches. It disables CP register protection around the
-trusted table update and restores it before the client IBs, following the upstream A6xx context
-switch sequence
+are mapped only in that client's root, while each root maps SQE and ring pages as unprivileged,
+read-only mappings. The writable RPTR/fence scratch is absent from client roots. The dormant packet
+builder retains the upstream A6xx `CP_SMMU_TABLE_UPDATE` sequence, but client submissions are
+rejected before reaching it until completion can be written after returning to the kernel root.
+Polaris A630v2 does not advertise `ADRENO_APRIV`. Matching KGSL allocates its CP ring and SQE
+microcode as GPU-read-only without the privileged-memory flag, so ordinary read-only CP-fetch
+mappings match that driver's A630v2 memory policy
+([Polaris `adreno-gpulist.h`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno-gpulist.h),
+[`adreno_ringbuffer.c`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno_ringbuffer.c),
+[`adreno_a6xx.c`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno_a6xx.c)).
+The reference A6xx context-switch sequence is documented in
 ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
 [`adreno_iommu.c`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_iommu.c)).
-Client close queues and waits for a trusted switch back to the kernel root before reclaiming the
-client root. If client BO fences or that switch cannot be proven complete, the mappings and root
-are retained. The protected-mode bracket is paired with an inspection of the local A630 SQE image
+Client submission is still rejected, so a client root cannot be in flight through the public path.
+The destroy hook reclaims it only after a kernel-root fence and complete unmap; otherwise it retains
+the mappings and root. The protected-mode bracket is paired with an inspection of the local A630 SQE image
 (`fw-gpu/a630_sqe.fw`, version `0x016ee19a`) using Mesa 25.0.7's `afuc-disasm`. Its IB dispatcher
 tracks nesting depth in `$12`: the ring starts at level 0, `CP_INDIRECT_BUFFER` increments the level
 before entering an IB, and `IN_IB_END` decrements it. The `CP_SET_PROTECTED_MODE` handler at SQE word
 `0x376` and `CP_SMMU_TABLE_UPDATE` handler at word `0x92c` both branch to the `CP_NOP` packet-skip
 path when `$12 != 0`. This confirms that client IBs cannot use those two packets to change CP
 register-protection mode or SID0's translation table in this firmware image. The inspection is
-source-level evidence only: retain the public-client gate until privileged-page isolation, the SQE
+source-level evidence only: retain the public-client gate until no-APRIV CP-page isolation, the SQE
 guard, and the switch/teardown path have been validated on Polaris hardware.
 
 GPU VA allocation and release now dispatch through the selected backend too. Polaris has a
 software-only, locked 32-bit IOVA allocator. Backend SQE/ring/RPTR buffers use the private range
 `[0x00010000, 0x40000000)`; the shared service receives client allocations only from
 `[0x40000000, 0x100000000)`. Both allocators round to 64-KiB extents and accept exact frees. This
-address partition complements per-client stage-1 roots: each root contains the backend mappings
-and only one client's BOs. The implementation builds on the 4K LPAE tables and active SID0 context.
-User submissions remain disabled until privileged-page isolation and runtime command submission
-are validated on the device.
+address partition complements per-client stage-1 roots: each root contains read-only CP fetch pages
+and only one client's BOs; writable completion scratch is kernel-root-only. The implementation
+builds on the 4K LPAE tables and active SID0 context. User submissions remain disabled until ring
+confidentiality, completion after return to the kernel root, and runtime command submission are
+validated on the device.
 
 The table descriptor format follows the existing project mapper and the ARM LPAE definitions in
 upstream Linux [`io-pgtable-arm.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c).
@@ -683,12 +691,12 @@ command isolation review, and bounded hardware submission checks.
    of these write stages has been run. Verify the Apps RSC transaction, sustained bandwidth/DCVS
    behavior, GX sequencing, core readbacks, CP idle/error status, fence visibility and PAS cleanup
    against Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. The dormant
-   production ring/fence callbacks are now implemented from the upstream A6xx submit ordering
-   ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)); they have not been exercised on hardware. Next validate the packets,
-   fence visibility, register protection and ring mappings on Polaris, then implement and validate
-   orderly stop path before accepting client submissions; validate loader-return quiesce and add
-   orderly partial-start cleanup. The stop path does not yet remove all inherited CX/GMU
-   parent-domain and clock votes.
+   kernel-owned fence path is implemented, but the client submit callback now rejects client
+   handles until it can complete after returning to the kernel root. Next validate the packets,
+   fence visibility, register protection and read-only ring mappings on Polaris; then implement a
+   no-APRIV client path with ring confidentiality and safe completion. Validate the orderly stop
+   path before accepting submissions; validate loader-return quiesce and add orderly partial-start
+   cleanup. The stop path does not yet remove all inherited CX/GMU parent-domain and clock votes.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; orderly stop and loader-return quiesce are validated on the phone.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -703,16 +711,18 @@ command isolation review, and bounded hardware submission checks.
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
    verify steps 19–21's bounded SQE/CP bootstrap, ZAP authentication, secure-mode transition and
-   kernel fence write, then validate production register protection, ring/fence mappings and mapper
-   behavior and the normal-stop path. Qualcomm's
+   kernel fence write, then implement a no-APRIV client path with ring confidentiality and a
+   completion proof after the client root is no longer active. Validate production register
+   protection, ring/fence mappings and mapper behavior and the normal-stop path. Qualcomm's
    A630 KGSL path sets the SQE base and authenticates ZAP through PIL before releasing SQE halt,
    submits `CP_ME_INIT`, then uses `CP_SET_SECURE_MODE(0)` to leave secure mode
    ([`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c),
    [`adreno.c`](https://android.googlesource.com/kernel/msm/%2B/604f9dc59bcb86b3967048ebe36c48aff59b2592/drivers/gpu/msm/adreno.c),
    [`adreno_ringbuffer.c`](https://android.googlesource.com/kernel/msm/%2B/3a9ea3d5335330e66dc313253c055442c9db7b8e/drivers/gpu/msm/adreno_ringbuffer.c)). Keep the backend disabled
    until those pieces are verified.
-   **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
-   command buffers; bounded test commands complete and write back expected data.
+   **Gate:** invalid IOVAs fault; client IBs cannot write SQE/ring or access the kernel fence page;
+   commands from one client cannot inspect another client's ring contents; bounded test commands
+   complete and write back expected data.
 6. **End-to-end rendering.** Expose the A630 profile through HakiosGPU; exercise Mesa/freedreno
    buffer allocation, mappings, command submission, synchronization, surfaces and display; then
    exercise the Metal client on the same service where supported. Add hang timeout/recovery and
@@ -748,19 +758,19 @@ command isolation review, and bounded hardware submission checks.
   client-memory isolation on the actual phone.
 - Do not assume CP APRIV can separate kernel and client mappings on this device. The Polaris
   SDM845 kernel's `a630v2` catalog entries omit `ADRENO_APRIV`, and its A6xx ring startup path does
-  not program `CP_APRIV_CNTL`
+  not program `CP_APRIV_CNTL`. Matching KGSL allocates its CP ring and SQE microcode as
+  GPU-read-only without the privileged-memory flag
   ([Polaris `adreno-gpulist.h`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno-gpulist.h),
+  [Polaris `adreno_ringbuffer.c`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno_ringbuffer.c),
   [Polaris `adreno_a6xx.c`](https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/lineage-22.0/drivers/gpu/msm/adreno_a6xx.c)).
-  This is evidence that KGSL does not rely on APRIV for this profile; it does not by itself prove
-  whether the A630 emits privileged transactions or whether the SMMU enforces the descriptor
-  distinction for CP fetches. The current kernel-owned SQE, ring and scratch mappings therefore do
-  not yet demonstrate client isolation. `CP_RB_CNTL_NO_UPDATE` disables CP writes to the RPTR
-  shadow, per-client roots map each client's BOs separately, and the local SQE guards
-  `CP_SMMU_TABLE_UPDATE` and `CP_SET_PROTECTED_MODE` inside IBs, but these checks do not close the
-  privilege-boundary question. Keep the userclient gate closed until CP/SMMU privilege behavior,
-  broader command isolation, and the switch/teardown path are validated on Polaris hardware; if
-  privileged-only mappings are not enforceable for CP, redesign the CP-visible shared pages and
-  completion proof before enabling submissions.
+  This supports ordinary read-only mappings for CP fetches; it does not provide client isolation
+  because a client IB can still read the shared SQE/ring pages. The kernel-owned SQE and ring now
+  use unprivileged read-only mappings; writable RPTR/fence scratch is mapped only in the kernel GPU
+  root and omitted from client roots. This also does not provide safe asynchronous completion by
+  itself. The userclient submit callback now rejects all client handles; the public gate also
+  remains closed. The local SQE guards `CP_SMMU_TABLE_UPDATE` and
+  `CP_SET_PROTECTED_MODE` inside IBs, but broader command isolation and safe context-switch/teardown
+  behavior still require hardware validation.
 - A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence
   stage and is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
   legacy-HFI slumber; it then checks GMU/CX/GX state, asserts CM3 reset, shuts down PAS, detaches
