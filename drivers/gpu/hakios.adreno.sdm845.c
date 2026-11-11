@@ -5652,7 +5652,8 @@ sdm845_gpu_stop(void)
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active;
 
 	/* This hook is reachable before ready(); preserve every resource the hardware may still use. */
-	if (polaris_gmu_firmware_started || polaris_gmu_hfi_ready || polaris_gmu_domain_ready ||
+	/* `domain_ready` records that CX/GMU were already available at probe time; it is not a live vote. */
+	if (polaris_gmu_firmware_started || polaris_gmu_hfi_ready ||
 	    polaris_gmu_boot_rail_active || polaris_gmu_temp_bus_vote_active || polaris_gpu_oob_active ||
 	    polaris_gpu_core_ready || polaris_gpu_core_configured || polaris_gpu_cp_started ||
 	    polaris_gpu_cp_initialized || polaris_pas_image_active || smmu_contexts_active) {

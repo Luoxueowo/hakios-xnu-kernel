@@ -691,9 +691,12 @@ bounded hardware submission checks.
 - Do not assume CP APRIV can separate kernel and client mappings on this device: Qualcomm's KGSL
   `a630v2` catalog entry does not advertise `ADRENO_APRIV`, unlike the deprecated A630v1 profile
   ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)). The current IOVA ranges are disjoint but share the same SID0 page table; a safe command-stream/private-memory isolation design remains a readiness blocker.
-- A630 shutdown after SQE startup: the current stop hook conservatively retains hardware votes,
-  PAS and buffers. Implement and validate the GMU idle/slumber and CP stop/reset sequence before
-  enabling client submissions or claiming recoverable power-down. Upstream A6xx shutdown checks
+- A630 shutdown after SQE startup: the current stop hook releases CP buffers only when the GPU,
+  GMU, PAS and all SMMU contexts are inactive. `gmu_domain_ready` is an initial availability
+  observation, not a live hardware vote, so it no longer blocks release of buffers that are only
+  mapped in a detached software page table. The hook still retains hardware votes, PAS and buffers
+  whenever hardware may use them. Implement and validate the GMU idle/slumber and CP stop/reset
+  sequence before enabling client submissions or claiming recoverable power-down. Upstream A6xx shutdown checks
   GMU idle, clears pending bus transactions, requests slumber, then stops HFI/interrupts and removes
   RPMh, power-domain, and clock votes; a separate force-off path handles a hung GMU. See Qualcomm's
   [`a6xx_gmu.c`](https://android.googlesource.com/kernel/common/%2B/0d534518ce87317e884dbd1485111b0f1606a194/drivers/gpu/drm/msm/adreno/a6xx_gmu.c).
