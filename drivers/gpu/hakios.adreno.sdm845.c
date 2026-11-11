@@ -160,12 +160,23 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define SMMU_IDR7_VERSION_MASK          0x0fu
 #define SMMU_SMR(n)                     (0x0800u + 4u * (n))
 #define SMMU_SMR_VALID                  (1u << 31)
+#define SMMU_SMR_ID_MASK                0x7fffu
+#define SMMU_SMR_MASK_SHIFT             16u
+#define SMMU_SMR_MASK_MASK              0x7fffu
 #define SMMU_S2CR(n)                    (0x0c00u + 4u * (n))
 #define SMMU_S2CR_TYPE_SHIFT            16
+#define SMMU_S2CR_TYPE_MASK              0x3u
+#define SMMU_S2CR_TYPE_TRANS             0u
+#define SMMU_S2CR_TYPE_BYPASS            1u
+#define SMMU_S2CR_TYPE_FAULT             2u
 #define SMMU_S2CR_CBNDX_MASK            0xffu
 #define SMMU_GR1                       0x1000u
 #define SMMU_CBAR(n)                    (SMMU_GR1 + 4u * (n))
 #define SMMU_CBA2R(n)                   (SMMU_GR1 + 0x0800u + 4u * (n))
+#define SMMU_CBAR_TYPE_SHIFT             16u
+#define SMMU_CBAR_TYPE_MASK              0x3u
+#define SMMU_CBAR_TYPE_S1_S2_BYPASS      1u
+#define SMMU_CBA2R_RW64                  (1u << 0)
 #define SMMU_CB_SCTLR                   0x0000u
 #define SMMU_CB_TCR2                    0x0010u
 #define SMMU_CB_TTBR0                   0x0020u
@@ -255,6 +266,13 @@ static uint32_t polaris_smmu_core_context;
 static uint32_t polaris_smmu_core_asid;
 static uint32_t polaris_smmu_stream_ids[POLARIS_SMMU_MAX_STREAM_IDS];
 static uint32_t polaris_smmu_stream_count;
+struct polaris_smmu_stream_route {
+	uint32_t stream_id;
+	uint32_t slot;
+	uint32_t s2cr;
+	uint32_t matches;
+};
+static struct polaris_smmu_stream_route polaris_smmu_stream_routes[POLARIS_SMMU_MAX_STREAM_IDS];
 struct polaris_zap_segment {
 	uint32_t paddr;
 	uint32_t file_size;
@@ -1472,6 +1490,130 @@ probe_gpucc(void)
 	return true;
 }
 
+static const char *
+polaris_smmu_stream_name(uint32_t stream_id)
+{
+	switch (stream_id) {
+	case 0: return "3D user";
+	case 1: return "3D secure A";
+	case 2: return "3D secure B";
+	case 4: return "GMU user";
+	case 5: return "GMU kernel";
+	default: return "unlabelled";
+	}
+}
+
+static const char *
+polaris_smmu_s2cr_type_name(uint32_t type)
+{
+	switch (type) {
+	case SMMU_S2CR_TYPE_TRANS: return "translation";
+	case SMMU_S2CR_TYPE_BYPASS: return "bypass";
+	case SMMU_S2CR_TYPE_FAULT: return "fault";
+	default: return "reserved";
+	}
+}
+
+static const char *
+polaris_smmu_cbar_type_name(uint32_t type)
+{
+	switch (type) {
+	case 0: return "stage-2";
+	case SMMU_CBAR_TYPE_S1_S2_BYPASS: return "stage-1/S2-bypass";
+	case 2: return "stage-1/S2-fault";
+	case 3: return "stage-1/S2-translation";
+	default: return "reserved";
+	}
+}
+
+static void
+polaris_smmu_routes_reset(void)
+{
+	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
+		polaris_smmu_stream_routes[i].stream_id = polaris_smmu_stream_ids[i];
+		polaris_smmu_stream_routes[i].slot = UINT32_MAX;
+		polaris_smmu_stream_routes[i].s2cr = 0;
+		polaris_smmu_stream_routes[i].matches = 0;
+	}
+}
+
+static void
+polaris_smmu_route_record(uint32_t stream_id, uint32_t slot, uint32_t s2cr)
+{
+	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
+		struct polaris_smmu_stream_route *route = &polaris_smmu_stream_routes[i];
+
+		if (route->stream_id != stream_id) {
+			continue;
+		}
+		if (route->matches == 0) {
+			route->slot = slot;
+			route->s2cr = s2cr;
+		}
+		route->matches++;
+	}
+}
+
+static bool
+polaris_smmu_route_context(uint32_t context_bank, uint32_t *cbar_out, uint32_t *cba2r_out,
+	uint32_t *sctlr_out)
+{
+	uint64_t context_offset;
+
+	if (smmu.virtual == 0 || polaris_smmu_context_page_size == 0 ||
+	    context_bank >= polaris_smmu_context_bank_count) {
+		return false;
+	}
+	context_offset = (uint64_t)polaris_smmu_context_base +
+	    (uint64_t)context_bank * polaris_smmu_context_page_size;
+	if (context_offset + polaris_smmu_context_page_size > smmu.size || context_offset > UINT32_MAX) {
+		return false;
+	}
+	*cbar_out = probe_read(&smmu, SMMU_CBAR(context_bank));
+	*cba2r_out = probe_read(&smmu, SMMU_CBA2R(context_bank));
+	*sctlr_out = probe_read(&smmu, (uint32_t)context_offset + SMMU_CB_SCTLR);
+	return true;
+}
+
+static void
+polaris_smmu_routes_report(void)
+{
+	for (uint32_t i = 0; i < polaris_smmu_stream_count; i++) {
+		const struct polaris_smmu_stream_route *route = &polaris_smmu_stream_routes[i];
+		uint32_t type;
+
+		if (route->matches == 0) {
+			printf("adreno-sdm845: SMMU SID %u (%s): no active stream route matched\n", route->stream_id,
+			    polaris_smmu_stream_name(route->stream_id));
+			continue;
+		}
+		if (route->matches != 1) {
+			printf("adreno-sdm845: SMMU SID %u (%s): %u SMR entries match; route is ambiguous\n",
+			    route->stream_id, polaris_smmu_stream_name(route->stream_id), route->matches);
+			continue;
+		}
+		type = (route->s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK;
+		printf("adreno-sdm845: SMMU SID %u (%s): slot %u routes to %s",
+		    route->stream_id, polaris_smmu_stream_name(route->stream_id), route->slot,
+		    polaris_smmu_s2cr_type_name(type));
+		if (type == SMMU_S2CR_TYPE_TRANS) {
+			uint32_t context_bank = route->s2cr & SMMU_S2CR_CBNDX_MASK;
+			uint32_t cbar, cba2r, sctlr;
+
+			if (!polaris_smmu_route_context(context_bank, &cbar, &cba2r, &sctlr)) {
+				printf(" via CB%u; context-bank registers are unavailable\n", context_bank);
+				continue;
+			}
+			printf(" via CB%u (CBAR %s VMID=%u, CBA2R=%#x%s, SCTLR=%#x%s)\n", context_bank,
+			    polaris_smmu_cbar_type_name((cbar >> SMMU_CBAR_TYPE_SHIFT) & SMMU_CBAR_TYPE_MASK),
+			    cbar & 0xffu, cba2r, (cba2r & SMMU_CBA2R_RW64) ? " 64-bit" : " 32-bit", sctlr,
+			    (sctlr & SMMU_SCTLR_M) ? " translation-on" : " translation-off");
+		} else {
+			printf(" (S2CR=%#x)\n", route->s2cr);
+		}
+	}
+}
+
 static void
 probe_smmu_contexts(uint32_t idr1)
 {
@@ -1484,6 +1626,9 @@ probe_smmu_contexts(uint32_t idr1)
 	uint64_t context_end = context_base + (uint64_t)page_size * context_banks;
 	uint32_t active = 0;
 
+	polaris_smmu_context_page_size = 0;
+	polaris_smmu_context_base = 0;
+	polaris_smmu_context_bank_count = 0;
 	/* IDR1 sizes the split global/context-bank register apertures; never probe beyond DT reg. */
 	if (context_banks == 0 || (uint64_t)SMMU_CB_TLBSTATUS + sizeof(uint32_t) > page_size ||
 	    context_base > smmu.size || context_end > smmu.size ||
@@ -1540,7 +1685,7 @@ static bool
 probe_smmu(void)
 {
 	uint32_t cx, memnoc, idr0, idr1, idr2, idr7;
-	uint32_t stream_groups, context_banks, s2_context_banks, sid_bits;
+	uint32_t stream_groups, context_banks, s2_context_banks, sid_bits, sid_mask;
 	uint32_t page_shift, major, minor;
 
 	if (!probe_gpucc_bus("step 2") || !map_block(&gpucc)) {
@@ -1572,6 +1717,7 @@ probe_smmu(void)
 	s2_context_banks = (idr1 >> SMMU_IDR1_NUMS2CB_SHIFT) & SMMU_IDR1_NUMCB_MASK;
 	sid_bits = (idr0 & SMMU_IDR0_EXIDS) ? 16 :
 	    ((idr0 >> SMMU_IDR0_NUMSIDB_SHIFT) & SMMU_IDR0_NUMSIDB_MASK);
+	sid_mask = sid_bits >= 16 ? 0xffffu : ((1u << sid_bits) - 1u);
 	page_shift = (idr1 & SMMU_IDR1_PAGESIZE_64K) ? 16 : 12;
 	major = (idr7 >> SMMU_IDR7_MAJOR_SHIFT) & SMMU_IDR7_VERSION_MASK;
 	minor = idr7 & SMMU_IDR7_VERSION_MASK;
@@ -1590,6 +1736,7 @@ probe_smmu(void)
 	    (unsigned)!!(idr2 & SMMU_IDR2_PTFS_16K), (unsigned)!!(idr2 & SMMU_IDR2_PTFS_64K));
 	polaris_smmu_oas_bits = smmu_id_size_to_bits((idr2 >> SMMU_IDR2_OAS_SHIFT) & SMMU_IDR2_SIZE_MASK);
 	polaris_smmu_supports_4k = (idr0 & SMMU_IDR0_S1TS) != 0 && (idr2 & SMMU_IDR2_PTFS_4K) != 0;
+	polaris_smmu_routes_reset();
 	printf("adreno-sdm845: SMMU stage-1 table prerequisites: 4K=%s, OAS=%u bits\n",
 	    polaris_smmu_supports_4k ? "supported" : "unavailable", polaris_smmu_oas_bits);
 	if (idr0 & SMMU_IDR0_SMS) {
@@ -1601,14 +1748,24 @@ probe_smmu(void)
 		} else {
 			for (uint32_t i = 0; i < stream_groups; i++) {
 				uint32_t smr = probe_read(&smmu, SMMU_SMR(i));
-				uint32_t s2cr;
+				uint32_t s2cr, stream_id_field, stream_mask;
 
 				if (!(smr & SMMU_SMR_VALID)) {
 					continue;
 				}
 				s2cr = probe_read(&smmu, SMMU_S2CR(i));
+				stream_id_field = smr & SMMU_SMR_ID_MASK;
+				stream_mask = (smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK;
 				printf("adreno-sdm845: SMMU SMR[%u]=%#x S2CR=%#x type=%u context-bank=%u\n", i, smr, s2cr,
 				    (s2cr >> SMMU_S2CR_TYPE_SHIFT) & 3u, s2cr & SMMU_S2CR_CBNDX_MASK);
+
+				for (uint32_t j = 0; j < polaris_smmu_stream_count; j++) {
+					uint32_t stream_id = polaris_smmu_stream_ids[j];
+
+					if (((stream_id ^ stream_id_field) & sid_mask & ~stream_mask) == 0) {
+						polaris_smmu_route_record(stream_id, i, s2cr);
+					}
+				}
 			}
 		}
 	} else if (sid_bits <= 16) {
@@ -1624,9 +1781,11 @@ probe_smmu(void)
 			s2cr = probe_read(&smmu, SMMU_S2CR(sid));
 			printf("adreno-sdm845: SMMU SID %u S2CR=%#x type=%u context-bank=%u\n", sid, s2cr,
 			    (s2cr >> SMMU_S2CR_TYPE_SHIFT) & 3u, s2cr & SMMU_S2CR_CBNDX_MASK);
+			polaris_smmu_route_record(sid, sid, s2cr);
 		}
 	}
 	probe_smmu_contexts(idr1);
+	polaris_smmu_routes_report();
 	return true;
 }
 

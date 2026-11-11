@@ -123,9 +123,13 @@ SMMU physical base. KGSL's device-tree binding describes this property and notes
 targets instead use a separate SMMU register aperture ([binding](https://android.googlesource.com/kernel/msm/+/e92ad0d204333c5b5dceb9d1573a71a49a713db6/Documentation/devicetree/bindings/gpu/adreno-iommu.txt)).
 The read-only probe decodes the SMMU ID registers and current stream-routing registers using the
 ARM SMMUv2 register layout cross-checked against upstream Linux [`arm-smmu.h`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)
-and [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
-The probe calculates the context-bank aperture as `2^(NUMPAGENDXB+1) * register-page-size` and
-checks it against the device-tree `reg` extent before reading context registers.
+and Qualcomm's [`arm-smmu.c`](https://android.googlesource.com/kernel/msm/+/ac6e850d96251d8cd68bd1049009a04e9d5354a6/drivers/iommu/arm-smmu.c).
+For the DT-validated stream IDs, step 2 correlates stream-match IDs/masks to S2CR slots (or reads
+the SID-indexed S2CR directly), then reports the unique route, target CB's CBAR type, CBA2R width,
+and SCTLR translation state. Multiple matching SMRs are reported as ambiguous. This remains a
+read-only snapshot; it does not claim that a route is safe to adopt or program. The probe calculates
+the context-bank aperture as `2^(NUMPAGENDXB+1) * register-page-size` and checks it against the
+device-tree `reg` extent before reading context registers.
 The v2 SMMU at `0x05040000` is not interchangeable with the Redwood driver's SMMUv500 at
 `0x03da0000`.
 
