@@ -230,9 +230,9 @@ allow it. A successful firmware boot alone is not a completed driver.
   It stops before SQE/ring register programming, `CP_ME_INIT`, ZAP authentication or submission.
   This write stage has not been run on the phone; `ready()` remains false.
 - `adreno=19` repeats the guarded GMU/GX startup and step 18 core setup, programs the SQE,
-  read-only 32-KiB CP ring and writable RPTR page, then releases SQE halt and publishes the
-  12-dword `CP_ME_INIT` packet. Before releasing SQE halt, it restages the validated ZAP image and
-  calls PAS `AUTH_AND_RESET`; an authenticated image remains active until GPU shutdown. It verifies
+  read-only 32-KiB CP ring and writable RPTR page, then restages the validated ZAP image and calls
+  PAS `AUTH_AND_RESET` before releasing SQE halt and publishing the 12-dword `CP_ME_INIT` packet.
+  An authenticated image remains active until GPU shutdown. It verifies
   the programmed IOVAs and ring control, verifies the published WPTR, then waits up to two seconds
   for RPTR to retire the packet, RBBM CP/AHB busy bits to clear, and CP error, hardware-fault and
   protection status to stay clear. Failures fault the backend and retain buffers and power for
@@ -241,6 +241,13 @@ allow it. A successful firmware boot alone is not a completed driver.
   the ring-size definition in [`adreno_a6xx.h`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_a6xx.h).
   Secure mode remains enabled; `CP_SET_SECURE_MODE(0)`, fences and user submissions are not
   attempted. This write stage has not been run on the phone; `ready()` remains false.
+- `adreno=20` repeats the guarded GMU/GX/core/ZAP/CP bootstrap, verifies CP is idle at RPTR/WPTR
+  12, appends the two-dword A630 `CP_SET_SECURE_MODE(0)` packet, publishes WPTR 14, and waits up
+  to two seconds for RPTR 14, CP/AHB idle, and clear CP error/fault/protection state. Any mismatch
+  faults the backend and leaves ordinary command submission disabled. This matches Qualcomm's
+  `adreno_set_unsecured_mode()` call after `a6xx_send_cp_init()` in [`adreno.c`](https://android.googlesource.com/kernel/msm/%2B/604f9dc59bcb86b3967048ebe36c48aff59b2592/drivers/gpu/msm/adreno.c) and the `CP_SET_SECURE_MODE` packet helper in [`adreno_ringbuffer.c`](https://android.googlesource.com/kernel/msm/%2B/3a9ea3d5335330e66dc313253c055442c9db7b8e/drivers/gpu/msm/adreno_ringbuffer.c).
+  It still does not enable fences, user submissions or rendering. This write stage has not been run
+  on the phone; `ready()` remains false.
 
 ## Polaris hardware facts
 
@@ -559,14 +566,14 @@ bring-up and a bounded test submission.
    validated from runtime DT; an explicit read-only step 8 inspects the TCS and CX/GFX ARC tables.
    The A630 GMU/HFI bootstrap, temporary startup DDR TCS vote, `PERF_TBL`, `BW_VOTE_TBL`, initial
    boot-rail OOB, and default DCVS stages are implemented behind explicit `adreno=12`/`adreno=13`/
-   `adreno=14`, but none has been run on hardware. Steps 17–19 now add the A630 GMU GPU OOB
+   `adreno=14`, but none has been run on hardware. Steps 17–20 now add the A630 GMU GPU OOB
    request, GX/GFX3D verification, core HWCG/VBIF/UCHE defaults, CP register protection, and a
-   bounded SQE/`CP_ME_INIT` startup with idle/error readbacks; none of these write stages has been
-   run. Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior, GX sequencing, core
-   readbacks and CP idle/error status against Polaris before proceeding. Keep step 7 limited to PAS
-   staging and shutdown. Step 19 now authenticates ZAP before SQE startup; next implement the
-   `CP_SET_SECURE_MODE(0)` transition in the A630 order and verify CP idle plus PAS, GMU, GPU OOB
-   and power-state cleanup on failure.
+   bounded SQE/`CP_ME_INIT` startup, PAS ZAP authentication before SQE release, and the
+   `CP_SET_SECURE_MODE(0)` transition with idle/error readbacks; none of these write stages has
+   been run. Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior, GX sequencing,
+   core readbacks, CP idle/error status and PAS cleanup against Polaris before proceeding. Keep
+   step 7 limited to PAS staging and shutdown. Next implement production ring/fence management and
+   recoverable power-down before accepting submissions.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -580,14 +587,13 @@ bring-up and a bounded test submission.
    any SMMU write stage has
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
-   verify step 19's bounded SQE/CP bootstrap ring and ZAP authentication, send
-   `CP_SET_SECURE_MODE(0)`, and wait for CP idle before ordinary command submission. Qualcomm's
+   verify steps 19–20's bounded SQE/CP bootstrap, ZAP authentication and secure-mode transition,
+   production register protection, ring/fence mappings and mapper behavior. Qualcomm's
    A630 KGSL path sets the SQE base and authenticates ZAP through PIL before releasing SQE halt,
-   submits `CP_ME_INIT`, then uses the CP packet to leave secure mode
-   ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/68a00586559f5fce3bb163f4618f1b71ef05b4e7/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
-   [`adreno_gpu.c`](https://android.googlesource.com/kernel/common/%2B/19b68814b1cd60c40546f31f7cc5b7895c0b013b/drivers/gpu/drm/msm/adreno/adreno_gpu.c)).
-   Continue with production register protection, ring/fence mappings and mapper validation. Keep
-   the backend disabled
+   submits `CP_ME_INIT`, then uses `CP_SET_SECURE_MODE(0)` to leave secure mode
+   ([`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c),
+   [`adreno.c`](https://android.googlesource.com/kernel/msm/%2B/604f9dc59bcb86b3967048ebe36c48aff59b2592/drivers/gpu/msm/adreno.c),
+   [`adreno_ringbuffer.c`](https://android.googlesource.com/kernel/msm/%2B/3a9ea3d5335330e66dc313253c055442c9db7b8e/drivers/gpu/msm/adreno_ringbuffer.c)). Keep the backend disabled
    until those pieces are verified.
    **Gate:** invalid IOVAs fault; protected kernel ring/fence pages cannot be overwritten by user
    command buffers; bounded test commands complete and write back expected data.

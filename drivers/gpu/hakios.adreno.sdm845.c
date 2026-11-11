@@ -14,12 +14,10 @@
  * detached GPU SID0 page table; adreno=17 maps those buffers, starts GMU/HFI, then requests GX
  * power through the A630 GPU OOB and verifies the GFX3D clock. Step 18 repeats that guarded startup
  * then programs A630 HWCG, VBIF, UCHE, CP defaults, and protected-register ranges. Step 19
- * authenticates ZAP before SQE/CP startup; the secure-mode transition and user submissions remain
- * later stages.
+ * authenticates ZAP before SQE/CP startup; step 20 submits CP_SET_SECURE_MODE(0) and waits for idle.
+ * User submissions, fences, runtime GPU DCVS, and rendering remain later stages.
  * Write stages are guarded by runtime preflight/readbacks and are not to be invoked on hardware
- * during this bring-up. Step 19 authenticates ZAP before SQE release; CP_SET_SECURE_MODE,
- * command submission, runtime GPU DCVS,
- * and rendering are still unavailable, so `ready()` remains false.
+ * during this bring-up. `ready()` remains false.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
  *   qcom,gpucc@5090000 (qcom,gpucc-sdm845-v2)
@@ -652,6 +650,7 @@ static bool polaris_gpu_core_ready;
 static bool polaris_gpu_core_configured;
 static bool polaris_gpu_cp_started;
 static bool polaris_gpu_cp_initialized;
+static bool polaris_gpu_unsecured_mode;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
 static bool polaris_sqe_safe;
@@ -5727,6 +5726,84 @@ fault:
 	return false;
 }
 
+/* Leave secure mode only after PAS authenticated ZAP and CP_ME_INIT retired. */
+static bool
+polaris_a630_cp_set_unsecured_mode(void)
+{
+	uint32_t cp_init[A630_CP_INIT_PACKET_DWORDS];
+	uint32_t secure_mode[A630_CP_SECURE_MODE_DWORDS];
+	uint32_t ring_rptr, ring_wptr, cp_interrupts, cp_fault, protect_status, rbbm_status;
+	uint32_t packet_offset = A630_CP_INIT_PACKET_DWORDS * sizeof(uint32_t);
+	uint32_t target_rptr = A630_CP_INIT_PACKET_DWORDS + A630_CP_SECURE_MODE_DWORDS;
+
+	printf("adreno-sdm845: step 20: submit CP_SET_SECURE_MODE(0) through the authenticated CP ring\n");
+	if (polaris_gpu_unsecured_mode) {
+		printf("adreno-sdm845: step 20 GPU is already in unsecured mode\n");
+		return true;
+	}
+	if (!polaris_gpu_cp_initialized || !polaris_gpu_cp_started || !polaris_zap_authenticated ||
+	    !polaris_pas_image_active || !polaris_gpu_core_ready || !polaris_gpu_core_configured ||
+	    !polaris_gpu_oob_active || !polaris_gmu_hfi_ready || !polaris_gmu_hfi_sealed ||
+	    !polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready ||
+	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active || polaris_smmu_backend_faulted ||
+	    polaris_gpu_ring_buffer.virtual == 0 ||
+	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
+	    target_rptr >= A630_CP_RING_DWORDS || !map_block(&gpu) ||
+	    !polaris_a630_cp_bootstrap_packets(cp_init, sizeof(cp_init) / sizeof(cp_init[0]),
+	    secure_mode, sizeof(secure_mode) / sizeof(secure_mode[0]))) {
+		printf("adreno-sdm845: step 20 requires authenticated ZAP, an idle initialized CP ring, and the active GX/SID0 handoff\n");
+		return false;
+	}
+
+	ring_rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
+	ring_wptr = probe_read(&gpu, GPU_CP_RB_WPTR);
+	cp_interrupts = probe_read(&gpu, GPU_CP_INTERRUPT_STATUS);
+	cp_fault = probe_read(&gpu, GPU_CP_HW_FAULT);
+	protect_status = probe_read(&gpu, GPU_CP_PROTECT_STATUS);
+	rbbm_status = probe_read(&gpu, GPU_RBBM_STATUS);
+	if (ring_rptr != A630_CP_INIT_PACKET_DWORDS || ring_wptr != A630_CP_INIT_PACKET_DWORDS ||
+	    (cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 || protect_status != 0 ||
+	    (rbbm_status & A630_RBBM_CP_BUSY_MASK) != 0) {
+		goto fault;
+	}
+
+	memcpy((void *)(polaris_gpu_ring_buffer.virtual + packet_offset), secure_mode, sizeof(secure_mode));
+	polaris_cache_lines(polaris_gpu_ring_buffer.virtual + packet_offset, sizeof(secure_mode));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	probe_write(&gpu, GPU_CP_RB_WPTR, target_rptr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ring_wptr = probe_read(&gpu, GPU_CP_RB_WPTR);
+	if (ring_wptr != target_rptr) {
+		goto fault;
+	}
+	for (uint32_t elapsed = 0; elapsed < A630_CP_INIT_TIMEOUT_US; elapsed += A630_CP_INIT_POLL_US) {
+		ring_rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
+		cp_interrupts = probe_read(&gpu, GPU_CP_INTERRUPT_STATUS);
+		cp_fault = probe_read(&gpu, GPU_CP_HW_FAULT);
+		protect_status = probe_read(&gpu, GPU_CP_PROTECT_STATUS);
+		rbbm_status = probe_read(&gpu, GPU_RBBM_STATUS);
+		if ((cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 || protect_status != 0) {
+			goto fault;
+		}
+		if (ring_rptr == target_rptr && (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0) {
+			polaris_gpu_unsecured_mode = true;
+			printf("adreno-sdm845: step 20 CP_SET_SECURE_MODE(0) retired: RPTR=%u CP idle; user submissions remain disabled\n",
+			    ring_rptr);
+			return true;
+		}
+		delay(A630_CP_INIT_POLL_US);
+	}
+	goto fault;
+
+fault:
+	polaris_smmu_backend_faulted = true;
+	printf("adreno-sdm845: step 20 secure-mode transition or idle check failed: RPTR=%#x WPTR=%#x CP_INT=%#x CP_FAULT=%#x CP_PROTECT=%#x RBBM_STATUS=%#x; user submissions remain disabled\n",
+	    probe_read(&gpu, GPU_CP_RB_RPTR), probe_read(&gpu, GPU_CP_RB_WPTR),
+	    probe_read(&gpu, GPU_CP_INTERRUPT_STATUS), probe_read(&gpu, GPU_CP_HW_FAULT),
+	    probe_read(&gpu, GPU_CP_PROTECT_STATUS), probe_read(&gpu, GPU_RBBM_STATUS));
+	return false;
+}
+
 static bool
 polaris_a630_gpu_domain_start(uint32_t step)
 {
@@ -5979,8 +6056,17 @@ hakios_adreno_sdm845_init(void)
 		printf("adreno-sdm845: step 19 finished; SQE is running, CP_ME_INIT retired, and ZAP is authenticated; secure-mode transition, fences, and rendering remain disabled\n");
 		return;
 	}
-	if (last_step > 19u) {
-		printf("adreno-sdm845: supported explicit stages end at adreno=19; requested step %u is refused\n", last_step);
+	if (last_step == 20) {
+		printf("adreno-sdm845: step 20 performs guarded GMU/GX/core setup, authenticates ZAP, initializes CP, then leaves secure mode and waits idle; user submissions remain disabled\n");
+		if (!polaris_a630_gpu_domain_start(20u) || !polaris_a630_gpu_core_initialize() ||
+		    !polaris_a630_cp_ring_start() || !polaris_a630_cp_set_unsecured_mode()) {
+			return;
+		}
+		printf("adreno-sdm845: step 20 finished; ZAP is authenticated, CP is idle in unsecured mode, but fences, ordinary submissions, and rendering remain disabled\n");
+		return;
+	}
+	if (last_step > 20u) {
+		printf("adreno-sdm845: supported explicit stages end at adreno=20; requested step %u is refused\n", last_step);
 		return;
 	}
 	printf("adreno-sdm845: Polaris Adreno 630 bring-up, steps 1..%u; step 7 stages ZAP only when explicitly requested\n",
