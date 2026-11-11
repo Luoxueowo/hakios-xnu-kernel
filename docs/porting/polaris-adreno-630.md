@@ -190,7 +190,8 @@ allow it. A successful firmware boot alone is not a completed driver.
   row; GMU remains the owner of HFI-described runtime votes. The TCS write path accepts only Apps RSC
   DRV2 v2.7, protects the shared sequencer with `hakios_rsc_lock`, and checks TCS completion and
   per-command status. ZAP authentication, command processor startup, full
-  stop/thermal handling, and rendering remain unavailable. Rejection of either table,
+  hardware-validated recovery, loader-return quiesce, thermal handling, and rendering remain
+  unavailable. Rejection of either table,
   `HFI_TEST`, or initial DCVS invokes failure cleanup. Cleanup verifies CM3 reset before releasing
   the temporary Apps RSC DDR vote; after that readback, it attempts to disconnect the GMU SID4/SID5
   routes, invalidate the ASIDs, blank the two context banks, and restore the original S2CR values.
@@ -211,8 +212,8 @@ allow it. A successful firmware boot alone is not a completed driver.
   RPTR scratch buffer into the detached GPU SID0 page table. The SQE and ring are GPU read-only;
   the RPTR page is GPU writable. It cleans the CPU cache lines and commits the software page tables,
   but does not attach SID0, write SMMU/GPU registers, start the SQE/CP, call PAS, or enable rendering.
-  Buffers remain allocated for review and are released by the backend stop path only when both the
-  3D context and core are inactive. The 32 KiB ring size follows the A630 KGSL definitions
+  Buffers remain allocated for review until the backend stop path confirms that the 3D context
+  is detached and the core is inactive. The 32 KiB ring size follows the A630 KGSL definitions
   ([`kgsl.h`](https://android.googlesource.com/kernel/msm.git/%2B/a11d0d49d2b949d401f8899369db331102d23cc3/drivers/gpu/msm/kgsl.h),
   [`adreno_ringbuffer.h`](https://android.googlesource.com/kernel/msm/%2B/7a5cb50be049b0de03e13c98b65cb3770ad15481/drivers/gpu/msm/adreno_ringbuffer.h));
   this stage has not been run under HakiOS on the phone.
@@ -271,29 +272,33 @@ allow it. A successful firmware boot alone is not a completed driver.
   fence. `ready()` also requires a separate public-client enable latch, which this bring-up path
   never raises. User submissions therefore remain disabled even after the kernel-owned smoke test.
   This write stage has not been run on the phone.
-- The A630 backend keeps the public-client enable latch closed until both orderly stop and
-  loader-return quiesce can prove that CP, GMU, and SMMU resources are safe to release. This avoids
-  the previous mismatch where step 21 could satisfy every other `ready()` condition even though
-  production client submission and teardown were still incomplete.
-- Once SQE halt has been released, `sdm845_gpu_stop()` now leaves the GMU OOB vote, PAS image,
-  SMMU mappings and CP buffers intact. A630's graceful idle/slumber, ring stop and reset sequence
-  is not implemented yet, so stop deliberately refuses to tear resources down underneath a live
-  CP. This is a safety guard, not a completed power-down path; runtime start/stop and recovery
-  remain unavailable.
+- The A630 backend keeps public-client submission disabled. Step 21 only submits one
+  kernel-owned fence, and `ready()` requires a separate client-enable latch that bring-up never
+  raises. Orderly stop now handles that fully initialized diagnostic state; loader-return
+  quiesce is still not implemented, so clients remain disabled.
+- `sdm845_gpu_stop()` first confirms the kernel fence and CP are idle, drains all four Polaris
+  VBIF XINs, releases the GPU/boot OOB holds, and requests the A630 legacy-HFI slumber state using
+  the DT-selected initial performance and bandwidth indices. It checks GMU slumber, CX busy and
+  AHB-fence state, waits for GPUCC to report GX/GFX3D off, then asserts and verifies CM3 reset.
+  After PAS shutdown it faults and detaches GMU SID4/SID5 and GPU SID0, synchronizes each ASID,
+  clears the context bank and restores its original S2CR before releasing private queue buffers.
+  Any failed check retains the possibly referenced memory. This path accepts only the complete
+  kernel-owned fence stage; partial startup cleanup and panic/loader-return `quiesce` remain
+  unavailable. Its register sequence is based on Qualcomm's A630 legacy-HFI slumber path and
+  no-GBIF bus drain in [`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/b6410c3f75259c0ca2df45a01838d2e46272723e/drivers/gpu/msm/adreno_a6xx_gmu.c) and
+  [`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/63407d3081a6b406d94bd7d96ff2ca38fa7df236/drivers/gpu/drm/msm/adreno/a6xx_gpu.c). This implementation has not been run on hardware.
 - The failure-only GMU cleanup now requires CM3 reset readback before touching active SID4/SID5
   routes. It changes each GMU S2CR to fault, invalidates a newly allocated SMR, synchronizes the
   ASID, clears and verifies the context bank, then restores the original S2CR. It never detaches
   GPU SID0, does not free GMU page tables, and retains the GX/MX boot-rail vote. The ordering follows
   the SMMUv2 stream-routing rules in Linux [`arm-smmu.c`](https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/%2B/77a1c68a96f4e018860033f3827602014a4f1663/drivers/iommu/arm-smmu.c).
-- The orderly stop entry now dispatches backend `stop()` even while `ready()` is false; this is
-  required to clean up a partial start. If HakiosGPU has not created its client lock yet, the stop
-  path dispatches directly because no clients can exist. A630's stop hook now preserves all state
-  whenever GMU/GX/PAS or any SMMU context may still be active, and only releases detached SQE/CP
-  buffers while the backend is inactive. Its panic/loader-return `quiesce` hook is still missing,
-  and the active stop path does not yet perform the verified idle/slumber/reset sequence. A write
-  stage can therefore leave live hardware referencing kernel-owned queues or page tables; do not
-  run those stages on-device or treat a return to the loader as safe until verified shutdown and
-  quiesce are implemented.
+- The orderly stop entry dispatches backend `stop()` even while `ready()` is false. If HakiosGPU
+  has not created its client lock yet, the stop path dispatches directly because no clients can
+  exist. The A630 stop hook handles only the completed kernel-owned fence stage and retains all
+  hardware-referenced memory if CP idle, VBIF drain, GMU slumber, power-off, reset, PAS shutdown,
+  or SMMU detach cannot be confirmed. Its panic/loader-return `quiesce` hook is still missing, and
+  partial startup cleanup is not implemented. Do not run write stages on-device or treat a return
+  to the loader as safe until those paths are implemented and validated.
 
 ## Polaris hardware facts
 
@@ -478,7 +483,8 @@ but does not issue a host TCS request. Steps 12–14 reconstruct the DDR command
 bus table; startup temporarily votes the DT-selected row through Apps RSC, and step 14 releases it
 after GMU accepts initial DCVS. This path is code-only and has not been run on the phone. Sustained
 DVFS is not operational because verified CX/GX sequencing, GMU/GPU clocks, GPU-user/3D mappings,
-runtime frequency transitions, and complete stop-time vote handling are still missing.
+runtime frequency transitions, complete parent-rail vote handling, and device validation remain
+missing.
 `H2F_MSG_START` is A640-specific in the cited KGSL flow and is not part of the A630 gate.
 
 The A630 legacy HFI v1 wire format is now isolated in `drivers/gpu/hakios.adreno.hfi.h`. It
@@ -554,7 +560,9 @@ shared service and lifecycle hooks through the selected backend. Redwood keeps i
 implementation behind that boundary. Polaris selects its own profile and a not-ready operations
 table. Its software map, commit, unmap and cache-maintenance callbacks are implemented; GMU
 firmware/HFI startup and initial ARC/DCVS requests are staged, while complete CX/GX sequencing,
-active GMU-user/3D SMMU context attachment, recoverable stop and thermal hooks are still missing.
+hardware validation of GMU-user/3D SMMU attachment, hardware-validated recovery, loader-return
+quiesce and thermal hooks are still missing. An orderly stop path exists for the fully initialized
+kernel-owned fence stage, but has not been run on a phone.
 The A630 backend now has dormant `submit`, `done`, `last`, and `report` callbacks: submit builds
 the A6xx CCU-invalidate / `CP_INDIRECT_BUFFER_PFE` / `CACHE_FLUSH_TS` sequence, validates each IB
 against the client IOVA aperture, handles ring wrap and bounded space polling, and keeps the
@@ -635,9 +643,11 @@ bounded hardware submission checks.
    production ring/fence callbacks are now implemented from the upstream A6xx submit ordering
    ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/a0497251f2b055a137d62ed065286ba999647b3c/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)); they have not been exercised on hardware. Next validate the packets,
    fence visibility, register protection and ring mappings on Polaris, then implement and validate
-   recoverable power-down before accepting client submissions.
+   orderly stop path before accepting client submissions; add partial-start cleanup and
+   loader-return quiesce. The stop path does not yet remove all inherited CX/GMU parent-domain and
+   clock votes.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
-   faults; stop returns hardware to the loader's prior state.
+   faults; orderly stop and loader-return quiesce are validated on the phone.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
    maintenance are implemented, with OAS and PTFS_4K checks taken from the read-only ID registers.
    Step 15 now constructs the A630 `CP_ME_INIT` and secure-mode packets offline. The local firmware
@@ -651,7 +661,7 @@ bounded hardware submission checks.
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
    verify steps 19–21's bounded SQE/CP bootstrap, ZAP authentication, secure-mode transition and
    kernel fence write, then validate production register protection, ring/fence mappings and mapper
-   behavior. Qualcomm's
+   behavior and the normal-stop path. Qualcomm's
    A630 KGSL path sets the SQE base and authenticates ZAP through PIL before releasing SQE halt,
    submits `CP_ME_INIT`, then uses `CP_SET_SECURE_MODE(0)` to leave secure mode
    ([`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c),
@@ -696,17 +706,16 @@ bounded hardware submission checks.
 - Do not assume CP APRIV can separate kernel and client mappings on this device: Qualcomm's KGSL
   `a630v2` catalog entry does not advertise `ADRENO_APRIV`, unlike the deprecated A630v1 profile
   ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)). The current IOVA ranges are disjoint but share the same SID0 page table; a safe command-stream/private-memory isolation design remains a readiness blocker.
-- A630 shutdown after SQE startup: the current stop hook releases CP buffers only when the GPU,
-  GMU, PAS and all SMMU contexts are inactive. `gmu_domain_ready` is an initial availability
-  observation, not a live hardware vote, so it no longer blocks release of buffers that are only
-  mapped in a detached software page table. The hook still retains hardware votes, PAS and buffers
-  whenever hardware may use them. Implement and validate the GMU idle/slumber and CP stop/reset
-  sequence before enabling client submissions or claiming recoverable power-down. Upstream A6xx shutdown checks
-  GMU idle, clears pending bus transactions, requests slumber, then stops HFI/interrupts and removes
-  RPMh, power-domain, and clock votes; a separate force-off path handles a hung GMU. See Qualcomm's
-  [`a6xx_gmu.c`](https://android.googlesource.com/kernel/common/%2B/0d534518ce87317e884dbd1485111b0f1606a194/drivers/gpu/drm/msm/adreno/a6xx_gmu.c).
-  This is a sequence to audit against Polaris' A630 legacy HFI, RSC and SMMUv2 setup, not code to
-  copy verbatim.
+- A630 stop after SQE startup is implemented only for the completed kernel-owned fence stage and
+  is still unverified on a phone. It requires CP idle and a completed VBIF drain before requesting
+  legacy-HFI slumber; it then checks GMU/CX/GX state, asserts CM3 reset, shuts down PAS, detaches
+  SID4/SID5/SID0 and releases private CP buffers. `gmu_domain_ready` remains only an initial
+  availability observation. A failed check leaves the affected resources attached. The normal
+  stop path does not perform full CX/GMU rail, RPMh, clock or parent-domain power removal, and it
+  does not recover a hung GMU. Partial-start cleanup and panic/loader-return `quiesce` are still
+  open. Qualcomm's A630 legacy-HFI request and no-GBIF XIN drain are referenced in
+  [`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/b6410c3f75259c0ca2df45a01838d2e46272723e/drivers/gpu/msm/adreno_a6xx_gmu.c) and
+  [`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/63407d3081a6b406d94bd7d96ff2ca38fa7df236/drivers/gpu/drm/msm/adreno/a6xx_gpu.c); the Polaris implementation is not hardware-validated.
 
 These are gates to resolve with source evidence and controlled device runs, not values to infer
 from Redwood or fill with guessed constants. The Dipper repository is only a comparison reference:

@@ -308,6 +308,10 @@ extern lck_mtx_t hakios_rsc_lock;
 #define GMU_DCVS_PERF_SETTING            GMU_REGISTER_GLOBAL_WORD(0x1cbfdu)
 #define GMU_DCVS_BW_SETTING              GMU_REGISTER_GLOBAL_WORD(0x1cbfeu)
 #define GMU_DCVS_RETURN                  GMU_REGISTER_GLOBAL_WORD(0x1cbffu)
+#define GMU_CX_GMU_POWER_COUNTER_ENABLE  GMU_REGISTER_GLOBAL_WORD(0x1f840u)
+#define GMU_RPMH_POWER_STATE             GMU_REGISTER_GLOBAL_WORD(0x1f8ecu)
+#define GMU_AO_GPU_CX_BUSY_STATUS        GMU_REGISTER_GLOBAL_WORD(0x23b0cu)
+#define GMU_AO_AHB_FENCE_CTRL            GMU_REGISTER_GLOBAL_WORD(0x23b10u)
 #define GMU_AHB_FENCE_RANGE_0            GMU_WORD(0x9311)
 #define A630_GMU_FW_MAX_BYTES           0x8000u
 #define A630_GMU_FW_READY                0xbabefaceu
@@ -323,6 +327,9 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_GMU_OOB_DCVS_ACK_MASK       (1u << 31)
 #define A630_GMU_OOB_GPU_SET_MASK        (1u << 16)
 #define A630_GMU_OOB_GPU_ACK_MASK        (1u << 24)
+#define A630_GMU_OOB_SLUMBER_OPTION      1u
+#define A630_GMU_HARDWARE_SLUMBER        0x0fu
+#define A630_GMU_GPU_CX_BUSY_MASK        (1u << 23)
 #define A630_GMU_DCVS_ACK_NONBLOCK       0u
 #define A630_GMU_DCVS_CLKSET_AT_LEAST    3u
 #define A630_GMU_HFI_DUMP_BYTES          0x4000u
@@ -381,6 +388,11 @@ extern lck_mtx_t hakios_rsc_lock;
 #define GPU_SP_NC_MODE_CNTL             GPU_WORD(0xae02)
 #define GPU_RBBM_VBIF_CLIENT_QOS_CNTL   GPU_WORD(0x0010)
 #define GPU_VBIF_GATE_OFF_WRREQ_EN      GPU_WORD(0x302a)
+#define GPU_VBIF_XIN_HALT_CTRL0          GPU_WORD(0x3080)
+#define GPU_VBIF_XIN_HALT_CTRL1          GPU_WORD(0x3081)
+#define A630_VBIF_XIN_HALT_MASK          0x0000000fu
+#define A630_STOP_TIMEOUT_US              100000u
+#define A630_STOP_POLL_US                 100u
 #define A630_GMEM_BASE                  0x00100000u
 #define A630_GMEM_SIZE                  0x00100000u
 #define A630_HIGHEST_BANK_BIT           15u
@@ -669,8 +681,11 @@ static bool polaris_gpu_cp_initialized;
 static bool polaris_gpu_unsecured_mode;
 static bool polaris_gpu_fence_smoke_test_done;
 static bool polaris_gpu_ring_submit_ready;
-/* Keep public client submission disabled until stop and loader quiesce are implemented. */
+/* Keep public client submission disabled until orderly stop and loader quiesce are validated. */
 static bool polaris_gpu_client_submission_enabled;
+static bool polaris_gpu_sptprac_enabled_by_driver;
+static bool polaris_gmu_slumber_confirmed;
+static bool polaris_gmu_cm3_reset_confirmed;
 static uint32_t polaris_gpu_ring_write_pointer;
 static uint32_t polaris_gpu_last_fence;
 static bool polaris_smmu_backend_enabled;
@@ -958,6 +973,11 @@ static bool sdm845_gpu_done(uint32_t fence);
 static uint32_t sdm845_gpu_last(void);
 static void sdm845_gpu_report(const char *why);
 static void sdm845_gpu_stop(void);
+static bool polaris_a630_cp_idle_for_stop(void);
+static bool polaris_a630_vbif_drain_for_stop(void);
+static bool polaris_a630_gmu_request_slumber(void);
+static bool polaris_smmu_gmu_contexts_detach(void);
+static bool polaris_smmu_gpu_context_detach(void);
 static uint32_t smmu_id_size_to_bits(uint32_t encoding);
 
 static bool
@@ -2256,32 +2276,22 @@ rollback:
 	return false;
 }
 
-/* Detach only GMU SIDs after CM3 reset is read back; leave the 3D route to GPU-specific shutdown. */
+/* Detach a route only after its engine is stopped and all transactions are drained. */
 static bool
-polaris_smmu_gmu_context_detach(struct polaris_smmu_address_space *space,
-	const struct polaris_smmu_route_candidate *route)
+polaris_smmu_context_detach(struct polaris_smmu_address_space *space,
+	const struct polaris_smmu_route_candidate *route, uint32_t stream_id, const char *name)
 {
 	struct polaris_smmu_context_image image;
-	const char *name, *failure = "unknown state";
-	uint32_t stream_id, bank, context, attached_s2cr, fault_s2cr, current_s2cr, expected_smr;
+	const char *failure = "unknown state";
+	uint32_t bank, context, attached_s2cr, fault_s2cr, current_s2cr, expected_smr;
 	uint64_t context_offset;
 
-	if (space == NULL || route == NULL) {
-		printf("adreno-sdm845: GMU SMMU detach received a null address space or route\n");
+	if (space == NULL || route == NULL || name == NULL) {
+		printf("adreno-sdm845: SMMU detach received a null address space, route, or name\n");
 		return false;
 	}
 	if (!space->context_active) {
 		return true;
-	}
-	if (space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL]) {
-		name = "GMU-kernel";
-		stream_id = 5u;
-	} else if (space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER]) {
-		name = "GMU-user";
-		stream_id = 4u;
-	} else {
-		printf("adreno-sdm845: GMU SMMU detach refused a non-GMU address space\n");
-		return false;
 	}
 	bank = space->context_bank;
 	if (!route->valid || route->stream_id != stream_id || route->context_bank != bank ||
@@ -2289,8 +2299,21 @@ polaris_smmu_gmu_context_detach(struct polaris_smmu_address_space *space,
 	    ((route->expected_s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK) == SMMU_S2CR_TYPE_TRANS ||
 	    gmu.virtual == 0 || smmu.virtual == 0 ||
 	    (probe_read(&gmu, GMU_CM3_SYSRESET) & 1u) == 0 || polaris_gpu_core_ready ||
-	    polaris_gpu_cp_started || polaris_pas_image_active) {
-		failure = "CM3 reset, route identity, or GPU-idle preconditions are not satisfied";
+	    polaris_gpu_core_configured || polaris_gpu_cp_started || polaris_gpu_cp_initialized ||
+	    polaris_gmu_firmware_started || polaris_pas_image_active) {
+		failure = "CM3 reset, route identity, or engine-idle preconditions are not satisfied";
+		goto fail;
+	}
+	if (stream_id == 0u && (space != &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU] ||
+	    gpucc.virtual == 0 || (probe_read(&gpucc, GPUCC_GX_GDSCR) & GDSC_POWER_ON) != 0 ||
+	    (probe_read(&gpucc, GPUCC_GX_GFX3D_CBCR) & (CBCR_ENABLE | CBCR_OFF)) != CBCR_OFF)) {
+		failure = "GPU SID0 detach requires the GX domain and GFX3D clock to be off";
+		goto fail;
+	}
+	if ((stream_id == 4u && space != &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER]) ||
+	    (stream_id == 5u && space != &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL]) ||
+	    (stream_id != 0u && stream_id != 4u && stream_id != 5u)) {
+		failure = "address space does not match the requested Polaris stream ID";
 		goto fail;
 	}
 	if ((probe_read(&smmu, SMMU_SCR0) & SMMU_SCR0_CLIENTPD) != 0 ||
@@ -2325,14 +2348,14 @@ polaris_smmu_gmu_context_detach(struct polaris_smmu_address_space *space,
 	    probe_read(&smmu, context + SMMU_CB_MAIR0) != image.mair0 ||
 	    probe_read(&smmu, context + SMMU_CB_MAIR1) != image.mair1 ||
 	    probe_read(&smmu, context + SMMU_CB_FSR) != 0) {
-		failure = "attached route or GMU context changed or recorded an SMMU fault";
+		failure = "attached route or context changed or recorded an SMMU fault";
 		goto fail;
 	}
 	if (route->stream_matching) {
 		expected_smr = route->existing_smr ? route->expected_smr :
 		    (SMMU_SMR_VALID | (stream_id & SMMU_SMR_ID_MASK));
 		if (probe_read(&smmu, SMMU_SMR(route->slot)) != expected_smr) {
-			failure = "SMR changed since GMU attachment";
+			failure = "SMR changed since attachment";
 			goto fail;
 		}
 	}
@@ -2389,14 +2412,14 @@ polaris_smmu_gmu_context_detach(struct polaris_smmu_address_space *space,
 	space->context_bank = UINT32_MAX;
 	polaris_smmu_context_blank[bank] = true;
 	polaris_smmu_context_routed[bank] = false;
-	printf("adreno-sdm845: detached %s SID%u after confirmed CM3 reset; context bank %u is blank and the original S2CR is restored\n",
+	printf("adreno-sdm845: detached %s SID%u after engine reset/idle; context bank %u is blank and the original S2CR is restored\n",
 	    name, stream_id, bank);
 	return true;
 
 fail:
 	polaris_smmu_backend_faulted = true;
 	printf("adreno-sdm845: %s SMMU detach refused or failed (%s); stream/context state and page tables are retained\n",
-	    space == &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER] ? "GMU-user" : "GMU-kernel", failure);
+	    name, failure);
 	return false;
 }
 
@@ -2406,16 +2429,23 @@ polaris_smmu_gmu_contexts_detach(void)
 	bool success = true;
 
 	if (polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active &&
-	    !polaris_smmu_gmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER],
-	    &polaris_smmu_gmu_user_route)) {
+	    !polaris_smmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER],
+	    &polaris_smmu_gmu_user_route, 4u, "GMU-user")) {
 		success = false;
 	}
 	if (polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active &&
-	    !polaris_smmu_gmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL],
-	    &polaris_smmu_gmu_kernel_route)) {
+	    !polaris_smmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL],
+	    &polaris_smmu_gmu_kernel_route, 5u, "GMU-kernel")) {
 		success = false;
 	}
 	return success;
+}
+
+static bool
+polaris_smmu_gpu_context_detach(void)
+{
+	return polaris_smmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
+	    &polaris_smmu_gpu_route, 0u, "GPU");
 }
 
 static bool
@@ -5653,23 +5683,160 @@ sdm845_gpu_stop(void)
 	bool smmu_contexts_active = polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active;
+	bool gx_off = false;
+	bool client_submission_was_enabled = polaris_gpu_client_submission_enabled;
 
-	/* This hook is reachable before ready(); preserve every resource the hardware may still use. */
-	/* `domain_ready` records that CX/GMU were already available at probe time; it is not a live vote. */
-	if (polaris_gmu_firmware_started || polaris_gmu_hfi_ready ||
-	    polaris_gmu_boot_rail_active || polaris_gmu_temp_bus_vote_active || polaris_gpu_oob_active ||
-	    polaris_gpu_core_ready || polaris_gpu_core_configured || polaris_gpu_cp_started ||
-	    polaris_gpu_cp_initialized || polaris_pas_image_active || smmu_contexts_active) {
-		printf("adreno-sdm845: GPU stop retains active GMU/GX/PAS/SMMU state; verified A630 shutdown and loader quiesce are not implemented\n");
+	/* Keep both client gates closed before touching any hardware state. */
+	polaris_gpu_client_submission_enabled = false;
+	polaris_gpu_ring_submit_ready = false;
+	if (!polaris_gmu_firmware_started && !polaris_gmu_hfi_ready && !polaris_gmu_boot_rail_active &&
+	    !polaris_gmu_temp_bus_vote_active && !polaris_gpu_oob_active && !polaris_gpu_core_ready &&
+	    !polaris_gpu_core_configured && !polaris_gpu_cp_started && !polaris_gpu_cp_initialized &&
+	    !polaris_pas_image_active && !smmu_contexts_active) {
+		if (cp_buffers_present) {
+			polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
+			polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
+			polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
+			printf("adreno-sdm845: GPU stop released private buffers from a detached inactive backend\n");
+		}
+		polaris_gpu_ring_write_pointer = 0;
+		polaris_gpu_last_fence = 0;
+		polaris_gpu_fence_smoke_test_done = false;
+		polaris_gpu_sptprac_enabled_by_driver = false;
+		polaris_gmu_slumber_confirmed = false;
+		polaris_gmu_cm3_reset_confirmed = false;
 		return;
 	}
+	if (!polaris_gmu_slumber_confirmed &&
+	    (!polaris_gmu_firmware_started || !polaris_gmu_hfi_ready || !polaris_gmu_hfi_sealed ||
+	    !polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready ||
+	    !polaris_gpu_core_ready || !polaris_gpu_core_configured ||
+	    !polaris_gpu_cp_started || !polaris_gpu_cp_initialized || !polaris_gpu_unsecured_mode ||
+	    !polaris_gpu_fence_smoke_test_done || client_submission_was_enabled ||
+	    polaris_gmu_temp_bus_vote_active || !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
+	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active)) {
+		printf("adreno-sdm845: GPU stop retained partial startup state; orderly stop only accepts the fully idle kernel-owned A630 fence stage\n");
+		return;
+	}
+	if (polaris_gpu_cp_started && !polaris_gmu_slumber_confirmed) {
+		if (gpucc.virtual == 0 ||
+		    (probe_read(&gpucc, GPUCC_GX_GDSCR) & GDSC_POWER_ON) == 0 ||
+		    (probe_read(&gpucc, GPUCC_GX_GFX3D_CBCR) & (CBCR_ENABLE | CBCR_OFF)) != CBCR_ENABLE) {
+			printf("adreno-sdm845: GPU stop retained state because GX/GFX3D is not confirmed on for CP idle checks\n");
+			return;
+		}
+		if (!polaris_a630_cp_idle_for_stop()) {
+			printf("adreno-sdm845: GPU stop retained CP/SMMU/DMA state because RPTR/WPTR, CP status, or the smoke-test fence is not idle\n");
+			return;
+		}
+		if (!polaris_a630_vbif_drain_for_stop()) {
+			printf("adreno-sdm845: GPU stop retained CP/SMMU/DMA state because the A630 VBIF did not drain\n");
+			return;
+		}
+		polaris_gmu_gpu_oob_release();
+		if (polaris_gmu_boot_rail_active) {
+			polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
+			polaris_gmu_boot_rail_active = false;
+		}
+		if (!polaris_a630_gmu_request_slumber()) {
+			printf("adreno-sdm845: GPU stop could not verify A630 GMU slumber; all CP/PAS/SMMU memory remains allocated\n");
+			return;
+		}
+	}
 
+	if (polaris_gmu_slumber_confirmed) {
+		if (gpucc.virtual == 0 || gmu.virtual == 0 || smmu.virtual == 0) {
+			printf("adreno-sdm845: GPU stop retained state because GPUCC/GMU/SMMU windows are not mapped\n");
+			return;
+		}
+		if (!polaris_gmu_cm3_reset_confirmed) {
+			bool idle = false;
+			for (uint32_t elapsed = 0; elapsed < A630_STOP_TIMEOUT_US; elapsed += A630_STOP_POLL_US) {
+				uint32_t state = probe_read(&gmu, GMU_RPMH_POWER_STATE);
+				uint32_t busy = probe_read(&gmu, GMU_AO_GPU_CX_BUSY_STATUS);
+				if (state == A630_GMU_HARDWARE_SLUMBER &&
+				    (busy & A630_GMU_GPU_CX_BUSY_MASK) == 0 &&
+				    probe_read(&gmu, GMU_AO_AHB_FENCE_CTRL) == 0) {
+					idle = true;
+					break;
+				}
+				delay_for_interval(A630_STOP_POLL_US, NSEC_PER_USEC);
+			}
+			if (!idle) {
+				printf("adreno-sdm845: GPU stop retained state because GMU slumber, CX busy, or AHB fence readback changed\n");
+				return;
+			}
+		}
+		for (uint32_t elapsed = 0; elapsed < A630_STOP_TIMEOUT_US; elapsed += A630_STOP_POLL_US) {
+			uint32_t gx = probe_read(&gpucc, GPUCC_GX_GDSCR);
+			uint32_t clock = probe_read(&gpucc, GPUCC_GX_GFX3D_CBCR);
+			if ((gx & GDSC_POWER_ON) == 0 && (clock & (CBCR_ENABLE | CBCR_OFF)) == CBCR_OFF) {
+				gx_off = true;
+				break;
+			}
+			delay_for_interval(A630_STOP_POLL_US, NSEC_PER_USEC);
+		}
+		if (!gx_off) {
+			printf("adreno-sdm845: GMU reported slumber but GPUCC still reports GX/GFX3D powered; CP buffers and SID0 remain attached\n");
+			return;
+		}
+		if (!polaris_gmu_cm3_reset_confirmed) {
+			probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			if ((probe_read(&gmu, GMU_CM3_SYSRESET) & 1u) == 0) {
+				printf("adreno-sdm845: GPU stop could not verify CM3 reset after slumber; GMU/SMMU memory remains allocated\n");
+				return;
+			}
+			polaris_gmu_cm3_reset_confirmed = true;
+		}
+		polaris_gmu_firmware_started = false;
+		polaris_gmu_hfi_ready = false;
+		polaris_gmu_hfi_sealed = false;
+		polaris_gmu_hfi_perf_table_ready = false;
+		polaris_gmu_hfi_bw_table_ready = false;
+		polaris_hfi_state.initialized = false;
+		polaris_gpu_core_ready = false;
+		polaris_gpu_core_configured = false;
+		polaris_gpu_cp_started = false;
+		polaris_gpu_cp_initialized = false;
+		polaris_gpu_unsecured_mode = false;
+		if (polaris_pas_image_active && !polaris_pas_shutdown()) {
+			printf("adreno-sdm845: PAS shutdown failed after GPU slumber; all CP/SMMU memory remains allocated\n");
+			return;
+		}
+		if (polaris_gmu_temp_bus_vote_active && !polaris_gmu_temp_bus_vote_set(false)) {
+			printf("adreno-sdm845: Apps RSC DDR vote release failed after GMU reset; all CP/SMMU memory remains allocated\n");
+			return;
+		}
+		if (!polaris_smmu_gmu_contexts_detach() || !polaris_smmu_gpu_context_detach()) {
+			printf("adreno-sdm845: GPU stop retained CP buffers after an incomplete GMU/GPU SMMU detach\n");
+			return;
+		}
+	}
+
+	smmu_contexts_active = polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL].context_active ||
+	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_USER].context_active;
+	if (polaris_gmu_firmware_started || polaris_gmu_hfi_ready || polaris_gmu_boot_rail_active ||
+	    polaris_gmu_temp_bus_vote_active || polaris_gpu_oob_active || polaris_gpu_core_ready ||
+	    polaris_gpu_core_configured || polaris_gpu_cp_started || polaris_gpu_cp_initialized ||
+	    polaris_pas_image_active || smmu_contexts_active) {
+		printf("adreno-sdm845: GPU stop retained buffers because a GMU/GX/PAS/SMMU resource is still active\n");
+		return;
+	}
 	if (cp_buffers_present) {
 		polaris_gpu_dma_buffer_release(&polaris_gpu_rptr_buffer);
 		polaris_gpu_dma_buffer_release(&polaris_gpu_ring_buffer);
 		polaris_gpu_dma_buffer_release(&polaris_gpu_sqe_buffer);
-		printf("adreno-sdm845: GPU stop released SQE/CP buffers from a detached, inactive backend\n");
 	}
+	polaris_gpu_ring_write_pointer = 0;
+	polaris_gpu_last_fence = 0;
+	polaris_gpu_fence_smoke_test_done = false;
+	polaris_gpu_sptprac_enabled_by_driver = false;
+	polaris_gmu_slumber_confirmed = false;
+	polaris_gmu_cm3_reset_confirmed = false;
+	printf("adreno-sdm845: orderly A630 stop confirmed CP idle, VBIF drain, GMU slumber/reset, PAS shutdown, and SID0/4/5 detach; private queue buffers were released\n");
 }
 
 static void
@@ -5696,6 +5863,7 @@ polaris_a630_hwcg_start(void)
 		{ 0x11a, 0x00000555 },
 	};
 	uint32_t clock_control, sptprac;
+	bool configured;
 
 	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_MODE_WORD), 0x00020222u);
 	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_GMU_AO_CGC_DELAY_WORD), 0x00010111u);
@@ -5735,8 +5903,125 @@ polaris_a630_hwcg_start(void)
 	probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD), (sptprac & ~1u) | 1u);
 	probe_write(&gpu, GPU_RBBM_CLOCK_CNTL, A630_RBBM_CLOCK_CNTL_ON);
 	__asm__ volatile ("dsb sy" ::: "memory");
-	return probe_read(&gpu, GPU_RBBM_CLOCK_CNTL) == A630_RBBM_CLOCK_CNTL_ON &&
+	configured = probe_read(&gpu, GPU_RBBM_CLOCK_CNTL) == A630_RBBM_CLOCK_CNTL_ON &&
 	    (probe_read(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD)) & 1u) != 0;
+	if (configured) {
+		polaris_gpu_sptprac_enabled_by_driver = true;
+	}
+	return configured;
+}
+
+static bool
+polaris_a630_cp_idle_for_stop(void)
+{
+	uint32_t rptr, wptr;
+	volatile uint32_t *fence;
+
+	if (gpu.virtual == 0 || polaris_gpu_ring_buffer.virtual == 0 ||
+	    polaris_gpu_rptr_buffer.virtual == 0 ||
+	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
+	    polaris_gpu_rptr_buffer.requested_size < A630_CP_FENCE_TEST_OFFSET + sizeof(uint32_t)) {
+		return false;
+	}
+	rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
+	wptr = probe_read(&gpu, GPU_CP_RB_WPTR);
+	fence = (volatile uint32_t *)(polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET);
+	polaris_cache_lines((vm_offset_t)fence, sizeof(*fence));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	return rptr < A630_CP_RING_DWORDS && wptr < A630_CP_RING_DWORDS && rptr == wptr &&
+	    rptr == polaris_gpu_ring_write_pointer &&
+	    (probe_read(&gpu, GPU_RBBM_STATUS) & A630_RBBM_CP_BUSY_MASK) == 0 &&
+	    (probe_read(&gpu, GPU_CP_INTERRUPT_STATUS) & A630_CP_INTERRUPT_ERROR_MASK) == 0 &&
+	    probe_read(&gpu, GPU_CP_HW_FAULT) == 0 && probe_read(&gpu, GPU_CP_PROTECT_STATUS) == 0 &&
+	    *fence == 0;
+}
+
+/* Polaris has no GBIF; drain all four VBIF XINs before releasing the GX hold. */
+static bool
+polaris_a630_vbif_drain_for_stop(void)
+{
+	if (gpu.virtual == 0) {
+		return false;
+	}
+	probe_write(&gpu, GPU_VBIF_XIN_HALT_CTRL0, A630_VBIF_XIN_HALT_MASK);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t elapsed = 0; elapsed < A630_STOP_TIMEOUT_US; elapsed += A630_STOP_POLL_US) {
+		if ((probe_read(&gpu, GPU_VBIF_XIN_HALT_CTRL1) & A630_VBIF_XIN_HALT_MASK) ==
+		    A630_VBIF_XIN_HALT_MASK) {
+			probe_write(&gpu, GPU_VBIF_XIN_HALT_CTRL0, 0);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			return probe_read(&gpu, GPU_VBIF_XIN_HALT_CTRL0) == 0;
+		}
+		delay_for_interval(A630_STOP_POLL_US, NSEC_PER_USEC);
+	}
+	/* Never leave an unsuccessful bus halt armed while retaining the live backend. */
+	probe_write(&gpu, GPU_VBIF_XIN_HALT_CTRL0, 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	return false;
+}
+
+static bool
+polaris_a630_gmu_request_slumber(void)
+{
+	const struct polaris_gpu_operating_point *initial;
+	uint32_t perf_index, bw_index, state, busy;
+	bool acknowledged = false;
+
+	if (!polaris_gmu_firmware_started || !polaris_gmu_hfi_ready || !polaris_gmu_hfi_sealed ||
+	    polaris_gpu_pwrlevel_count < 2u || polaris_gpu_initial_pwrlevel >= polaris_gpu_pwrlevel_count - 1u ||
+	    gmu.virtual == 0) {
+		return false;
+	}
+	initial = &polaris_gpu_pwrlevels[polaris_gpu_initial_pwrlevel];
+	perf_index = polaris_gpu_pwrlevel_count - polaris_gpu_initial_pwrlevel - 1u;
+	bw_index = initial->bus_frequency;
+	if (perf_index >= POLARIS_A630_HFI_MAX_GPU_LEVELS || bw_index >= polaris_gpu_bus_level_count ||
+	    bw_index > 0xffu) {
+		return false;
+	}
+	probe_write(&gmu, GMU_CX_GMU_POWER_COUNTER_ENABLE, 0);
+	if (polaris_gpu_sptprac_enabled_by_driver) {
+		probe_write(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD),
+		    probe_read(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD)) & ~1u);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		if ((probe_read(&gmu, GMU_REGISTER_GLOBAL_WORD(A630_HWC_GMU_SPTPRAC_WORD)) & 1u) != 0) {
+			return false;
+		}
+		polaris_gpu_sptprac_enabled_by_driver = false;
+	}
+	probe_write(&gmu, GMU_BOOT_SLUMBER_OPTION, A630_GMU_OOB_SLUMBER_OPTION);
+	probe_write(&gmu, GMU_GX_VOTE_IDX, perf_index);
+	probe_write(&gmu, GMU_MX_VOTE_IDX, bw_index);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&gmu, GMU_BOOT_SLUMBER_OPTION) != A630_GMU_OOB_SLUMBER_OPTION ||
+	    probe_read(&gmu, GMU_GX_VOTE_IDX) != perf_index || probe_read(&gmu, GMU_MX_VOTE_IDX) != bw_index) {
+		return false;
+	}
+	probe_write(&gmu, GMU_HOST2GMU_INTR_SET, A630_GMU_OOB_BOOT_SET_MASK);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t elapsed = 0; elapsed < A630_STOP_TIMEOUT_US; elapsed += A630_STOP_POLL_US) {
+		if ((probe_read(&gmu, GMU_GMU2HOST_INTR_INFO) & A630_GMU_OOB_BOOT_ACK_MASK) != 0) {
+			acknowledged = true;
+			break;
+		}
+		delay_for_interval(A630_STOP_POLL_US, NSEC_PER_USEC);
+	}
+	probe_write(&gmu, GMU_GMU2HOST_INTR_CLR, A630_GMU_OOB_BOOT_ACK_MASK);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	polaris_gmu_oob_clear(A630_GMU_OOB_BOOT_ACK_MASK);
+	polaris_gmu_boot_rail_active = false;
+	if (!acknowledged) {
+		return false;
+	}
+	state = probe_read(&gmu, GMU_RPMH_POWER_STATE);
+	busy = probe_read(&gmu, GMU_AO_GPU_CX_BUSY_STATUS);
+	probe_write(&gmu, GMU_AO_AHB_FENCE_CTRL, 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (state != A630_GMU_HARDWARE_SLUMBER || probe_read(&gmu, GMU_AO_AHB_FENCE_CTRL) != 0) {
+		return false;
+	}
+	polaris_gmu_slumber_confirmed = true;
+	return (busy & A630_GMU_GPU_CX_BUSY_MASK) == 0;
 }
 
 static bool
