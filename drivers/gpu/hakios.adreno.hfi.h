@@ -35,6 +35,12 @@
 #define POLARIS_A630_HFI_TYPE_POST            1u
 #define POLARIS_A630_HFI_TYPE_ACK             2u
 #define POLARIS_A630_HFI_ID_INIT              0u
+#define POLARIS_A630_HFI_ID_FW_VERSION        1u
+
+#define POLARIS_A630_GMU_VERSION_MAJOR        1u
+#define POLARIS_A630_GMU_VERSION_MINOR        3u
+#define POLARIS_A630_GMU_VERSION \
+	((POLARIS_A630_GMU_VERSION_MAJOR << 28) | (POLARIS_A630_GMU_VERSION_MINOR << 16))
 
 #define POLARIS_A630_HFI_INTR_MESSAGE         (1u << 0)
 #define POLARIS_A630_HFI_INTR_SEND            (1u << 0)
@@ -349,6 +355,18 @@ polaris_a630_hfi_make_init(uint32_t dump_address, uint32_t dump_bytes, uint32_t 
 	message[2] = dump_address;
 	message[3] = dump_bytes;
 	message[4] = boot_state;
+	return true;
+}
+
+/* Ask the A630 legacy GMU for the version selected by its core profile. */
+static inline bool
+polaris_a630_hfi_make_fw_version(uint32_t supported_version, uint16_t sequence, uint32_t message[2])
+{
+	if (message == NULL || !polaris_a630_hfi_make_header(POLARIS_A630_HFI_ID_FW_VERSION, 2,
+	    POLARIS_A630_HFI_TYPE_COMMAND, sequence, &message[0])) {
+		return false;
+	}
+	message[1] = supported_version;
 	return true;
 }
 

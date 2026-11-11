@@ -116,14 +116,17 @@ allow it. A successful firmware boot alone is not a completed driver.
   HFI, 16 KiB dump, and 4 KiB log buffers, loads and verifies the raw A630 GMU image, refreshes the
   SMMU snapshot, then installs the GMU-kernel SID5 context. It programs the A6xx TCM-boot, HFI
   table, log, SFR chip-ID, cache, power-collapse baseline, and AHB-fence registers; releases CM3;
-  polls the firmware-ready and HFI-queue status; sends the legacy five-dword `GMU_INIT`; and polls
-  the message queue for its matching ACK. It leaves SID4 and GPU SID0 unattached and does not load
-  or authenticate ZAP, submit RPMh tables/votes, start the 3D core, or enable rendering. On timeout
-  after CM3 release, it reasserts reset and marks the backend faulted while leaving SID5 attached.
+  polls the firmware-ready and HFI-queue status; sends the legacy five-dword `GMU_INIT`; then sends
+  `FW_VERSION`, checks the matching ACK, and requires A630 GMU 1.3 or newer within major version 1.
+  It leaves SID4 and GPU SID0 unattached and does not load or authenticate ZAP, submit RPMh
+  performance/bandwidth tables or votes, start the 3D core, or enable rendering. On timeout or an
+  incompatible version after CM3 release, it reasserts reset and marks the backend faulted while
+  leaving SID5 attached.
   This stage has not been invoked on the phone. The sequence follows Qualcomm's A6xx GMU TCM boot
-  and HFI queue setup plus its A630 legacy `GMU_INIT` path
+  and HFI queue setup plus its A630 legacy `GMU_INIT`/`FW_VERSION` path
   ([`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/815ef3fd67546132532651279885563ff35a4605/drivers/gpu/msm/adreno_a6xx_gmu.c),
-  [`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/%2B/541919e72ee1156c0054952dd11d5066372095a8/drivers/gpu/msm/kgsl_hfi.c)).
+  [`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/%2B/541919e72ee1156c0054952dd11d5066372095a8/drivers/gpu/msm/kgsl_hfi.c),
+  [`A630 GMU profile`](https://android.googlesource.com/kernel/msm/%2B/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/adreno-gpulist.h)).
 
 ## Polaris hardware facts
 
@@ -260,8 +263,9 @@ are 0/4/5/1 for command/message/debug/dispatch; the dispatch queue remains disab
 table/queue allocation is page-rounded to 20 KiB and its GMU virtual address belongs to the
 noncached kernel range beginning at `0x60000000`. `adreno=3` checks and reports this protocol
 layout. Step 9 prepares detached HFI/dump/log mappings, step 11 attaches the GMU-kernel context,
-and step 12 starts the GMU and sends the first `GMU_INIT` request. Further HFI command handling,
-performance/bandwidth tables, user and 3D contexts, and CP startup remain pending.
+and step 12 starts the GMU, sends `GMU_INIT`, and verifies the A630 GMU firmware version through
+`FW_VERSION`. HFI performance/bandwidth tables, user and 3D contexts, DCVS votes, and CP startup
+remain pending.
 The queue-table header still reports four active slots with dispatch disabled in its queue header,
 matching Qualcomm's A630 `hfi_init` (`num_active_q = HFI_QUEUE_MAX`); HakiOS preserves that v1
 contract ([`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_hfi.c)).

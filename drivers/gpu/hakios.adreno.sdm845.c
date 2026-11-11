@@ -5,10 +5,10 @@
  *
  * adreno=1..6 performs read-only probes. Explicit adreno=7 stages and releases PAS metadata,
  * adreno=10 loads GMU ITCM while reset stays asserted, adreno=11 installs only the GMU-kernel
- * SMMUv2 context and SID route, and adreno=12 boots the GMU and completes its first legacy HFI
- * INIT handshake. These write stages are guarded by runtime preflight/readbacks and have not been
- * run on hardware. ZAP authentication, GMU-user and 3D contexts, performance votes, command
- * submission, and rendering are still unavailable, so the backend `ready()` gate remains false.
+ * SMMUv2 context and SID route, and adreno=12 boots the GMU, completes legacy HFI GMU_INIT, and
+ * checks the GMU firmware version. These write stages are guarded by runtime preflight/readbacks
+ * and have not been run on hardware. ZAP authentication, GMU-user and 3D contexts, performance
+ * votes, command submission, and rendering are still unavailable, so `ready()` remains false.
  *
  * Addresses and sizes are from the checked-in Polaris Android DTB:
  *   qcom,gpucc@5090000 (qcom,gpucc-sdm845-v2)
@@ -3018,21 +3018,25 @@ polaris_gmu_firmware_load(void)
 }
 
 static bool
-polaris_gmu_hfi_send_init(void)
+polaris_gmu_hfi_send_command(const uint32_t *command, uint32_t command_dwords,
+	uint32_t *reply, uint32_t reply_capacity, uint32_t *reply_dwords)
 {
-	uint32_t message[5];
-	uint32_t message_header, sequence, status = UINT32_MAX;
-	bool acknowledged = false;
+	uint32_t message_header, status = UINT32_MAX;
 
-	sequence = polaris_a630_hfi_next_sequence(&polaris_hfi_state);
-	if (sequence == 0 || !polaris_a630_hfi_make_init(A630_GMU_DUMP_VA, A630_GMU_HFI_DUMP_BYTES,
-	    A630_GMU_BOOT_COLD, (uint16_t)sequence, message) ||
-	    !polaris_a630_hfi_write(&polaris_hfi_state, POLARIS_A630_HFI_QUEUE_COMMAND,
-	    message, sizeof(message) / sizeof(message[0]))) {
-		printf("adreno-sdm845: step 12 could not queue the A630 GMU_INIT HFI command\n");
+	if (reply_dwords != NULL) {
+		*reply_dwords = 0;
+	}
+	if (command == NULL || command_dwords == 0 || !polaris_hfi_state.initialized ||
+	    (reply == NULL && reply_capacity != 0) || reply_dwords == NULL) {
+		printf("adreno-sdm845: step 12 rejected an invalid A630 HFI transaction\n");
 		return false;
 	}
-	message_header = message[0];
+	message_header = command[0];
+	if (!polaris_a630_hfi_write(&polaris_hfi_state, POLARIS_A630_HFI_QUEUE_COMMAND,
+	    command, command_dwords)) {
+		printf("adreno-sdm845: step 12 could not queue A630 HFI command %#x\n", message_header & 0xffu);
+		return false;
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	probe_write(&gmu, GMU_HOST2GMU_INTR_SET, POLARIS_A630_HFI_INTR_SEND);
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -3056,25 +3060,86 @@ polaris_gmu_hfi_send_init(void)
 				printf("adreno-sdm845: step 12 received a malformed A630 HFI message (result=%d)\n", result);
 				return false;
 			}
-			if (polaris_a630_hfi_v1_ack_matches(response, response_dwords, message_header, &status)) {
-				acknowledged = true;
-				break;
+			if (!polaris_a630_hfi_v1_ack_matches(response, response_dwords, message_header, &status)) {
+				printf("adreno-sdm845: step 12 ignored unmatched HFI message header=%#x (%u dwords)\n",
+				    response[0], response_dwords);
+				continue;
 			}
-			printf("adreno-sdm845: step 12 ignored unmatched HFI message header=%#x (%u dwords)\n",
-			    response[0], response_dwords);
-		}
-		if (acknowledged) {
 			if (status != 0) {
-				printf("adreno-sdm845: step 12 GMU_INIT was rejected with status %#x\n", status);
+				printf("adreno-sdm845: step 12 HFI command %#x was rejected with status %#x\n",
+				    message_header & 0xffu, status);
 				return false;
 			}
+			if (response_dwords > reply_capacity && reply != NULL) {
+				printf("adreno-sdm845: step 12 HFI reply has %u dwords, caller accepts %u\n",
+				    response_dwords, reply_capacity);
+				return false;
+			}
+			if (reply != NULL) {
+				memcpy(reply, response, response_dwords * sizeof(response[0]));
+			}
+			*reply_dwords = response_dwords;
 			return true;
 		}
 		delay(A630_GMU_HFI_POLL_DELAY_US);
 	}
-	printf("adreno-sdm845: step 12 timed out waiting for the A630 GMU_INIT acknowledgement (header=%#x)\n",
-	    message_header);
+	printf("adreno-sdm845: step 12 timed out waiting for A630 HFI command %#x acknowledgement (header=%#x)\n",
+	    message_header & 0xffu, message_header);
 	return false;
+}
+
+static bool
+polaris_gmu_hfi_send_init(void)
+{
+	uint32_t message[5], response_dwords = 0;
+	uint32_t sequence = polaris_a630_hfi_next_sequence(&polaris_hfi_state);
+
+	if (sequence == 0 || !polaris_a630_hfi_make_init(A630_GMU_DUMP_VA, A630_GMU_HFI_DUMP_BYTES,
+	    A630_GMU_BOOT_COLD, (uint16_t)sequence, message) ||
+	    !polaris_gmu_hfi_send_command(message, sizeof(message) / sizeof(message[0]), NULL, 0,
+	    &response_dwords)) {
+		printf("adreno-sdm845: step 12 A630 GMU_INIT failed\n");
+		return false;
+	}
+	if (response_dwords < 3u) {
+		printf("adreno-sdm845: step 12 GMU_INIT ACK is too short (%u dwords)\n", response_dwords);
+		return false;
+	}
+	return true;
+}
+
+static bool
+polaris_gmu_hfi_verify_firmware_version(uint32_t *version)
+{
+	uint32_t message[2], response[4], response_dwords = 0;
+	uint32_t sequence = polaris_a630_hfi_next_sequence(&polaris_hfi_state);
+	uint32_t firmware_version, major, minor;
+
+	if (version != NULL) {
+		*version = 0;
+	}
+	if (version == NULL || sequence == 0 ||
+	    !polaris_a630_hfi_make_fw_version(POLARIS_A630_GMU_VERSION, (uint16_t)sequence, message) ||
+	    !polaris_gmu_hfi_send_command(message, sizeof(message) / sizeof(message[0]), response,
+	    sizeof(response) / sizeof(response[0]), &response_dwords)) {
+		printf("adreno-sdm845: step 12 could not verify the A630 GMU firmware version over HFI\n");
+		return false;
+	}
+	if (response_dwords < 4u) {
+		printf("adreno-sdm845: step 12 GMU firmware-version ACK is too short (%u dwords)\n", response_dwords);
+		return false;
+	}
+	firmware_version = response[3];
+	major = (firmware_version >> 28) & 0xfu;
+	minor = (firmware_version >> 16) & 0xfffu;
+	if (major != POLARIS_A630_GMU_VERSION_MAJOR || minor < POLARIS_A630_GMU_VERSION_MINOR) {
+		printf("adreno-sdm845: step 12 incompatible GMU firmware version %#x (need %u.%u or newer in major %u)\n",
+		    firmware_version, POLARIS_A630_GMU_VERSION_MAJOR, POLARIS_A630_GMU_VERSION_MINOR,
+		    POLARIS_A630_GMU_VERSION_MAJOR);
+		return false;
+	}
+	*version = firmware_version;
+	return true;
 }
 
 /* Boot only the GMU and its legacy HFI queues; GPU-user SID4, ZAP, GX and CP stay off. */
@@ -3083,7 +3148,7 @@ polaris_gmu_hfi_start(void)
 {
 	struct polaris_smmu_address_space *space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GMU_KERNEL];
 	const struct polaris_smmu_route_candidate *route = &polaris_smmu_gmu_kernel_route;
-	uint32_t reset, init_result, context, s2cr, log_info, hfi_version;
+	uint32_t reset, init_result, context, s2cr, log_info, hfi_version, firmware_version;
 
 	if (!polaris_gmu_firmware_loaded || polaris_gmu_firmware_started || polaris_gmu_hfi_ready ||
 	    !polaris_gmu_domain_ready || polaris_gpu_core_ready || !polaris_hfi_space_mapped ||
@@ -3178,16 +3243,21 @@ polaris_gmu_hfi_start(void)
 		return false;
 	}
 	hfi_version = probe_read(&gmu, GMU_HFI_VERSION_INFO);
-	if (!polaris_gmu_hfi_send_init()) {
+	if (((hfi_version >> 28) & 0xfu) != 1u || !polaris_gmu_hfi_send_init() ||
+	    !polaris_gmu_hfi_verify_firmware_version(&firmware_version)) {
 		probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
 		polaris_gmu_firmware_started = false;
 		polaris_smmu_backend_faulted = true;
+		if (((hfi_version >> 28) & 0xfu) != 1u) {
+			printf("adreno-sdm845: step 12 expected legacy HFI v1 for A630, register reports %#x; CM3 was reset\n",
+			    hfi_version);
+		}
 		return false;
 	}
 	polaris_gmu_hfi_ready = true;
-	printf("adreno-sdm845: step 12 GMU firmware and legacy HFI INIT are ready (HFI version=%#x); GPU-user SID4, 3D SID0, ZAP, votes, CP, and rendering remain disabled\n",
-	    hfi_version);
+	printf("adreno-sdm845: step 12 GMU firmware and legacy HFI are ready (HFI=%#x GMU=%#x); GPU-user SID4, 3D SID0, ZAP, votes, CP, and rendering remain disabled\n",
+	    hfi_version, firmware_version);
 	return true;
 }
 
