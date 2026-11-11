@@ -552,6 +552,8 @@ not been executed on Polaris, and hypervisor write access remains an unresolved 
 The backend boundary must carry at least: SoC/GPU identity, firmware file set, MMIO resources,
 GMEM and frequency capabilities, SMMU implementation and stream/context assignments, startup and
 stop operations, and the GPU address/map/submit/fence operations consumed by `hakios.gpu.cpp`.
+The shared `HakiosGPUUserClient::submit()` rejects zero-byte command buffers before forming an IB
+entry, in addition to its existing alignment, relocation and bounds checks.
 The public `HakiosGPU` service must only start after its selected backend has completed the CP
 bring-up and a bounded test submission.
 

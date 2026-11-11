@@ -1050,7 +1050,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
 			continue;                               /* the other kinds are for a GPU shared between address spaces */
 		}
-		if (b == NULL || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
+		if (b == NULL || cmds[i].nr_relocs != 0 || cmds[i].size == 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
 		    (uint64_t) cmds[i].submit_offset + cmds[i].size > b->size) {
 			IOLog("HakiosGPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
 			    i, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
