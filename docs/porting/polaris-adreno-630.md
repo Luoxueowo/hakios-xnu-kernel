@@ -130,6 +130,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   ([`adreno_a6xx_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/815ef3fd67546132532651279885563ff35a4605/drivers/gpu/msm/adreno_a6xx_gmu.c),
   [`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/%2B/541919e72ee1156c0054952dd11d5066372095a8/drivers/gpu/msm/kgsl_hfi.c),
   [`A630 GMU profile`](https://android.googlesource.com/kernel/msm/%2B/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/adreno-gpulist.h)).
+- `adreno=13` reuses the step 12 GMU/HFI startup, then builds and sends only the A630 v1
+  `H2F_MSG_PERF_TBL`. It reads `gfx.lvl`, `cx.lvl`, and `mx.lvl` from CMD_DB, maps Polaris GPU
+  and GMU frequencies to SDM845 voltage corners, and packs the ARC indices and kHz frequencies
+  into the fixed 43-dword message. GPU rows follow KGSL order (idle through 710 MHz); the live
+  device-tree order is reversed while building the table. It does not send `BW_VOTE_TBL` or
+  `H2F_MSG_START`, request an RPMh TCS vote, attach GMU-user or 3D contexts, authenticate ZAP,
+  enable GX/CP, or expose rendering. If table construction or acknowledgement fails, it reasserts
+  CM3 reset, marks the backend faulted, and leaves GMU-kernel SID5 attached. This write stage has
+  not been run on the phone.
 
 ## Polaris hardware facts
 
@@ -240,10 +249,11 @@ the header, resource tables, and auxiliary level data consumed by that probe
 ([SDM845 DTS](https://android.googlesource.com/kernel/common/+/f40f97aaf7fa6222f4ec073c24fb14f04ffb6f80/arch/arm64/boot/dts/qcom/sdm845.dtsi),
 [`cmd-db.c`](https://android.googlesource.com/kernel/common/+/29d66b3902962d0a89408abaf6d24a3df5eef518/drivers/soc/qcom/cmd-db.c)).
 The same probe now validates and reports the runtime GPU and GMU operating-point arrays. Recovery's
-live tree has eight GPU entries (710, 675, 596, 520, 414, 342, 257, and 0 MHz) with per-entry bus
-frequency/minimum/maximum indices, and three GMU entries (0, 200, and 500 MHz). These values are
-read from DT; the driver does not assume that the checked-in or upstream frequency table matches
-the live tree. The GPU client `grp3d` exposes 13 one-path `qcom,msm-bus,vectors-KBps` usecases and
+live tree has eight GPU entries (710, 675, 596, 520, 414, 342, 257, and 0 MHz), with the idle
+entry last and per-entry bus frequency/minimum/maximum indices, plus three GMU entries (0, 200,
+and 500 MHz). Preflight reads these values from DT; the step 13 ARC builder accepts only
+frequencies with a source-verified SDM845 v2 corner mapping. The GPU client `grp3d` exposes 13
+one-path `qcom,msm-bus,vectors-KBps` usecases and
 the GMU client `cnoc` exposes 2. Preflight checks stable source/destination IDs, zero bandwidth in
 the first case, monotonically nondecreasing AB/IB values, and that each GPU powerlevel's
 `qcom,bus-freq`, `qcom,bus-min`, and `qcom,bus-max` indices fit the 13-case table. The read-only
@@ -253,20 +263,28 @@ alone are not interchangeable with those commands
 ([`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm/%2B/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/kgsl_gmu.c),
 [`adreno-gmu.txt`](https://android.googlesource.com/kernel/msm/%2B/refs/heads/android-msm-coral-4.14-android10-qpr1/Documentation/devicetree/bindings/gpu/adreno-gmu.txt)).
 
-The Qualcomm A6xx KGSL flow uses the `gfx.lvl`/`cx.lvl` ARC tables to build GMU voltage votes from
-GPU/GMU operating points, then sends performance and bandwidth indices through the GMU DCVS/HFI
-path. This indicates the GPU-specific ARC vote owner is the GMU; HakiOS should not duplicate those
-votes with CPU-side active TCS requests. Qualcomm's A630v2 target identifies GMU 1.3 and enables
-RPMh, while KGSL labels the A630/A615 firmware path as legacy HFI. HakiOS therefore needs the
-A630 legacy queue/message contract, not assumptions taken from newer HFI variants
-([`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm/+/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/kgsl_gmu.c),
+The Qualcomm A6xx KGSL flow uses `gfx.lvl`, `cx.lvl`, and `mx.lvl` ARC tables to build the GPU and
+GMU voltage votes, then sends those rows through the GMU DCVS/HFI path. HakiOS now builds that
+fixed-size performance table in `adreno=13`; the GPU corner mapping follows SDM845 GPUCC's v2
+frequency/corner table, and GMU 200/500 MHz use the SDM845 CX minimum/low corners. This indicates
+the GPU-specific ARC vote owner is the GMU; HakiOS should not duplicate those votes with CPU-side
+active TCS requests. Qualcomm's A630v2 target identifies GMU 1.3 and enables RPMh, while KGSL
+labels the A630/A615 firmware path as legacy HFI. The HakiOS stage sends `PERF_TBL` only; it does
+not send the bandwidth table or `H2F_MSG_START`. See the primary
+[`gpucc-sdm845.c`](https://android.googlesource.com/kernel/msm/%2B/048cc82284cb0ee2c7381ec5d1b08a2f7d7aa0b4/drivers/clk/qcom/gpucc-sdm845.c),
+[`SDM845 RPMh level bindings`](https://android.googlesource.com/kernel/common/%2B/3135f5b73592988af0eb1b11ccbb72a8667be201/include/dt-bindings/power/qcom-rpmpd.h),
+[`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm/+/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/kgsl_gmu.c),
 [`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm.git/+/7bbb67403d95f83d95e0ea464f972f247475d0d4/drivers/gpu/msm/adreno-gpulist.h),
 [`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/+/541919e72ee1156c0054952dd11d5066372095a8/drivers/gpu/msm/kgsl_hfi.c),
 [`sdm845-v2.dtsi`](https://android.googlesource.com/kernel/msm/+/5f65a2ac2505d5e0c122d5e54a58194c873b426c/arch/arm64/boot/dts/qcom/sdm845-v2.dtsi)).
-The current step 8 remains read-only: it validates ARC and bus-vector inputs and reports active TCS
-status, but does not reconstruct RPMh command payloads, send an HFI message, or issue an RPMh
-request. The TCS command reconstruction and GPU/GMU voltage dependency tables remain prerequisites
-for a complete DCVS setup.
+For the runtime Polaris frequencies, the builder maps GPU 257/342/414/520/596/675/710 MHz to
+VDD_GX corner values 64/128/192/256/320/384/416; the source's 180 MHz floor maps to 48 but is not
+present in this DT. GMU 200/500 MHz map to VDD_CX corner values 48/128. A zero-frequency row uses
+corner requirement zero, then KGSL's ARC lookup selects the first available primary level.
+Step 8 remains read-only: it validates ARC and bus-vector inputs and reports active TCS status,
+but does not reconstruct RPMh command payloads or issue a TCS request. Step 13 sends the HFI
+performance table only; bandwidth TCS command reconstruction and the `BW_VOTE_TBL`/`H2F_MSG_START`
+sequence remain prerequisites for a complete DCVS setup.
 
 The A630 legacy HFI v1 wire format is now isolated in `drivers/gpu/hakios.adreno.hfi.h`. It
 provides bounded shared-table initialization, command queue writes, response queue reads,
@@ -276,9 +294,11 @@ are 0/4/5/1 for command/message/debug/dispatch; the dispatch queue remains disab
 table/queue allocation is page-rounded to 20 KiB and its GMU virtual address belongs to the
 noncached kernel range beginning at `0x60000000`. `adreno=3` checks and reports this protocol
 layout. Step 9 prepares detached HFI/dump/log mappings, step 11 attaches the GMU-kernel context,
-and step 12 starts the GMU, sends `GMU_INIT`, and verifies the A630 GMU firmware version through
-`FW_VERSION`. HFI performance/bandwidth tables, user and 3D contexts, DCVS votes, and CP startup
-remain pending.
+step 12 starts the GMU, sends `GMU_INIT`, and verifies the A630 GMU firmware version through
+`FW_VERSION`. Step 13 builds and sends the 43-dword HFI v1 `PERF_TBL` with GPU/GMU ARC votes.
+Bandwidth tables, GMU-user and 3D contexts, `H2F_MSG_START`, command processor startup, and rendering
+remain pending. Steps 12 and 13 are code-only bring-up stages and have not been invoked on the
+phone.
 The queue-table header still reports four active slots with dispatch disabled in its queue header,
 matching Qualcomm's A630 `hfi_init` (`num_active_q = HFI_QUEUE_MAX`); HakiOS preserves that v1
 contract ([`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/+/965345c9413fe4ce2e92c8b55f1892c0395eb91d/drivers/gpu/msm/kgsl_hfi.c)).
@@ -384,8 +404,10 @@ bring-up and a bounded test submission.
    shutdown path are implemented behind explicit `adreno=7`, gated on live DT and already-on
    domains. The Apps RSC DRV2 and AOP CMD_DB windows and GPU/GMU operating-point tables are now
    validated from runtime DT; an explicit read-only step 8 inspects the TCS and CX/GFX ARC tables.
-   Implement SDM845 CX/GX sequencing and clocks, then start the A630 GMU and route GPU DCVS/ARC
-   votes through its verified HFI path. Exercise the PAS stage, verify the secure stream/context,
+   The A630 GMU/HFI bootstrap and a `PERF_TBL`-only stage are implemented behind explicit
+   `adreno=12`/`adreno=13`, but neither has been run on hardware. Implement SDM845 CX/GX sequencing
+   and clocks, then complete the bandwidth/DCVS sequence and route GPU ARC votes through its
+   verified HFI path. Exercise the PAS stage, verify the secure stream/context,
    authenticate ZAP, and bring up GMU firmware/HFI. Clean up in reverse on every failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
@@ -427,9 +449,10 @@ bring-up and a bounded test submission.
   its register-protection table and the MSM submission path still need validation against the
   630's GMEM/UBWC configuration.
 - Whether TrustZone PAS calls for GPU firmware are permitted from this boot environment.
-- Whether A630 GMU HFI initializes and accepts DCVS requests under HakiOS and the Polaris
-  hypervisor, and whether the runtime `gfx.lvl`/`cx.lvl` tables pair correctly with the live GPU/GMU
-  operating points. The GPU backend has issued no HFI or RPMh writes.
+- Whether A630 GMU HFI initializes and accepts the performance table under HakiOS and the Polaris
+  hypervisor, and whether the runtime `gfx.lvl`/`cx.lvl`/`mx.lvl` tables pair correctly with the
+  live GPU/GMU operating points. The `adreno=12`/`adreno=13` HFI write stages have not been invoked
+  on the phone, and HakiOS has issued no RPMh TCS requests.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
 

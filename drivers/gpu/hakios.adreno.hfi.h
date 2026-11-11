@@ -30,6 +30,8 @@
 #define POLARIS_A630_HFI_ID_DISPATCH          1u
 #define POLARIS_A630_HFI_ID_MESSAGE           4u
 #define POLARIS_A630_HFI_ID_DEBUG             5u
+#define POLARIS_A630_HFI_ID_BW_VOTE_TABLE     3u
+#define POLARIS_A630_HFI_ID_PERF_TABLE        4u
 
 #define POLARIS_A630_HFI_TYPE_COMMAND         0u
 #define POLARIS_A630_HFI_TYPE_POST            1u
@@ -47,6 +49,9 @@
 
 #define POLARIS_A630_HFI_TABLE_BYTES          216u
 #define POLARIS_A630_HFI_QUEUE_DATA_OFFSET    224u
+#define POLARIS_A630_HFI_MAX_GPU_LEVELS       16u
+#define POLARIS_A630_HFI_MAX_GMU_LEVELS       4u
+#define POLARIS_A630_HFI_PERF_TABLE_DWORDS    43u
 #define POLARIS_A630_HFI_REQUIRED_BYTES       \
 	(POLARIS_A630_HFI_QUEUE_DATA_OFFSET + POLARIS_A630_HFI_QUEUE_COUNT * POLARIS_A630_HFI_QUEUE_BYTES)
 #define POLARIS_A630_HFI_ALLOCATION_BYTES     \
@@ -84,6 +89,11 @@ struct polaris_a630_hfi_state {
 	uint32_t gmu_address;
 	uint16_t sequence;
 	bool initialized;
+};
+
+struct polaris_a630_hfi_opp {
+	uint32_t vote;
+	uint32_t frequency_khz;
 };
 
 enum polaris_a630_hfi_read_result {
@@ -367,6 +377,35 @@ polaris_a630_hfi_make_fw_version(uint32_t supported_version, uint16_t sequence, 
 		return false;
 	}
 	message[1] = supported_version;
+	return true;
+}
+
+/* Build the fixed-size legacy A630 DCVS table; ARC votes are prepared by the caller. */
+static inline bool
+polaris_a630_hfi_make_perf_table(uint16_t sequence, const struct polaris_a630_hfi_opp *gpu,
+	uint32_t gpu_count, const struct polaris_a630_hfi_opp *gmu, uint32_t gmu_count,
+	uint32_t message[POLARIS_A630_HFI_PERF_TABLE_DWORDS])
+{
+	if (gpu == NULL || gmu == NULL || message == NULL || gpu_count == 0 ||
+	    gpu_count > POLARIS_A630_HFI_MAX_GPU_LEVELS || gmu_count == 0 ||
+	    gmu_count > POLARIS_A630_HFI_MAX_GMU_LEVELS ||
+	    !polaris_a630_hfi_make_header(POLARIS_A630_HFI_ID_PERF_TABLE,
+	    POLARIS_A630_HFI_PERF_TABLE_DWORDS, POLARIS_A630_HFI_TYPE_COMMAND, sequence, &message[0])) {
+		return false;
+	}
+	for (uint32_t i = 1; i < POLARIS_A630_HFI_PERF_TABLE_DWORDS; i++) {
+		message[i] = 0;
+	}
+	message[1] = gpu_count;
+	message[2] = gmu_count;
+	for (uint32_t i = 0; i < gpu_count; i++) {
+		message[3u + 2u * i] = gpu[i].vote;
+		message[4u + 2u * i] = gpu[i].frequency_khz;
+	}
+	for (uint32_t i = 0; i < gmu_count; i++) {
+		message[3u + 2u * POLARIS_A630_HFI_MAX_GPU_LEVELS + 2u * i] = gmu[i].vote;
+		message[4u + 2u * POLARIS_A630_HFI_MAX_GPU_LEVELS + 2u * i] = gmu[i].frequency_khz;
+	}
 	return true;
 }
 
