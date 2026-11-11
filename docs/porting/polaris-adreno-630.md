@@ -205,6 +205,17 @@ allow it. A successful firmware boot alone is not a completed driver.
   ([`kgsl.h`](https://android.googlesource.com/kernel/msm.git/%2B/a11d0d49d2b949d401f8899369db331102d23cc3/drivers/gpu/msm/kgsl.h),
   [`adreno_ringbuffer.h`](https://android.googlesource.com/kernel/msm/%2B/7a5cb50be049b0de03e13c98b65cb3770ad15481/drivers/gpu/msm/adreno_ringbuffer.h));
   this stage has not been run under HakiOS on the phone.
+- `adreno=17` is the next explicit hardware stage. It requires the GPU core initially off and
+  SID0 detached, prepares the step 16 SQE/ring/RPTR mappings, starts the GMU/HFI with its separate
+  SID5/SID4 contexts, sends and verifies `PERF_TBL`, `BW_VOTE_TBL`, `HFI_TEST`, and initial DCVS,
+  then releases the temporary host DDR vote. With those prerequisites satisfied, it attaches the
+  populated GPU SID0 context, requests GX power using the A630 `OOB_GPU_SET_MASK` handshake, and
+  verifies the GX GDSC plus GFX3D clock readback. It leaves the GPU OOB request active to hold the
+  core for a later initialization stage. It deliberately stops before A6xx core setup, ring/SQE
+  register writes, `CP_ME_INIT`, ZAP authentication, or rendering. The OOB bit/ack protocol and
+  ordering follow Qualcomm's A630 KGSL [`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c)
+  and [`adreno.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno.c).
+  This stage adds hardware writes but has not been run on the phone; `ready()` remains false.
 
 ## Polaris hardware facts
 
@@ -523,12 +534,12 @@ bring-up and a bounded test submission.
    validated from runtime DT; an explicit read-only step 8 inspects the TCS and CX/GFX ARC tables.
    The A630 GMU/HFI bootstrap, temporary startup DDR TCS vote, `PERF_TBL`, `BW_VOTE_TBL`, initial
    boot-rail OOB, and default DCVS stages are implemented behind explicit `adreno=12`/`adreno=13`/
-   `adreno=14`, but none has been run on hardware. Implement SDM845 CX/GX sequencing and clocks,
-   then verify the Apps RSC transaction and sustained bandwidth/DCVS behavior against the Polaris
-   kernel. Keep step 7 limited to PAS staging and shutdown. After GMU/HFI and GPU domain sequencing
-   are established, add a bounded SQE/CP bootstrap ring and the A630 secure-mode transition before
-   calling `PAS_AUTH_AND_RESET`; verify the CP idle response and unwind PAS, GMU and power state on
-   failure.
+   `adreno=14`, but none has been run on hardware. Step 17 now adds the A630 GMU GPU OOB request
+   after GMU/HFI table setup and verifies GX/GFX3D power readback; it has not been run either.
+   Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior, and GX sequencing against
+   Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. Next port A630 core
+   initialization, then the bounded SQE/CP ring startup and secure-mode transition before calling
+   `PAS_AUTH_AND_RESET`; verify CP idle and unwind PAS, GMU, GPU OOB and power state on failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
