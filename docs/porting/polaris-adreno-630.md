@@ -18,8 +18,9 @@ allow it. A successful firmware boot alone is not a completed driver.
 - A separate `hakios.adreno.sdm845.c` probe is now wired into the driver configuration. On an
   SDM845 build, `adreno=1..4` reads the GPUCC, KGSL SMMU, GMU and (only when powered and clocked)
   3D core status; it checks the GCC GPU config-AHB clock before reading GPUCC and checks CX plus
-  GPU MEMNOC before reading the SMMU. Step 2 also reports SMMU capabilities and the current
-  SMR/S2CR stream routing (or the device-tree KGSL stream IDs when stream indexing is active).
+  GPU MEMNOC before reading the SMMU. Step 2 also reports SMMU capabilities, the current
+  SMR/S2CR stream routing (or the device-tree KGSL stream IDs when stream indexing is active),
+  and the IDR1-sized context-bank window and its nonzero registers.
   It does not write registers or expose rendering. This probe has not been run on the phone yet.
 - Firmware has been extracted read-only from the Polaris Recovery vendor partition. The local
   `fw-gpu/` directory is ignored by Git; the blobs must stay out of the repository and be staged
@@ -63,9 +64,15 @@ The SMMU node is marked `qcom,dynamic` and `qcom,use-3-lvl-tables`; the KGSL nod
 but they do not establish context-bank numbers, SMR masks, secure-context ownership, or whether
 the active hypervisor lets this kernel program those streams. Those still need validation against
 the matching Qualcomm KGSL/SMMU implementation and the live device before SMMU writes.
+The child node's `qcom,gpu-offset = <0x48000>` is an offset into the GPU register view for
+GPU-side access to that context bank; it is not a context-bank number or an offset to add to the
+SMMU physical base. KGSL's device-tree binding describes this property and notes that some
+targets instead use a separate SMMU register aperture ([binding](https://android.googlesource.com/kernel/msm/+/e92ad0d204333c5b5dceb9d1573a71a49a713db6/Documentation/devicetree/bindings/gpu/adreno-iommu.txt)).
 The read-only probe decodes the SMMU ID registers and current stream-routing registers using the
 ARM SMMUv2 register layout cross-checked against upstream Linux [`arm-smmu.h`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)
 and [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
+The probe calculates the context-bank aperture as `2^(NUMPAGENDXB+1) * register-page-size` and
+checks it against the device-tree `reg` extent before reading context registers.
 The v2 SMMU at `0x05040000` is not interchangeable with the Redwood driver's SMMUv500 at
 `0x03da0000`.
 

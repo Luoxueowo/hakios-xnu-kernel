@@ -76,6 +76,8 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 #define SMMU_IDR0_NUMSIDB_MASK          0x0fu
 #define SMMU_IDR0_NUMSMRG_MASK          0xffu
 #define SMMU_IDR1_PAGESIZE_64K          (1u << 31)
+#define SMMU_IDR1_NUMPAGENDXB_SHIFT      28
+#define SMMU_IDR1_NUMPAGENDXB_MASK       0x07u
 #define SMMU_IDR1_NUMS2CB_SHIFT         16
 #define SMMU_IDR1_NUMCB_MASK            0xffu
 #define SMMU_IDR2_PTFS_4K               (1u << 12)
@@ -92,6 +94,18 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 #define SMMU_S2CR(n)                    (0x0c00u + 4u * (n))
 #define SMMU_S2CR_TYPE_SHIFT            16
 #define SMMU_S2CR_CBNDX_MASK            0xffu
+#define SMMU_GR1                       0x1000u
+#define SMMU_CBAR(n)                    (SMMU_GR1 + 4u * (n))
+#define SMMU_CBA2R(n)                   (SMMU_GR1 + 0x0800u + 4u * (n))
+#define SMMU_CB_SCTLR                   0x0000u
+#define SMMU_CB_TCR2                    0x0010u
+#define SMMU_CB_TTBR0                   0x0020u
+#define SMMU_CB_TCR                     0x0030u
+#define SMMU_CB_MAIR0                   0x0038u
+#define SMMU_CB_FSR                     0x0058u
+#define SMMU_CB_TLBSYNC                 0x07f0u
+#define SMMU_CB_TLBSTATUS               0x07f4u
+#define SMMU_SCTLR_M                    (1u << 0)
 
 /* A6xx GMU offsets are in 32-bit words in the register XML. */
 #define GMU_WORD(n)                     (4u * (n))
@@ -345,6 +359,67 @@ probe_gpucc(void)
 	return true;
 }
 
+static void
+probe_smmu_contexts(uint32_t idr1)
+{
+	uint32_t page_shift = (idr1 & SMMU_IDR1_PAGESIZE_64K) ? 16u : 12u;
+	uint32_t page_size = 1u << page_shift;
+	uint32_t num_page_index_bits = (idr1 >> SMMU_IDR1_NUMPAGENDXB_SHIFT) & SMMU_IDR1_NUMPAGENDXB_MASK;
+	uint32_t context_banks = idr1 & SMMU_IDR1_NUMCB_MASK;
+	uint64_t global_pages = 1ull << (num_page_index_bits + 1u);
+	uint64_t context_base = global_pages * page_size;
+	uint64_t context_end = context_base + (uint64_t)page_size * context_banks;
+	uint32_t active = 0;
+
+	/* IDR1 sizes the split global/context-bank register apertures; never probe beyond DT reg. */
+	if (context_banks == 0 || (uint64_t)SMMU_CB_TLBSTATUS + sizeof(uint32_t) > page_size ||
+	    context_base > smmu.size || context_end > smmu.size ||
+	    (context_banks != 0 &&
+	    (SMMU_CBAR(context_banks - 1) + sizeof(uint32_t) > context_base ||
+	    SMMU_CBA2R(context_banks - 1) + sizeof(uint32_t) > context_base))) {
+		printf("adreno-sdm845: SMMU context-bank window is outside DT reg (%#llx bytes); context registers are not read\n",
+		    (uint64_t)smmu.size);
+		return;
+	}
+
+	for (uint32_t i = 0; i < context_banks; i++) {
+		uint32_t cbar = probe_read(&smmu, SMMU_CBAR(i));
+		uint32_t cba2r = probe_read(&smmu, SMMU_CBA2R(i));
+		uint32_t base = (uint32_t)context_base + page_size * i;
+		uint32_t sctlr = probe_read(&smmu, base + SMMU_CB_SCTLR);
+		uint32_t ttbr0_lo = probe_read(&smmu, base + SMMU_CB_TTBR0);
+		uint32_t ttbr0_hi = probe_read(&smmu, base + SMMU_CB_TTBR0 + 4u);
+		uint32_t tcr = probe_read(&smmu, base + SMMU_CB_TCR);
+		uint32_t tcr2 = probe_read(&smmu, base + SMMU_CB_TCR2);
+		uint32_t mair0 = probe_read(&smmu, base + SMMU_CB_MAIR0);
+		uint32_t fsr = probe_read(&smmu, base + SMMU_CB_FSR);
+
+		if (cbar == 0 && cba2r == 0 && sctlr == 0 && ttbr0_lo == 0 && ttbr0_hi == 0 && tcr == 0 &&
+		    tcr2 == 0 && mair0 == 0 && fsr == 0) {
+			continue;
+		}
+		active++;
+		printf("adreno-sdm845: SMMU CB%u: CBAR=%#x CBA2R=%#x SCTLR=%#x%s TTBR0=%#x%08x TCR=%#x "
+		    "TCR2=%#x MAIR0=%#x FSR=%#x\n", i, cbar, cba2r, sctlr,
+		    (sctlr & SMMU_SCTLR_M) ? " (translation on)" : "", ttbr0_hi, ttbr0_lo, tcr, tcr2, mair0, fsr);
+	}
+	printf("adreno-sdm845: SMMU context-bank window: page=%u bytes, base=%#llx, %u banks, %u nonzero\n",
+	    page_size, context_base, context_banks, active);
+}
+
+static uint32_t
+smmu_id_size_to_bits(uint32_t encoding)
+{
+	switch (encoding) {
+	case 0: return 32;
+	case 1: return 36;
+	case 2: return 40;
+	case 3: return 42;
+	case 4: return 44;
+	default: return 48;
+	}
+}
+
 static bool
 probe_smmu(void)
 {
@@ -390,30 +465,32 @@ probe_smmu(void)
 	    (unsigned)!!(idr0 & SMMU_IDR0_S1TS), (unsigned)!!(idr0 & SMMU_IDR0_S2TS),
 	    (unsigned)!!(idr0 & SMMU_IDR0_SMS), stream_groups,
 	    sid_bits, context_banks, s2_context_banks, 1u << (page_shift - 10));
-	printf("adreno-sdm845: SMMU page-walk: IAS/OAS/UBS encoding=%u/%u/%u, 4K/16K/64K tables=%u/%u/%u\n",
+	printf("adreno-sdm845: SMMU page-walk: IAS/OAS/UBS=%u/%u/%u bits, encodings=%u/%u/%u, "
+	    "4K/16K/64K tables=%u/%u/%u\n",
+	    smmu_id_size_to_bits(idr2 & SMMU_IDR2_IAS_MASK),
+	    smmu_id_size_to_bits((idr2 >> SMMU_IDR2_OAS_SHIFT) & SMMU_IDR2_SIZE_MASK),
+	    smmu_id_size_to_bits((idr2 >> SMMU_IDR2_UBS_SHIFT) & SMMU_IDR2_SIZE_MASK),
 	    idr2 & SMMU_IDR2_IAS_MASK, (idr2 >> SMMU_IDR2_OAS_SHIFT) & SMMU_IDR2_SIZE_MASK,
 	    (idr2 >> SMMU_IDR2_UBS_SHIFT) & SMMU_IDR2_SIZE_MASK, (unsigned)!!(idr2 & SMMU_IDR2_PTFS_4K),
 	    (unsigned)!!(idr2 & SMMU_IDR2_PTFS_16K), (unsigned)!!(idr2 & SMMU_IDR2_PTFS_64K));
 	if (idr0 & SMMU_IDR0_SMS) {
 		if (stream_groups == 0) {
 			printf("adreno-sdm845: SMMU advertises stream matching but reports no SMR groups\n");
-			return true;
-		}
-		if (stream_groups > (POLARIS_SMMU_SIZE - SMMU_S2CR(0)) / sizeof(uint32_t)) {
+		} else if (stream_groups > (POLARIS_SMMU_SIZE - SMMU_S2CR(0)) / sizeof(uint32_t)) {
 			printf("adreno-sdm845: SMMU stream-match count %#x exceeds the mapped register window; entries are not read\n",
 			    stream_groups);
-			return true;
-		}
-		for (uint32_t i = 0; i < stream_groups; i++) {
-			uint32_t smr = probe_read(&smmu, SMMU_SMR(i));
-			uint32_t s2cr;
+		} else {
+			for (uint32_t i = 0; i < stream_groups; i++) {
+				uint32_t smr = probe_read(&smmu, SMMU_SMR(i));
+				uint32_t s2cr;
 
-			if (!(smr & SMMU_SMR_VALID)) {
-				continue;
+				if (!(smr & SMMU_SMR_VALID)) {
+					continue;
+				}
+				s2cr = probe_read(&smmu, SMMU_S2CR(i));
+				printf("adreno-sdm845: SMMU SMR[%u]=%#x S2CR=%#x type=%u context-bank=%u\n", i, smr, s2cr,
+				    (s2cr >> SMMU_S2CR_TYPE_SHIFT) & 3u, s2cr & SMMU_S2CR_CBNDX_MASK);
 			}
-			s2cr = probe_read(&smmu, SMMU_S2CR(i));
-			printf("adreno-sdm845: SMMU SMR[%u]=%#x S2CR=%#x type=%u context-bank=%u\n", i, smr, s2cr,
-			    (s2cr >> SMMU_S2CR_TYPE_SHIFT) & 3u, s2cr & SMMU_S2CR_CBNDX_MASK);
 		}
 	} else if (sid_bits <= 16) {
 		uint32_t sid_limit = 1u << sid_bits;
@@ -430,6 +507,7 @@ probe_smmu(void)
 			    (s2cr >> SMMU_S2CR_TYPE_SHIFT) & 3u, s2cr & SMMU_S2CR_CBNDX_MASK);
 		}
 	}
+	probe_smmu_contexts(idr1);
 	return true;
 }
 
