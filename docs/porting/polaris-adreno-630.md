@@ -287,11 +287,24 @@ allow it. A successful firmware boot alone is not a completed driver.
   fence. `ready()` also requires a separate public-client enable latch, which this bring-up path
   never raises. User submissions therefore remain disabled even after the kernel-owned smoke test.
   This write stage has not been run on the phone.
+- `adreno=22` repeats the verified kernel fence setup, builds a temporary client root with only the
+  ordinary read-only SQE/ring mappings, then tests a CPU-driven SID0 root switch to that ASID and
+  back. It waits for the CP ring and A6xx RBBM clients to be idle, faults SID0 in S2CR, disables
+  CB0, synchronizes the old/new ASIDs, updates TTBR0/TTBR1, re-enables CB0, and restores the
+  translation route. It reclaims the temporary tables only after SID0 is verified back on the
+  kernel root. This exercises context-register switching only: it submits no client IB, does not
+  prove that the root translates actual GPU accesses, and does not open the client gate. The idle
+  predicate follows Linux's A6xx ring-drain, RBBM-idle and hang-detection checks
+  ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/63407d3081a6b406d94bd7d96ff2ca38fa7df236/drivers/gpu/drm/msm/adreno/a6xx_gpu.c));
+  context-bank and ASID operations follow the ARM SMMUv2 architecture specification
+  ([IHI 0062](https://documentation-service.arm.com/static/5f900d34f86e16515cdc08fb)). The stage has
+  not been run on the phone.
 - The A630 backend keeps public-client submission disabled. Step 21 only submits one
-  kernel-owned fence, and `ready()` requires a separate client-enable latch that bring-up never
-  raises. Orderly stop accepts the successful idle GPU stages from GX startup through the kernel
-  fence smoke test; loader-return quiesce uses a bounded reset/route-fault path. Neither has been
-  validated on the phone, so clients stay disabled.
+  kernel-owned fence; step 22 only changes the selected SMMU root while the GPU is idle. `ready()`
+  requires a separate client-enable latch that bring-up never raises. Orderly stop accepts the
+  successful idle GPU stages from GX startup through the kernel fence smoke test; loader-return
+  quiesce uses a bounded reset/route-fault path. Neither has been validated on the phone, so clients
+  stay disabled.
 - `sdm845_gpu_stop()` first confirms the kernel fence and CP are idle, drains all four Polaris
   VBIF XINs, releases the GPU/boot OOB holds, and requests the A630 legacy-HFI slumber state using
   the DT-selected initial performance and bandwidth indices. It checks GMU slumber, CX busy and
@@ -688,14 +701,19 @@ command isolation review, and bounded hardware submission checks.
    request, GX/GFX3D verification, core HWCG/VBIF/UCHE defaults, CP register protection, bounded
    SQE/`CP_ME_INIT` startup, PAS ZAP authentication before SQE release, the
    `CP_SET_SECURE_MODE(0)` transition, and a kernel-owned CP memory-write fence smoke test. None
-   of these write stages has been run. Verify the Apps RSC transaction, sustained bandwidth/DCVS
+   of these write stages has been run. Step 22 now probes CPU-driven CB0 root switching at a full
+   A6xx idle boundary, but it has not been run and only tests context-register readback. Verify the
+   Apps RSC transaction, sustained bandwidth/DCVS
    behavior, GX sequencing, core readbacks, CP idle/error status, fence visibility and PAS cleanup
-   against Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. The dormant
-   kernel-owned fence path is implemented, but the client submit callback now rejects client
-   handles until it can complete after returning to the kernel root. Next validate the packets,
-   fence visibility, register protection and read-only ring mappings on Polaris; then implement a
-   no-APRIV client path with ring confidentiality and safe completion. Validate the orderly stop
-   path before accepting submissions; validate loader-return quiesce and add orderly partial-start
+   against Polaris before proceeding. Keep step 7 limited to PAS staging and shutdown. The client
+   submit callback still rejects client handles. The intended no-APRIV design is to switch roots
+   from the CPU only after a full CP/RBBM idle boundary, clear the shared read-only ring before each
+   client job, submit no trusted TTBR or kernel-fence address while the client root is active, then
+   return to the kernel root before issuing the cache-flush/fence packet. This avoids exposing
+   kernel root addresses through the client-readable ring and keeps writable completion memory out
+   of client roots, but remains a design proposal until step 22 and the command path are validated
+   on Polaris. Validate register protection, root switching, ring scrubbing, fence visibility,
+   orderly stop and loader-return quiesce before accepting submissions; add orderly partial-start
    cleanup. The stop path does not yet remove all inherited CX/GMU parent-domain and clock votes.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; orderly stop and loader-return quiesce are validated on the phone.
@@ -710,10 +728,12 @@ command isolation review, and bounded hardware submission checks.
    any SMMU write stage has
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
-   verify steps 19–21's bounded SQE/CP bootstrap, ZAP authentication, secure-mode transition and
-   kernel fence write, then implement a no-APRIV client path with ring confidentiality and a
-   completion proof after the client root is no longer active. Validate production register
-   protection, ring/fence mappings and mapper behavior and the normal-stop path. Qualcomm's
+   verify steps 19–22's bounded SQE/CP bootstrap, ZAP authentication, secure-mode transition,
+   kernel fence write and CPU-driven CB0 root switching. Implement the no-APRIV client path by
+   serializing each root change at a full A6xx idle boundary, scrubbing the shared read-only ring
+   before it is exposed to one client, and issuing the completion fence only after returning to the
+   kernel root. Validate production register protection, ring/fence mappings, mapper behavior and
+   the normal-stop path. Qualcomm's
    A630 KGSL path sets the SQE base and authenticates ZAP through PIL before releasing SQE halt,
    submits `CP_ME_INIT`, then uses `CP_SET_SECURE_MODE(0)` to leave secure mode
    ([`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c),
@@ -767,8 +787,13 @@ command isolation review, and bounded hardware submission checks.
   because a client IB can still read the shared SQE/ring pages. The kernel-owned SQE and ring now
   use unprivileged read-only mappings; writable RPTR/fence scratch is mapped only in the kernel GPU
   root and omitted from client roots. This also does not provide safe asynchronous completion by
-  itself. The userclient submit callback now rejects all client handles; the public gate also
-  remains closed. The local SQE guards `CP_SMMU_TABLE_UPDATE` and
+  itself. A CPU-driven CB0 context-switch helper and explicit `adreno=22` register probe now exist;
+  the probe builds a disposable client root and refuses to reclaim its tables if it cannot return
+  to the kernel root. It has not run on-device and does not submit a client IB. The proposed client
+  path clears the shared ring before one client's IBs, avoids putting kernel TTBR/fence addresses
+  into the client-visible ring, then switches to the kernel root at full GPU idle before flushing
+  and writing the private fence. The userclient submit callback still rejects all client handles;
+  the public gate remains closed. The local SQE guards `CP_SMMU_TABLE_UPDATE` and
   `CP_SET_PROTECTED_MODE` inside IBs, but broader command isolation and safe context-switch/teardown
   behavior still require hardware validation.
 - A630 stop after SQE startup accepts successful idle CP boundaries through the kernel-owned fence

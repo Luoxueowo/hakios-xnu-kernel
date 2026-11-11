@@ -125,6 +125,8 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_INIT_POLL_US            100u
 #define A630_CP_INTERRUPT_ERROR_MASK    0x000000f7u
 #define A630_RBBM_CP_BUSY_MASK          0x00000007u
+#define A630_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER (1u << 0)
+#define A630_RBBM_INT_HANG_DETECT       (1u << 23)
 #define A630_SQE_FILE_PREFIX_BYTES      4u
 
 /*
@@ -577,6 +579,8 @@ static struct polaris_smmu_address_space polaris_smmu_spaces[POLARIS_SMMU_ADDRES
 static LCK_GRP_DECLARE(polaris_gpu_client_lck_grp, "polaris-gpu-client-space");
 static LCK_MTX_DECLARE(polaris_gpu_client_lck, &polaris_gpu_client_lck_grp);
 static struct polaris_gpu_client_space polaris_gpu_client_spaces[POLARIS_GPU_MAX_CLIENT_SPACES];
+static struct polaris_gpu_client_space polaris_gpu_context_probe_client;
+static struct polaris_smmu_address_space *polaris_gpu_active_space;
 static uint32_t polaris_smmu_oas_bits;
 static uint32_t polaris_smmu_oas_encoding;
 static bool polaris_smmu_supports_4k;
@@ -1004,6 +1008,7 @@ static bool polaris_smmu_gmu_contexts_detach(void);
 static bool polaris_smmu_gpu_context_detach(void);
 static bool polaris_smmu_space_root_prepare(struct polaris_smmu_address_space *space);
 static bool polaris_smmu_space_destroy(struct polaris_smmu_address_space *space);
+static bool polaris_smmu_gpu_context_switch(struct polaris_smmu_address_space *target, const char *reason);
 static uint32_t smmu_id_size_to_bits(uint32_t encoding);
 
 static bool
@@ -2506,10 +2511,16 @@ polaris_smmu_gmu_contexts_detach(void)
 static bool
 polaris_smmu_gpu_context_detach(void)
 {
+	if (polaris_gpu_active_space != NULL &&
+	    polaris_gpu_active_space != &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU]) {
+		printf("adreno-sdm845: refusing to detach SID0 while a non-kernel page-table root is selected\n");
+		return false;
+	}
 	bool detached = polaris_smmu_context_detach(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
 	    &polaris_smmu_gpu_route, 0u, "GPU");
 
 	if (detached) {
+		polaris_gpu_active_space = NULL;
 		lck_mtx_lock(&polaris_gpu_client_lck);
 		for (uint32_t i = 0; i < POLARIS_GPU_MAX_CLIENT_SPACES; i++) {
 			polaris_gpu_client_spaces[i].smmu.context_active = false;
@@ -2608,6 +2619,7 @@ polaris_smmu_gpu_attach(void)
 	    &polaris_smmu_gpu_route)) {
 		return false;
 	}
+	polaris_gpu_active_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
 	lck_mtx_lock(&polaris_gpu_client_lck);
 	for (uint32_t i = 0; i < POLARIS_GPU_MAX_CLIENT_SPACES; i++) {
 		if (polaris_gpu_client_spaces[i].allocated && !polaris_gpu_client_spaces[i].quarantined) {
@@ -6495,6 +6507,265 @@ polaris_a630_cp_idle_for_stop(void)
 	    *fence == 0;
 }
 
+/* A6xx page-table changes require the CP ring and the GPU's other clients to be idle. */
+static bool
+polaris_a630_gpu_idle_for_root_switch(void)
+{
+	uint32_t bank, context;
+	uint64_t context_offset;
+
+	if (!polaris_gpu_core_ready || !polaris_gpu_cp_started || !polaris_gpu_cp_initialized ||
+	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active || !polaris_smmu_gpu_route.valid ||
+	    !map_block(&gpu) || smmu.virtual == 0 || polaris_smmu_context_page_size == 0) {
+		return false;
+	}
+	bank = polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_bank;
+	if (bank >= polaris_smmu_context_bank_count) {
+		return false;
+	}
+	context_offset = (uint64_t)polaris_smmu_context_base + (uint64_t)bank * polaris_smmu_context_page_size;
+	if (context_offset + polaris_smmu_context_page_size > smmu.size || context_offset > UINT32_MAX) {
+		return false;
+	}
+	context = (uint32_t)context_offset;
+	for (uint32_t elapsed = 0; elapsed < A630_CP_INIT_TIMEOUT_US; elapsed += A630_CP_INIT_POLL_US) {
+		uint32_t rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
+		uint32_t wptr = probe_read(&gpu, GPU_CP_RB_WPTR);
+		uint32_t status = probe_read(&gpu, GPU_RBBM_STATUS);
+		uint32_t interrupts = probe_read(&gpu, GPU_RBBM_INT_0_STATUS);
+		uint32_t cp_interrupts = probe_read(&gpu, GPU_CP_INTERRUPT_STATUS);
+
+		if (rptr == polaris_gpu_ring_write_pointer && rptr == wptr &&
+		    (status & ~A630_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER) == 0 &&
+		    (interrupts & A630_RBBM_INT_HANG_DETECT) == 0 &&
+		    (cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) == 0 &&
+		    probe_read(&gpu, GPU_CP_HW_FAULT) == 0 && probe_read(&gpu, GPU_CP_PROTECT_STATUS) == 0 &&
+		    probe_read(&smmu, context + SMMU_CB_FSR) == 0) {
+			return true;
+		}
+		delay_for_interval(A630_CP_INIT_POLL_US, NSEC_PER_USEC);
+	}
+	return false;
+}
+
+static void
+polaris_smmu_gpu_context_switch_fault(const char *reason)
+{
+	if (smmu.virtual != 0 && polaris_smmu_gpu_route.valid &&
+	    polaris_smmu_gpu_route.slot < POLARIS_SMMU_MAX_CONTEXT_BANKS) {
+		uint32_t current = probe_read(&smmu, SMMU_S2CR(polaris_smmu_gpu_route.slot));
+		uint32_t fault = current & ~SMMU_S2CR_TYPE_FIELD_MASK;
+
+		fault |= SMMU_S2CR_TYPE_FAULT << SMMU_S2CR_TYPE_SHIFT;
+		probe_write(&smmu, SMMU_S2CR(polaris_smmu_gpu_route.slot), fault);
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	polaris_gpu_active_space = NULL;
+	polaris_smmu_backend_faulted = true;
+	polaris_gpu_ring_submit_ready = false;
+	printf("adreno-sdm845: SID0 page-table switch failed (%s); stream faulted where possible and GPU resources are retained\n",
+	    reason != NULL ? reason : "unknown state");
+}
+
+/*
+ * A630v2 has no APRIV. Switch the SID0 root only at a full A6xx idle boundary, faulting the
+ * stream while the SMMUv2 context is disabled. This avoids exposing TTBRs in the client-visible
+ * CP ring; the public submit gate remains closed until this path is exercised on Polaris.
+ */
+static bool
+polaris_smmu_gpu_context_switch(struct polaris_smmu_address_space *target, const char *reason)
+{
+	struct polaris_smmu_address_space *current = polaris_gpu_active_space;
+	struct polaris_smmu_address_space *kernel_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
+	struct polaris_smmu_context_image current_image, target_image;
+	uint32_t bank, context, route_s2cr, fault_s2cr, expected_smr;
+	uint64_t context_offset;
+	const char *failure = "unknown state";
+
+	if (target == NULL || current == NULL || target == current) {
+		return target != NULL && target == current;
+	}
+	if (reason == NULL) {
+		reason = "unspecified transition";
+	}
+	if (polaris_smmu_backend_faulted || smmu.virtual == 0 || !polaris_smmu_gpu_route.valid ||
+	    !polaris_smmu_client_enabled || !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
+	    !current->context_active || !target->context_active || current->root == NULL || target->root == NULL ||
+	    current->context_bank != kernel_space->context_bank || target->context_bank != kernel_space->context_bank ||
+	    current->asid == 0 || target->asid == 0 || current->asid == target->asid ||
+	    current->pte_attributes != kernel_space->pte_attributes || target->pte_attributes != kernel_space->pte_attributes ||
+	    !polaris_smmu_context_image_build(current, &current_image) ||
+	    !polaris_smmu_context_image_build(target, &target_image) || !polaris_a630_gpu_idle_for_root_switch()) {
+		printf("adreno-sdm845: SID0 page-table switch refused for %s; context, route, or full-idle preconditions failed\n",
+		    reason);
+		return false;
+	}
+	bank = kernel_space->context_bank;
+	context_offset = (uint64_t)polaris_smmu_context_base + (uint64_t)bank * polaris_smmu_context_page_size;
+	if (context_offset + polaris_smmu_context_page_size > smmu.size || context_offset > UINT32_MAX ||
+	    polaris_smmu_gpu_route.slot >= POLARIS_SMMU_MAX_CONTEXT_BANKS) {
+		failure = "SMMU context register window is invalid";
+		goto fault;
+	}
+	context = (uint32_t)context_offset;
+	route_s2cr = (polaris_smmu_gpu_route.expected_s2cr &
+	    ~(SMMU_S2CR_TYPE_FIELD_MASK | SMMU_S2CR_CBNDX_MASK)) |
+	    (SMMU_S2CR_TYPE_TRANS << SMMU_S2CR_TYPE_SHIFT) | bank;
+	fault_s2cr = (route_s2cr & ~SMMU_S2CR_TYPE_FIELD_MASK) |
+	    (SMMU_S2CR_TYPE_FAULT << SMMU_S2CR_TYPE_SHIFT);
+	if ((probe_read(&smmu, SMMU_SCR0) & SMMU_SCR0_CLIENTPD) != 0 ||
+	    probe_read(&smmu, SMMU_CBAR(bank)) != current_image.cbar ||
+	    probe_read(&smmu, SMMU_CBA2R(bank)) != current_image.cba2r ||
+	    probe_read(&smmu, context + SMMU_CB_SCTLR) != current_image.sctlr ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR0) != (uint32_t)current_image.ttbr0 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR0 + 4u) != (uint32_t)(current_image.ttbr0 >> 32) ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR1) != (uint32_t)current_image.ttbr1 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR1 + 4u) != (uint32_t)(current_image.ttbr1 >> 32) ||
+	    probe_read(&smmu, context + SMMU_CB_TCR) != current_image.tcr ||
+	    probe_read(&smmu, context + SMMU_CB_TCR2) != current_image.tcr2 ||
+	    probe_read(&smmu, context + SMMU_CB_CONTEXTIDR) != 0 ||
+	    probe_read(&smmu, context + SMMU_CB_MAIR0) != current_image.mair0 ||
+	    probe_read(&smmu, context + SMMU_CB_MAIR1) != current_image.mair1 ||
+	    probe_read(&smmu, context + SMMU_CB_FSR) != 0 ||
+	    probe_read(&smmu, SMMU_S2CR(polaris_smmu_gpu_route.slot)) != route_s2cr) {
+		failure = "active SID0 route or root changed since the last verified attach/switch";
+		goto fault;
+	}
+	if (polaris_smmu_gpu_route.stream_matching) {
+		expected_smr = polaris_smmu_gpu_route.existing_smr ? polaris_smmu_gpu_route.expected_smr :
+		    (SMMU_SMR_VALID | (polaris_smmu_gpu_route.stream_id & SMMU_SMR_ID_MASK));
+		if (probe_read(&smmu, SMMU_SMR(polaris_smmu_gpu_route.slot)) != expected_smr) {
+			failure = "SID0 stream-matching entry changed";
+			goto fault;
+		}
+	}
+
+	/* Block new SID0 traffic while the context is disabled, so it cannot fall back to bypass. */
+	probe_write(&smmu, SMMU_S2CR(polaris_smmu_gpu_route.slot), fault_s2cr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, SMMU_S2CR(polaris_smmu_gpu_route.slot)) != fault_s2cr) {
+		failure = "SID0 fault-route readback failed";
+		goto fault;
+	}
+	probe_write(&smmu, context + SMMU_CB_SCTLR, 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, context + SMMU_CB_SCTLR) != 0 ||
+	    !polaris_smmu_tlbi(current) || !polaris_smmu_tlbi(target)) {
+		failure = "context disable or old/new ASID invalidation failed";
+		goto fault;
+	}
+	probe_write64(&smmu, context + SMMU_CB_TTBR0, target_image.ttbr0);
+	probe_write64(&smmu, context + SMMU_CB_TTBR1, target_image.ttbr1);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, context + SMMU_CB_TTBR0) != (uint32_t)target_image.ttbr0 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR0 + 4u) != (uint32_t)(target_image.ttbr0 >> 32) ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR1) != (uint32_t)target_image.ttbr1 ||
+	    probe_read(&smmu, context + SMMU_CB_TTBR1 + 4u) != (uint32_t)(target_image.ttbr1 >> 32) ||
+	    probe_read(&smmu, context + SMMU_CB_TCR) != target_image.tcr ||
+	    probe_read(&smmu, context + SMMU_CB_TCR2) != target_image.tcr2 ||
+	    !polaris_smmu_tlbi(target)) {
+		failure = "target TTBR readback or ASID invalidation failed";
+		goto fault;
+	}
+	probe_write(&smmu, context + SMMU_CB_SCTLR, target_image.sctlr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, context + SMMU_CB_SCTLR) != target_image.sctlr ||
+	    probe_read(&smmu, context + SMMU_CB_FSR) != 0) {
+		failure = "target context enable or fault-status readback failed";
+		goto fault;
+	}
+	probe_write(&smmu, SMMU_S2CR(polaris_smmu_gpu_route.slot), route_s2cr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&smmu, SMMU_S2CR(polaris_smmu_gpu_route.slot)) != route_s2cr) {
+		failure = "SID0 translation-route restore readback failed";
+		goto fault;
+	}
+	polaris_gpu_active_space = target;
+	printf("adreno-sdm845: switched idle SID0 from ASID %u to ASID %u for %s; CP ring and all A6xx RBBM clients were idle\n",
+	    current->asid, target->asid, reason);
+	return true;
+
+fault:
+	polaris_smmu_gpu_context_switch_fault(failure);
+	return false;
+}
+
+/* Explicit step 22: exercise an isolated client root switch without submitting client commands. */
+static bool
+polaris_a630_gpu_root_switch_probe(void)
+{
+	struct polaris_gpu_client_space *client = &polaris_gpu_context_probe_client;
+	struct polaris_smmu_address_space *kernel_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
+	struct polaris_gpu_dma_buffer *buffers[] = {
+		&polaris_gpu_sqe_buffer, &polaris_gpu_ring_buffer,
+	};
+
+	if (client->smmu.root != NULL || client->smmu.mapped_pages != 0 ||
+	    polaris_gpu_active_space != kernel_space || !polaris_gpu_fence_smoke_test_done ||
+	    !polaris_gpu_ring_submit_ready || polaris_smmu_backend_faulted) {
+		printf("adreno-sdm845: step 22 requires a clean probe slot, the kernel root selected, CP idle and the completed step 21 fence test\n");
+		return false;
+	}
+	bzero(client, sizeof(*client));
+	client->smmu.name = "3D context-switch probe";
+	client->smmu.pte_attributes = kernel_space->pte_attributes;
+	client->smmu.cached_l1_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+	client->smmu.cached_l2_index = POLARIS_SMMU_CACHE_INDEX_NONE;
+	client->smmu.context_bank = kernel_space->context_bank;
+	client->smmu.asid = POLARIS_GPU_CLIENT_ASID_FIRST;
+	client->smmu.context_active = true;
+	if (!polaris_gpu_client_space_map_private(client)) {
+		printf("adreno-sdm845: step 22 could not build the temporary ordinary read-only SQE/ring root\n");
+		goto cleanup;
+	}
+	if (!polaris_smmu_gpu_context_switch(&client->smmu, "step 22 client-root probe")) {
+		if (polaris_gpu_active_space == kernel_space && !polaris_smmu_backend_faulted) {
+			goto cleanup;
+		}
+		client->quarantined = true;
+		printf("adreno-sdm845: step 22 retained its client tables after the root switch faulted SID0\n");
+		return false;
+	}
+	if (!polaris_smmu_gpu_context_switch(kernel_space, "step 22 return to kernel root")) {
+		polaris_smmu_gpu_context_switch_fault("step 22 could not return SID0 to the kernel root");
+		client->quarantined = true;
+		printf("adreno-sdm845: step 22 left its client tables allocated because SID0 did not return to a verified kernel root\n");
+		return false;
+	}
+	for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
+		polaris_smmu_space_unmap(&client->smmu, buffers[i]->gpu_address, buffers[i]->allocation_size);
+	}
+	if (client->smmu.mapped_pages != 0 || !polaris_smmu_space_destroy(&client->smmu)) {
+		client->quarantined = true;
+		polaris_smmu_backend_faulted = true;
+		polaris_gpu_ring_submit_ready = false;
+		printf("adreno-sdm845: step 22 could not reclaim the detached probe root; its tables remain allocated\n");
+		return false;
+	}
+	bzero(client, sizeof(*client));
+	printf("adreno-sdm845: step 22 switched SID0 kernel ASID -> client ASID -> kernel ASID with only SQE/ring read-only mappings; no client IB was submitted and the public gate stays closed\n");
+	return true;
+
+cleanup:
+	for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
+		if (buffers[i]->gpu_address != 0 && buffers[i]->allocation_size != 0) {
+			polaris_smmu_space_unmap(&client->smmu, buffers[i]->gpu_address, buffers[i]->allocation_size);
+		}
+	}
+	if (client->smmu.root != NULL) {
+		if (!polaris_smmu_backend_faulted && client->smmu.mapped_pages == 0 &&
+		    polaris_smmu_space_destroy(&client->smmu)) {
+			bzero(client, sizeof(*client));
+		} else {
+			client->quarantined = true;
+			polaris_smmu_backend_faulted = true;
+			polaris_gpu_ring_submit_ready = false;
+			printf("adreno-sdm845: step 22 retained its failed temporary page-table allocation after cleanup could not be verified\n");
+		}
+	}
+	return false;
+}
+
 /* Polaris has no GBIF; drain all four VBIF XINs before releasing the GX hold. */
 static bool
 polaris_a630_vbif_drain_for_stop(void)
@@ -7500,8 +7771,18 @@ hakios_adreno_sdm845_init(void)
 		printf("adreno-sdm845: step 21 finished; the bounded kernel fence test retired, but the GPU backend remains disabled for client submissions\n");
 		return;
 	}
-	if (last_step > 21u) {
-		printf("adreno-sdm845: supported explicit stages end at adreno=21; requested step %u is refused\n", last_step);
+	if (last_step == 22u) {
+		printf("adreno-sdm845: step 22 performs the verified kernel fence setup, then switches SID0 to a temporary client root and back while the A6xx GPU is fully idle; it submits no client IB\n");
+		if (!polaris_a630_gpu_domain_start(22u) || !polaris_a630_gpu_core_initialize() ||
+		    !polaris_a630_cp_ring_start() || !polaris_a630_cp_set_unsecured_mode() ||
+		    !polaris_a630_cp_fence_smoke_test() || !polaris_a630_gpu_root_switch_probe()) {
+			return;
+		}
+		printf("adreno-sdm845: step 22 finished; SID0 returned to the kernel root and temporary tables were reclaimed; public client submission remains disabled\n");
+		return;
+	}
+	if (last_step > 22u) {
+		printf("adreno-sdm845: supported explicit stages end at adreno=22; requested step %u is refused\n", last_step);
 		return;
 	}
 	printf("adreno-sdm845: Polaris Adreno 630 bring-up, steps 1..%u; step 7 stages ZAP only when explicitly requested\n",
