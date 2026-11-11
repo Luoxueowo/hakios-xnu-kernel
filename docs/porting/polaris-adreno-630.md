@@ -154,8 +154,24 @@ runtime reservation before mapping it for the explicit read-only probe. Qualcomm
 the header, resource tables, and auxiliary level data consumed by that probe
 ([SDM845 DTS](https://android.googlesource.com/kernel/common/+/f40f97aaf7fa6222f4ec073c24fb14f04ffb6f80/arch/arm64/boot/dts/qcom/sdm845.dtsi),
 [`cmd-db.c`](https://android.googlesource.com/kernel/common/+/29d66b3902962d0a89408abaf6d24a3df5eef518/drivers/soc/qcom/cmd-db.c)).
-No active rail voting is implemented yet; the discovered table contents and live TCS state must
-still be checked under HakiOS before the driver can issue any RPMh command.
+The same probe now validates and reports the runtime GPU and GMU operating-point arrays. Recovery's
+live tree has eight GPU entries (710, 675, 596, 520, 414, 342, 257, and 0 MHz) with per-entry bus
+frequency/minimum/maximum indices, and three GMU entries (0, 200, and 500 MHz). These values are
+read from DT; the driver does not assume that the checked-in or upstream frequency table matches
+the live tree.
+
+The Qualcomm A6xx KGSL flow uses the `gfx.lvl`/`cx.lvl` ARC tables to build GMU voltage votes from
+GPU/GMU operating points, then sends performance and bandwidth indices through the GMU DCVS/HFI
+path. This indicates the GPU-specific ARC vote owner is the GMU; HakiOS should not duplicate those
+votes with CPU-side active TCS requests. Qualcomm's A630v2 target identifies GMU 1.3 and enables
+RPMh, while KGSL labels the A630/A615 firmware path as legacy HFI. HakiOS therefore needs the
+A630 legacy queue/message contract, not assumptions taken from newer HFI variants
+([`kgsl_gmu.c`](https://android.googlesource.com/kernel/msm/+/9b7afd65fddcb21b51a2db8f4a82b08942225263/drivers/gpu/msm/kgsl_gmu.c),
+[`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm.git/+/7bbb67403d95f83d95e0ea464f972f247475d0d4/drivers/gpu/msm/adreno-gpulist.h),
+[`kgsl_hfi.c`](https://android.googlesource.com/kernel/msm/+/541919e72ee1156c0054952dd11d5066372095a8/drivers/gpu/msm/kgsl_hfi.c),
+[`sdm845-v2.dtsi`](https://android.googlesource.com/kernel/msm/+/5f65a2ac2505d5e0c122d5e54a58194c873b426c/arch/arm64/boot/dts/qcom/sdm845-v2.dtsi)).
+The current step 8 remains read-only: it discovers the tables and TCS state but sends neither an
+HFI message nor an RPMh request.
 
 The local firmware set is `a630_gmu.bin`, `a630_sqe.fw`, and `a630_zap.{mdt,b00,b01,b02,elf}`.
 The `mdt` describes three program headers, with a single loadable segment matching `b02`; the
@@ -241,11 +257,11 @@ bring-up and a bounded test submission.
 4. **Power, clocks and secure firmware.** The A630 raw GMU image path and size limit are now
    source-confirmed, and the local image fits. The signed ZAP metadata/segment loader and PAS 13
    shutdown path are implemented behind explicit `adreno=7`, gated on live DT and already-on
-  domains. The Apps RSC DRV2 and AOP CMD_DB windows are now validated from the runtime DT; an
-  explicit read-only step 8 inspects the TCS and CX/GFX ARC tables. Implement SDM845 CX/GX
-  sequencing, clocks and required RPMh votes; then exercise the
-   PAS stage, verify the secure stream/context, authenticate ZAP, and bring up GMU firmware/HFI.
-   Clean up in reverse on every failure.
+   domains. The Apps RSC DRV2 and AOP CMD_DB windows and GPU/GMU operating-point tables are now
+   validated from runtime DT; an explicit read-only step 8 inspects the TCS and CX/GFX ARC tables.
+   Implement SDM845 CX/GX sequencing and clocks, then start the A630 GMU and route GPU DCVS/ARC
+   votes through its verified HFI path. Exercise the PAS stage, verify the secure stream/context,
+   authenticate ZAP, and bring up GMU firmware/HFI. Clean up in reverse on every failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -281,8 +297,9 @@ bring-up and a bounded test submission.
   then validate its register protection table and the MSM submission path against the 630's
   GMEM/UBWC configuration.
 - Whether TrustZone PAS calls for GPU firmware are permitted from this boot environment.
-- Whether HakiOS can safely own the Apps RSC active TCS slots under the Polaris hypervisor, and
-  the exact voltage vote required for each A630 operating point. No RPMh writes have been issued.
+- Whether A630 GMU HFI initializes and accepts DCVS requests under HakiOS and the Polaris
+  hypervisor, and whether the runtime `gfx.lvl`/`cx.lvl` tables pair correctly with the live GPU/GMU
+  operating points. The GPU backend has issued no HFI or RPMh writes.
 - Cache coherency, interrupt availability, hang recovery, DVFS/thermal policy, and full
   client-memory isolation on the actual phone.
 

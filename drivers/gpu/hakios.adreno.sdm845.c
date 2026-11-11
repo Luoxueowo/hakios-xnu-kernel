@@ -60,6 +60,8 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_RPMH_DRV_DT_PATH        "/soc/mailbox@179e0000"
 #define POLARIS_CMD_DB_DT_PATH          "/soc/qcom,cmd-db@861e0000"
 #define POLARIS_CMD_DB_RESERVATION_PATH "/reserved-memory/removed_region@85fc0000"
+#define POLARIS_GPU_PWRLEVELS_DT_PATH   "/soc/qcom,kgsl-3d0@5000000/qcom,gpu-pwrlevels"
+#define POLARIS_GMU_PWRLEVELS_DT_PATH   "/soc/qcom,gmu/qcom,gmu-pwrlevels"
 #define POLARIS_SMMU_DT_PATH            "/soc/arm,smmu-kgsl@5040000"
 #define POLARIS_PIL_GPU_DT_PATH         "/soc/qcom,kgsl-hyp"
 #define POLARIS_GPU_MEMORY_DT_PATH      "/reserved-memory/gpu_region@0x8c415000"
@@ -88,6 +90,9 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define POLARIS_CMD_DB_ENTRY_SIZE         24u
 #define POLARIS_CMD_DB_MAX_ENTRIES        512u
 #define POLARIS_CMD_DB_MAX_LEVELS         16u
+#define POLARIS_MAX_GPU_PWRLEVELS         16u
+#define POLARIS_MAX_GMU_PWRLEVELS         16u
+#define POLARIS_MAX_CLOCK_RATE_HZ         1000000000u
 
 /* SDM845 Apps RSC DRV2; resource windows and TCS counts come from the live DT. */
 #define POLARIS_RPMH_DRV_ID                0x0000u
@@ -261,6 +266,12 @@ struct polaris_cmd_db_resource {
 	uint16_t levels[POLARIS_CMD_DB_MAX_LEVELS];
 	uint32_t level_count;
 };
+struct polaris_gpu_operating_point {
+	uint32_t frequency_hz;
+	uint32_t bus_frequency;
+	uint32_t bus_minimum;
+	uint32_t bus_maximum;
+};
 static struct polaris_zap_segment polaris_zap_segments[A630_MDT_MAX_SEGMENTS];
 static uint32_t polaris_zap_segment_count;
 static const uint8_t *polaris_zap_mdt;
@@ -290,6 +301,10 @@ static uint32_t polaris_rpmh_tcs_offset;
 static uint32_t polaris_rpmh_tcs_counts[4];
 static uint32_t polaris_rpmh_total_tcs;
 static const uint8_t *polaris_cmd_db;
+static struct polaris_gpu_operating_point polaris_gpu_pwrlevels[POLARIS_MAX_GPU_PWRLEVELS];
+static uint32_t polaris_gpu_pwrlevel_count;
+static uint32_t polaris_gmu_pwrlevels[POLARIS_MAX_GMU_PWRLEVELS];
+static uint32_t polaris_gmu_pwrlevel_count;
 static bool polaris_gmu_domain_ready;
 static bool polaris_gpu_core_ready;
 static bool polaris_smmu_core_context_active;
@@ -599,6 +614,110 @@ polaris_dt_clocks_match(DTEntry node, const char *name, const struct polaris_dt_
 			return false;
 		}
 	}
+	return true;
+}
+
+static bool
+polaris_runtime_pwrlevels_validate(void)
+{
+	DTEntry gpu_table = NULL, gmu_table = NULL;
+	char path[160];
+	uint32_t gpu_count = 0, gmu_count = 0, previous_gpu_frequency = UINT32_MAX;
+	bool gpu_idle_seen = false, gmu_nonzero_seen = false;
+
+	if (SecureDTLookupEntry(NULL, POLARIS_GPU_PWRLEVELS_DT_PATH, &gpu_table) != kSuccess || gpu_table == NULL ||
+	    !polaris_dt_has_compatible(gpu_table, "qcom,gpu-pwrlevels") ||
+	    SecureDTLookupEntry(NULL, POLARIS_GMU_PWRLEVELS_DT_PATH, &gmu_table) != kSuccess || gmu_table == NULL ||
+	    !polaris_dt_has_compatible(gmu_table, "qcom,gmu-pwrlevels")) {
+		printf("adreno-sdm845: runtime GPU/GMU operating-point tables are missing or have unexpected compatibles\n");
+		return false;
+	}
+
+	for (uint32_t i = 0; i < POLARIS_MAX_GPU_PWRLEVELS; i++) {
+		DTEntry level = NULL;
+		uint32_t index, frequency, bus, bus_min, bus_max;
+
+		snprintf(path, sizeof(path), "%s/qcom,gpu-pwrlevel@%u", POLARIS_GPU_PWRLEVELS_DT_PATH, i);
+		if (SecureDTLookupEntry(NULL, path, &level) != kSuccess || level == NULL) {
+			break;
+		}
+		if (!polaris_dt_get_u32(level, "reg", &index) || index != i ||
+		    !polaris_dt_get_u32(level, "qcom,gpu-freq", &frequency) || frequency > POLARIS_MAX_CLOCK_RATE_HZ ||
+		    !polaris_dt_get_u32(level, "qcom,bus-freq", &bus) ||
+		    !polaris_dt_get_u32(level, "qcom,bus-min", &bus_min) ||
+		    !polaris_dt_get_u32(level, "qcom,bus-max", &bus_max)) {
+			printf("adreno-sdm845: Polaris GPU operating point %u is incomplete or outside supported bounds\n", i);
+			return false;
+		}
+		if (frequency == 0) {
+			if (gpu_count == 0 || gpu_idle_seen || bus != 0 || bus_min != 0 || bus_max != 0) {
+				printf("adreno-sdm845: Polaris GPU idle operating point %u is malformed\n", i);
+				return false;
+			}
+			gpu_idle_seen = true;
+		} else if (gpu_idle_seen || frequency >= previous_gpu_frequency || bus == 0 || bus_max > 31 ||
+		    bus_min > bus || bus > bus_max) {
+			printf("adreno-sdm845: Polaris GPU operating point %u has invalid frequency or bus ordering\n", i);
+			return false;
+		}
+		polaris_gpu_pwrlevels[i] = (struct polaris_gpu_operating_point){ frequency, bus, bus_min, bus_max };
+		if (frequency != 0) {
+			previous_gpu_frequency = frequency;
+		}
+		gpu_count++;
+	}
+	if (gpu_count < 2 || !gpu_idle_seen || gpu_count == POLARIS_MAX_GPU_PWRLEVELS) {
+		printf("adreno-sdm845: Polaris GPU operating-point table lacks a bounded frequency range and idle entry\n");
+		return false;
+	}
+	for (uint32_t i = gpu_count; i < POLARIS_MAX_GPU_PWRLEVELS; i++) {
+		DTEntry level = NULL;
+
+		snprintf(path, sizeof(path), "%s/qcom,gpu-pwrlevel@%u", POLARIS_GPU_PWRLEVELS_DT_PATH, i);
+		if (SecureDTLookupEntry(NULL, path, &level) == kSuccess && level != NULL) {
+			printf("adreno-sdm845: Polaris GPU operating-point table has a gap before entry %u\n", i);
+			return false;
+		}
+	}
+	polaris_gpu_pwrlevel_count = gpu_count;
+
+	for (uint32_t i = 0; i < POLARIS_MAX_GMU_PWRLEVELS; i++) {
+		DTEntry level = NULL;
+		uint32_t index, frequency;
+
+		snprintf(path, sizeof(path), "%s/qcom,gmu-pwrlevel@%u", POLARIS_GMU_PWRLEVELS_DT_PATH, i);
+		if (SecureDTLookupEntry(NULL, path, &level) != kSuccess || level == NULL) {
+			break;
+		}
+		if (!polaris_dt_get_u32(level, "reg", &index) || index != i ||
+		    !polaris_dt_get_u32(level, "qcom,gmu-freq", &frequency) || frequency > POLARIS_MAX_CLOCK_RATE_HZ) {
+			printf("adreno-sdm845: Polaris GMU operating point %u is incomplete or outside supported bounds\n", i);
+			return false;
+		}
+		for (uint32_t prior = 0; prior < gmu_count; prior++) {
+			if (frequency != 0 && polaris_gmu_pwrlevels[prior] == frequency) {
+				printf("adreno-sdm845: Polaris GMU operating-point frequency %u is duplicated\n", frequency);
+				return false;
+			}
+		}
+		polaris_gmu_pwrlevels[i] = frequency;
+		gmu_nonzero_seen |= frequency != 0;
+		gmu_count++;
+	}
+	if (gmu_count < 2 || !gmu_nonzero_seen || gmu_count == POLARIS_MAX_GMU_PWRLEVELS) {
+		printf("adreno-sdm845: Polaris GMU operating-point table is incomplete or unbounded\n");
+		return false;
+	}
+	for (uint32_t i = gmu_count; i < POLARIS_MAX_GMU_PWRLEVELS; i++) {
+		DTEntry level = NULL;
+
+		snprintf(path, sizeof(path), "%s/qcom,gmu-pwrlevel@%u", POLARIS_GMU_PWRLEVELS_DT_PATH, i);
+		if (SecureDTLookupEntry(NULL, path, &level) == kSuccess && level != NULL) {
+			printf("adreno-sdm845: Polaris GMU operating-point table has a gap before entry %u\n", i);
+			return false;
+		}
+	}
+	polaris_gmu_pwrlevel_count = gmu_count;
 	return true;
 }
 
@@ -976,6 +1095,9 @@ polaris_runtime_power_validate(DTEntry gpu_node, DTEntry gmu_node)
 		return false;
 	}
 	if (!polaris_runtime_rpmh_validate()) {
+		return false;
+	}
+	if (!polaris_runtime_pwrlevels_validate()) {
 		return false;
 	}
 	printf("adreno-sdm845: runtime DT matches the SDM845 GPU/GFXCC clock tree, GPU/GMU supply domains, and CX/MX/GFX rails\n");
@@ -2067,6 +2189,16 @@ probe_rpmh(void)
 	printf("adreno-sdm845: CMD_DB gfx.lvl address=%#x levels:", gfx_level.address);
 	for (uint32_t i = 0; i < gfx_level.level_count; i++) {
 		printf(" %u", gfx_level.levels[i]);
+	}
+	printf("\n");
+	printf("adreno-sdm845: Polaris GPU pwrlevels (Hz/bus):");
+	for (uint32_t i = 0; i < polaris_gpu_pwrlevel_count; i++) {
+		printf(" %u:%u/%u", i, polaris_gpu_pwrlevels[i].frequency_hz,
+		    polaris_gpu_pwrlevels[i].bus_frequency);
+	}
+	printf("; GMU pwrlevels (Hz):");
+	for (uint32_t i = 0; i < polaris_gmu_pwrlevel_count; i++) {
+		printf(" %u:%u", i, polaris_gmu_pwrlevels[i]);
 	}
 	printf("\n");
 	printf("adreno-sdm845: RPMh discovery complete; no TCS registers or rail votes were written\n");
