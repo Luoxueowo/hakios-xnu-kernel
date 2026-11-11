@@ -362,6 +362,7 @@ extern bool HakiosGPUStart(void);
 #define GPU_WORD(n)                     (4u * (n))
 #define GPU_RBBM_INT_0_STATUS           GPU_WORD(0x0201)
 #define GPU_RBBM_STATUS                 GPU_WORD(0x0210)
+#define GPU_RBBM_STATUS3                GPU_WORD(0x0213)
 #define GPU_CP_HW_FAULT                 GPU_WORD(0x0821)
 #define GPU_CP_INTERRUPT_STATUS         GPU_WORD(0x0823)
 #define GPU_CP_PROTECT_STATUS           GPU_WORD(0x0824)
@@ -376,6 +377,12 @@ extern bool HakiosGPUStart(void);
 #define GPU_RBBM_SW_RESET_CMD            GPU_WORD(0x0043)
 #define GPU_CP_SQE_INSTR_BASE_LO        GPU_WORD(0x0830)
 #define GPU_CP_SQE_INSTR_BASE_HI        GPU_WORD(0x0831)
+#define GPU_CP_IB1_BASE_LO              GPU_WORD(0x0928)
+#define GPU_CP_IB1_BASE_HI              GPU_WORD(0x0929)
+#define GPU_CP_IB1_REM_SIZE             GPU_WORD(0x092a)
+#define GPU_CP_IB2_BASE_LO              GPU_WORD(0x092b)
+#define GPU_CP_IB2_BASE_HI              GPU_WORD(0x092c)
+#define GPU_CP_IB2_REM_SIZE             GPU_WORD(0x092d)
 #define GPU_RBBM_CLOCK_CNTL             GPU_WORD(0x00ae)
 #define GPU_RBBM_PERFCTR_GPU_BUSY_MASKED GPU_WORD(0x050b)
 #define GPU_CP_ROQ_THRESHOLDS_1         GPU_WORD(0x08c1)
@@ -7915,13 +7922,24 @@ static void
 sdm845_gpu_report(const char *why)
 {
 	uint32_t completed_fence = 0;
+	uint32_t gx, gfx3d_clock;
 	volatile uint32_t *fence_word;
-	bool gpu_mapped;
+	bool gpucc_accessible = false, gpu_core_accessible = false, gpu_mapped = false;
 
 	if (why == NULL) {
 		why = "unspecified failure";
 	}
-	gpu_mapped = map_block(&gpu);
+	/* A stale software-ready flag is not enough: GX can be power/clock gated after a fault. */
+	if (probe_gpucc_bus("GPU report") && map_block(&gpucc)) {
+		gpucc_accessible = true;
+		gx = probe_read(&gpucc, GPUCC_GX_GDSCR);
+		gfx3d_clock = probe_read(&gpucc, GPUCC_GX_GFX3D_CBCR);
+		gpu_core_accessible = (gx & GDSC_POWER_ON) != 0 &&
+		    (gfx3d_clock & (CBCR_ENABLE | CBCR_OFF)) == CBCR_ENABLE;
+		if (gpu_core_accessible) {
+			gpu_mapped = map_block(&gpu);
+		}
+	}
 	if (gpu_mapped && polaris_gpu_ring_submit_ready && polaris_gpu_rptr_buffer.virtual != 0) {
 		fence_word = (volatile uint32_t *)(polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET);
 		polaris_cache_lines((vm_offset_t)fence_word, sizeof(*fence_word));
@@ -7929,14 +7947,24 @@ sdm845_gpu_report(const char *why)
 		completed_fence = *fence_word;
 	}
 	if (gpu_mapped) {
-		printf("adreno-sdm845: GPU report: %s; last fence=%u done=%u RPTR=%#x WPTR=%#x software WPTR=%u status=%#x interrupt=%#x CP fault=%#x CP interrupt=%#x protection=%#x\n",
+		printf("adreno-sdm845: GPU report: %s; last fence=%u done=%u RPTR=%#x WPTR=%#x software WPTR=%u RBBM=%#x STATUS3=%#x interrupt=%#x CP fault=%#x CP interrupt=%#x protection=%#x\n",
 		    why, polaris_gpu_last_fence, completed_fence,
 		    probe_read(&gpu, GPU_CP_RB_RPTR), probe_read(&gpu, GPU_CP_RB_WPTR),
-		    polaris_gpu_ring_write_pointer, probe_read(&gpu, GPU_RBBM_STATUS),
+		    polaris_gpu_ring_write_pointer, probe_read(&gpu, GPU_RBBM_STATUS), probe_read(&gpu, GPU_RBBM_STATUS3),
 		    probe_read(&gpu, GPU_RBBM_INT_0_STATUS), probe_read(&gpu, GPU_CP_HW_FAULT),
 		    probe_read(&gpu, GPU_CP_INTERRUPT_STATUS), probe_read(&gpu, GPU_CP_PROTECT_STATUS));
+		printf("adreno-sdm845: CP active IB snapshot: IB1=%#x:%#x remaining=%#x IB2=%#x:%#x remaining=%#x\n",
+		    probe_read(&gpu, GPU_CP_IB1_BASE_HI), probe_read(&gpu, GPU_CP_IB1_BASE_LO),
+		    probe_read(&gpu, GPU_CP_IB1_REM_SIZE), probe_read(&gpu, GPU_CP_IB2_BASE_HI),
+		    probe_read(&gpu, GPU_CP_IB2_BASE_LO), probe_read(&gpu, GPU_CP_IB2_REM_SIZE));
+	} else if (!gpucc_accessible) {
+		printf("adreno-sdm845: GPU report: %s; GPUCC state unavailable; GPU MMIO snapshot skipped, last fence=%u\n",
+		    why, polaris_gpu_last_fence);
+	} else if (!gpu_core_accessible) {
+		printf("adreno-sdm845: GPU report: %s; GX is powered down or GFX3D clock is off; GPU MMIO snapshot skipped, last fence=%u\n",
+		    why, polaris_gpu_last_fence);
 	} else {
-		printf("adreno-sdm845: GPU report: %s; GPU MMIO window unavailable, last fence=%u\n", why,
+		printf("adreno-sdm845: GPU report: %s; GPU MMIO window unavailable while GX/GFX3D is on, last fence=%u\n", why,
 		    polaris_gpu_last_fence);
 	}
 

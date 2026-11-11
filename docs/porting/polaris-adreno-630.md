@@ -30,16 +30,20 @@ allow it. A successful firmware boot alone is not a completed driver.
   and deliberately retains resources if startup is faulted or safety cannot be confirmed. This
   runtime cleanup path has not yet been validated on the phone.
 - On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
-  `hakios.adreno.sdm845.o`, `hakios.adreno.o`, `MiniIOSurface.cpo`, and the shared IOKit GPU service,
-  including the new resource caps. The build emitted `hakios-kernel`, then exited 2 on the known
-  XNU kext symbol-set import-list failures; this is compile evidence only, not a device boot or GPU
-  runtime result.
+  `hakios.adreno.sdm845.o` (including the guarded A630 hang snapshot), `hakios.adreno.o`,
+  `MiniIOSurface.cpo`, and the shared IOKit GPU service, including the new resource caps. The build
+  emitted `hakios-kernel`, then exited 2 on the known XNU kext symbol-set import-list failures;
+  this is compile evidence only, not a device boot or GPU runtime result.
 - The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
   A completion wait of at least one second that expires blocks later GEM submissions before cache
   maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory
   remains retained. A ring-full report alone no longer short-circuits later fence waits. The A630
   report also samples the selected SID0 SMMUv2 context FSR/FAR/FSYNR0 and global SMMU fault state
-  when its existing mappings and bounds permit; this read-only snapshot does not recover the GPU.
+  when its existing mappings and bounds permit. Before reading GPU core registers it now checks
+  the live GX power and GFX3D clock state, then records RBBM STATUS3 and active CP IB1/IB2 base and
+  remaining-size registers. Their offsets match Qualcomm's A6xx
+  [`a6xx_reg.h`](https://android.googlesource.com/kernel/msm/%2B/d5d2256a441456eb3548ee03b95323f111732bb5/drivers/gpu/msm/a6xx_reg.h).
+  This read-only snapshot improves hang diagnosis; it does not recover the GPU.
   The offsets and Linux fault-read path follow upstream [`arm-smmu.h`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h)
   and [`arm-smmu.c`](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c).
   These changes have compile/source evidence only and still need a controlled Polaris run.
