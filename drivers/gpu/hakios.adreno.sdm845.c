@@ -102,6 +102,12 @@ extern lck_mtx_t hakios_rsc_lock;
 #define A630_CP_INIT_PACKET_DWORDS      (1u + A630_CP_INIT_ORDINALS)
 #define A630_CP_SECURE_MODE_DWORDS      2u
 #define A630_CP_RING_BYTES              (32u * 1024u)
+#define A630_CP_RING_DWORDS             (A630_CP_RING_BYTES / sizeof(uint32_t))
+#define A630_CP_RB_CNTL_DEFAULT         0x0000020cu
+#define A630_CP_INIT_TIMEOUT_US         2000000u
+#define A630_CP_INIT_POLL_US            100u
+#define A630_CP_INTERRUPT_ERROR_MASK    0x000000f7u
+#define A630_RBBM_CP_BUSY_MASK          0x00000007u
 #define A630_SQE_FILE_PREFIX_BYTES      4u
 
 /*
@@ -320,6 +326,18 @@ extern lck_mtx_t hakios_rsc_lock;
 #define GPU_RBBM_INT_0_STATUS           GPU_WORD(0x0201)
 #define GPU_RBBM_STATUS                 GPU_WORD(0x0210)
 #define GPU_CP_HW_FAULT                 GPU_WORD(0x0821)
+#define GPU_CP_INTERRUPT_STATUS         GPU_WORD(0x0823)
+#define GPU_CP_PROTECT_STATUS           GPU_WORD(0x0824)
+#define GPU_CP_RB_BASE                  GPU_WORD(0x0800)
+#define GPU_CP_RB_BASE_HI               GPU_WORD(0x0801)
+#define GPU_CP_RB_CNTL                  GPU_WORD(0x0802)
+#define GPU_CP_RB_RPTR_ADDR_LO          GPU_WORD(0x0804)
+#define GPU_CP_RB_RPTR_ADDR_HI          GPU_WORD(0x0805)
+#define GPU_CP_RB_RPTR                  GPU_WORD(0x0806)
+#define GPU_CP_RB_WPTR                  GPU_WORD(0x0807)
+#define GPU_CP_SQE_CNTL                 GPU_WORD(0x0808)
+#define GPU_CP_SQE_INSTR_BASE_LO        GPU_WORD(0x0830)
+#define GPU_CP_SQE_INSTR_BASE_HI        GPU_WORD(0x0831)
 #define GPU_RBBM_CLOCK_CNTL             GPU_WORD(0x00ae)
 #define GPU_RBBM_PERFCTR_GPU_BUSY_MASKED GPU_WORD(0x050b)
 #define GPU_CP_ROQ_THRESHOLDS_1         GPU_WORD(0x08c1)
@@ -630,6 +648,8 @@ static bool polaris_gpu_oob_active;
 static bool polaris_gmu_domain_ready;
 static bool polaris_gpu_core_ready;
 static bool polaris_gpu_core_configured;
+static bool polaris_gpu_cp_started;
+static bool polaris_gpu_cp_initialized;
 static bool polaris_smmu_backend_enabled;
 static bool polaris_smmu_backend_faulted;
 static bool polaris_sqe_safe;
@@ -5564,6 +5584,115 @@ fault:
 	return false;
 }
 
+/* Start the single A630 ring and wait for CP_ME_INIT to retire before any secure transition. */
+static bool
+polaris_a630_cp_ring_start(void)
+{
+	uint64_t ring_address = polaris_gpu_ring_buffer.gpu_address;
+	uint64_t rptr_address = polaris_gpu_rptr_buffer.gpu_address;
+	uint64_t sqe_address = polaris_gpu_sqe_buffer.gpu_address;
+	uint32_t ring_rptr, ring_wptr, cp_interrupts, cp_fault, protect_status, rbbm_status;
+
+	printf("adreno-sdm845: step 19: start the A630 SQE and submit CP_ME_INIT on the bounded ring\n");
+	if (polaris_gpu_cp_initialized) {
+		printf("adreno-sdm845: step 19 CP_ME_INIT has already retired\n");
+		return true;
+	}
+	if (polaris_gpu_cp_started || !polaris_gpu_core_ready || !polaris_gpu_core_configured ||
+	    !polaris_gpu_oob_active || !polaris_gmu_hfi_ready || !polaris_gmu_hfi_sealed ||
+	    !polaris_gmu_hfi_perf_table_ready || !polaris_gmu_hfi_bw_table_ready ||
+	    !polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active || polaris_smmu_backend_faulted ||
+	    !map_block(&gpu) || polaris_gpu_sqe_buffer.virtual == 0 ||
+	    polaris_gpu_ring_buffer.virtual == 0 || polaris_gpu_rptr_buffer.virtual == 0 ||
+	    polaris_gpu_sqe_buffer.requested_size == 0 ||
+	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
+	    polaris_gpu_rptr_buffer.requested_size < sizeof(uint32_t) ||
+	    (ring_address & 0xffffu) != 0 || (rptr_address & 0xffffu) != 0 ||
+	    (sqe_address & 0xffffu) != 0 || ring_address > UINT32_MAX ||
+	    rptr_address > UINT32_MAX || sqe_address > UINT32_MAX ||
+	    A630_CP_RING_DWORDS < A630_CP_INIT_PACKET_DWORDS) {
+		printf("adreno-sdm845: step 19 requires the configured A630 core, attached SID0, a live GPU OOB request, and aligned 32-bit SQE/ring/RPTR IOVAs\n");
+		return false;
+	}
+
+	ring_rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
+	ring_wptr = probe_read(&gpu, GPU_CP_RB_WPTR);
+	cp_interrupts = probe_read(&gpu, GPU_CP_INTERRUPT_STATUS);
+	cp_fault = probe_read(&gpu, GPU_CP_HW_FAULT);
+	protect_status = probe_read(&gpu, GPU_CP_PROTECT_STATUS);
+	rbbm_status = probe_read(&gpu, GPU_RBBM_STATUS);
+	if (ring_rptr != 0 || ring_wptr != 0 ||
+	    (cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 ||
+	    protect_status != 0 || (rbbm_status & A630_RBBM_CP_BUSY_MASK) != 0) {
+		printf("adreno-sdm845: step 19 refused a non-idle CP before startup: RPTR=%#x WPTR=%#x CP_INT=%#x CP_FAULT=%#x CP_PROTECT=%#x RBBM_STATUS=%#x\n",
+		    ring_rptr, ring_wptr, cp_interrupts, cp_fault, protect_status, rbbm_status);
+		return false;
+	}
+
+	/* The CP fetches only these read-only packets; its RPTR shadow is a separate writable page. */
+	*(volatile uint32_t *)polaris_gpu_rptr_buffer.virtual = 0;
+	polaris_cache_lines(polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
+	polaris_cache_lines(polaris_gpu_rptr_buffer.virtual, sizeof(uint32_t));
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	probe_write(&gpu, GPU_CP_RB_RPTR_ADDR_LO, (uint32_t)rptr_address);
+	probe_write(&gpu, GPU_CP_RB_RPTR_ADDR_HI, (uint32_t)(rptr_address >> 32));
+	probe_write(&gpu, GPU_CP_RB_CNTL, A630_CP_RB_CNTL_DEFAULT);
+	probe_write(&gpu, GPU_CP_RB_BASE, (uint32_t)ring_address);
+	probe_write(&gpu, GPU_CP_RB_BASE_HI, (uint32_t)(ring_address >> 32));
+	probe_write(&gpu, GPU_CP_SQE_INSTR_BASE_LO, (uint32_t)sqe_address);
+	probe_write(&gpu, GPU_CP_SQE_INSTR_BASE_HI, (uint32_t)(sqe_address >> 32));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (probe_read(&gpu, GPU_CP_RB_RPTR_ADDR_LO) != (uint32_t)rptr_address ||
+	    probe_read(&gpu, GPU_CP_RB_RPTR_ADDR_HI) != (uint32_t)(rptr_address >> 32) ||
+	    probe_read(&gpu, GPU_CP_RB_CNTL) != A630_CP_RB_CNTL_DEFAULT ||
+	    probe_read(&gpu, GPU_CP_RB_BASE) != (uint32_t)ring_address ||
+	    probe_read(&gpu, GPU_CP_RB_BASE_HI) != (uint32_t)(ring_address >> 32) ||
+	    probe_read(&gpu, GPU_CP_SQE_INSTR_BASE_LO) != (uint32_t)sqe_address ||
+	    probe_read(&gpu, GPU_CP_SQE_INSTR_BASE_HI) != (uint32_t)(sqe_address >> 32)) {
+		goto fault;
+	}
+
+	/* Match KGSL's A6xx order: program SQE, release SQE_HALT, then publish CP_ME_INIT. */
+	polaris_gpu_cp_started = true;
+	probe_write(&gpu, GPU_CP_SQE_CNTL, 1u);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	probe_write(&gpu, GPU_CP_RB_WPTR, A630_CP_INIT_PACKET_DWORDS);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ring_wptr = probe_read(&gpu, GPU_CP_RB_WPTR);
+	if (ring_wptr != A630_CP_INIT_PACKET_DWORDS) {
+		goto fault;
+	}
+	for (uint32_t elapsed = 0; elapsed < A630_CP_INIT_TIMEOUT_US; elapsed += A630_CP_INIT_POLL_US) {
+		ring_rptr = probe_read(&gpu, GPU_CP_RB_RPTR);
+		cp_interrupts = probe_read(&gpu, GPU_CP_INTERRUPT_STATUS);
+		cp_fault = probe_read(&gpu, GPU_CP_HW_FAULT);
+		protect_status = probe_read(&gpu, GPU_CP_PROTECT_STATUS);
+		rbbm_status = probe_read(&gpu, GPU_RBBM_STATUS);
+		if ((cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 ||
+		    protect_status != 0) {
+			goto fault;
+		}
+		if (ring_rptr == A630_CP_INIT_PACKET_DWORDS &&
+		    (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0) {
+			polaris_gpu_cp_initialized = true;
+			printf("adreno-sdm845: step 19 CP_ME_INIT retired: RPTR=%u CP idle; secure mode unchanged, ZAP auth and user submissions remain disabled\n",
+			    ring_rptr);
+			return true;
+		}
+		delay(A630_CP_INIT_POLL_US);
+	}
+	goto fault;
+
+fault:
+	polaris_smmu_backend_faulted = true;
+	printf("adreno-sdm845: step 19 SQE/CP startup or CP_ME_INIT failed: RPTR=%#x CP_INT=%#x CP_FAULT=%#x CP_PROTECT=%#x RBBM_STATUS=%#x; buffers and GPU power are retained for diagnosis\n",
+	    probe_read(&gpu, GPU_CP_RB_RPTR), probe_read(&gpu, GPU_CP_INTERRUPT_STATUS),
+	    probe_read(&gpu, GPU_CP_HW_FAULT), probe_read(&gpu, GPU_CP_PROTECT_STATUS),
+	    probe_read(&gpu, GPU_RBBM_STATUS));
+	return false;
+}
+
 static bool
 polaris_a630_gpu_domain_start(uint32_t step)
 {
@@ -5807,8 +5936,17 @@ hakios_adreno_sdm845_init(void)
 		printf("adreno-sdm845: step 18 finished; A630 core defaults and protected-register ranges are programmed, GPU OOB remains asserted, and SQE/CP, ZAP authentication, and rendering remain disabled\n");
 		return;
 	}
-	if (last_step > 18u) {
-		printf("adreno-sdm845: supported explicit stages end at adreno=18; requested step %u is refused\n", last_step);
+	if (last_step == 19) {
+		printf("adreno-sdm845: step 19 performs guarded GMU/GX/core setup then starts the SQE and waits for CP_ME_INIT idle; secure mode and submissions remain disabled\n");
+		if (!polaris_a630_gpu_domain_start(19u) || !polaris_a630_gpu_core_initialize() ||
+		    !polaris_a630_cp_ring_start()) {
+			return;
+		}
+		printf("adreno-sdm845: step 19 finished; SQE is running and CP_ME_INIT retired, but ZAP authentication, secure-mode transition, fences, and rendering remain disabled\n");
+		return;
+	}
+	if (last_step > 19u) {
+		printf("adreno-sdm845: supported explicit stages end at adreno=19; requested step %u is refused\n", last_step);
 		return;
 	}
 	printf("adreno-sdm845: Polaris Adreno 630 bring-up, steps 1..%u; step 7 stages ZAP only when explicitly requested\n",

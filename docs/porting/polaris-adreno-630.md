@@ -229,6 +229,17 @@ allow it. A successful firmware boot alone is not a completed driver.
   and [`kgsl_iommu.c`](https://android.googlesource.com/kernel/msm/%2B/f39cb888297d4560766734fe0c42177714f8f9d5/drivers/gpu/msm/kgsl_iommu.c).
   It stops before SQE/ring register programming, `CP_ME_INIT`, ZAP authentication or submission.
   This write stage has not been run on the phone; `ready()` remains false.
+- `adreno=19` repeats the guarded GMU/GX startup and step 18 core setup, programs the SQE,
+  read-only 32-KiB CP ring and writable RPTR page, then releases SQE halt and publishes the
+  12-dword `CP_ME_INIT` packet. It verifies the programmed IOVAs and ring control before starting
+  CP, verifies the published WPTR, then waits up to two seconds for RPTR to retire the packet,
+  RBBM CP/AHB busy bits to clear, and CP error, hardware-fault and protection status to stay clear. Failures fault the backend
+  and retain buffers and power for diagnosis. This follows Qualcomm's A630 `a6xx_rb_start()` /
+  `a6xx_send_cp_init()` sequence in [`adreno_a6xx.c`](https://android.googlesource.com/kernel/msm/%2B/eb78ba4b034e826f66279bd30408d96227a67210/drivers/gpu/msm/adreno_a6xx.c) and
+  the ring-size definition in [`adreno_a6xx.h`](https://android.googlesource.com/kernel/msm/%2B/33ba973747392d08905b14b9d47a1bfb9ffb20d0/drivers/gpu/msm/adreno_a6xx.h).
+  Secure mode remains unchanged; ZAP authentication, `CP_SET_SECURE_MODE`, fences and user
+  submissions are not attempted. This write stage has not been run on the phone; `ready()` remains
+  false.
 
 ## Polaris hardware facts
 
@@ -547,13 +558,13 @@ bring-up and a bounded test submission.
    validated from runtime DT; an explicit read-only step 8 inspects the TCS and CX/GFX ARC tables.
    The A630 GMU/HFI bootstrap, temporary startup DDR TCS vote, `PERF_TBL`, `BW_VOTE_TBL`, initial
    boot-rail OOB, and default DCVS stages are implemented behind explicit `adreno=12`/`adreno=13`/
-   `adreno=14`, but none has been run on hardware. Steps 17 and 18 now add the A630 GMU GPU OOB
-   request, GX/GFX3D verification, core HWCG/VBIF/UCHE defaults and CP register protection; neither
-   write stage has been run. Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior,
-   GX sequencing, and core readbacks against Polaris before proceeding. Keep step 7 limited to PAS
-   staging and shutdown. Next implement bounded SQE/CP ring startup and the secure-mode transition
-   before calling `PAS_AUTH_AND_RESET`; verify CP idle and unwind PAS, GMU, GPU OOB and power state
-   on failure.
+   `adreno=14`, but none has been run on hardware. Steps 17–19 now add the A630 GMU GPU OOB
+   request, GX/GFX3D verification, core HWCG/VBIF/UCHE defaults, CP register protection, and a
+   bounded SQE/`CP_ME_INIT` startup with idle/error readbacks; none of these write stages has been
+   run. Verify the Apps RSC transaction, sustained bandwidth/DCVS behavior, GX sequencing, core
+   readbacks and CP idle/error status against Polaris before proceeding. Keep step 7 limited to PAS
+   staging and shutdown. Next implement the secure-mode transition and ZAP authentication in the
+   A630 order; verify CP idle and unwind PAS, GMU, GPU OOB and power state on failure.
    **Gate:** GMU firmware reaches its documented ready state; SMMU and secure firmware report no
    faults; stop returns hardware to the loader's prior state.
 5. **SMMUv2 and command processor.** The software 4K page-table mapper and its table-cache
@@ -567,7 +578,7 @@ bring-up and a bounded test submission.
    any SMMU write stage has
    run on the phone. Do not invoke step 11 until HYP ownership and write access are verified from
    a controlled HakiOS boot. Then verify the GMU contexts and conditional 3D context attachments,
-   bring up the SQE/CP with a bounded bootstrap ring, authenticate ZAP, send
+   verify step 19's bounded SQE/CP bootstrap ring, authenticate ZAP, send
    `CP_SET_SECURE_MODE(0)`, and wait for CP idle before ordinary command submission. Qualcomm's
    A6xx path enables SQE and calls `a6xx_cp_init` before ZAP authentication, then uses the CP packet to leave secure mode
    ([`a6xx_gpu.c`](https://android.googlesource.com/kernel/common/%2B/68a00586559f5fce3bb163f4618f1b71ef05b4e7/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
