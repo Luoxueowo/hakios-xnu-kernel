@@ -271,6 +271,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   is not implemented yet, so stop deliberately refuses to tear resources down underneath a live
   CP. This is a safety guard, not a completed power-down path; runtime start/stop and recovery
   remain unavailable.
+- There is an earlier lifecycle gap: the shared `hakios_adreno_stop()` only calls `HakiosGPUStop()`
+  when `hakios_gpu_ready()` is true, while A630 deliberately keeps `ready()` false and its backend
+  has no `quiesce` callback. Therefore the A630 stop guard is not reached through the normal stop
+  entry, and `loader_return()` does not quiesce this backend before returning memory to the loader.
+  After a write stage has started GMU/HFI or attached SMMU streams, this can leave live hardware
+  referencing kernel-owned queues or page tables. Do not run those stages on-device or treat a
+  return to the loader as safe until lifecycle dispatch and a verified A630 quiesce path are in
+  place. Do not fix this by merely removing the readiness check: A630 needs a stage-aware shutdown
+  that proves the GMU and CP are idle before releasing votes, routes, or backing memory.
 
 ## Polaris hardware facts
 
@@ -675,7 +684,12 @@ bounded hardware submission checks.
   ([`adreno-gpulist.h`](https://android.googlesource.com/kernel/msm/%2B/090c2c5774db4807fadaa2e283922264ae9267d1/drivers/gpu/msm/adreno-gpulist.h)). The current IOVA ranges are disjoint but share the same SID0 page table; a safe command-stream/private-memory isolation design remains a readiness blocker.
 - A630 shutdown after SQE startup: the current stop hook conservatively retains hardware votes,
   PAS and buffers. Implement and validate the GMU idle/slumber and CP stop/reset sequence before
-  enabling client submissions or claiming recoverable power-down.
+  enabling client submissions or claiming recoverable power-down. Upstream A6xx shutdown checks
+  GMU idle, clears pending bus transactions, requests slumber, then stops HFI/interrupts and removes
+  RPMh, power-domain, and clock votes; a separate force-off path handles a hung GMU. See Qualcomm's
+  [`a6xx_gmu.c`](https://android.googlesource.com/kernel/common/%2B/0d534518ce87317e884dbd1485111b0f1606a194/drivers/gpu/drm/msm/adreno/a6xx_gmu.c).
+  This is a sequence to audit against Polaris' A630 legacy HFI, RSC and SMMUv2 setup, not code to
+  copy verbatim.
 
 These are gates to resolve with source evidence and controlled device runs, not values to infer
 from Redwood or fill with guessed constants. The Dipper repository is only a comparison reference:
