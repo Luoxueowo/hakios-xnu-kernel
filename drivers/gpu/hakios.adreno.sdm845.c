@@ -3237,27 +3237,81 @@ polaris_gpu_clock_on(uint32_t offset, const char *name)
 	return polaris_block_clock_on(&gpucc, offset, name);
 }
 
+#define GCC_GPU_SNOC_DVM_GFX_CBCR       0x0018u
+#define GDSCR_CLK_DIS_WAIT_MASK         0x0000f000u
+#define GDSCR_CLK_DIS_WAIT(value)       ((value) << 12)
+#define CX_CLK_DIS_WAIT_VALUE           8u
+#define CX_GMU_CBCR_WAKE_SLEEP          ((0xfu << 8) | (0xfu << 4))
+#define RCG_CMD_ROOT_EN                 (1u << 1)
+#define RCG_CMD_ROOT_OFF                (1u << 31)
+#define RCG_UPDATE                      (1u << 0)
+
+/* gpucc-sdm845.c: the GMU's clock source is the crystal, undivided, root forced on. */
+static bool
+polaris_gmu_clock_source(void)
+{
+	uint32_t value = probe_read(&gpucc, GPUCC_GMU_RCGR_CFG);
+
+	probe_write(&gpucc, GPUCC_GMU_RCGR_CFG, value & ~((7u << 8) | 0x1fu));
+	probe_write(&gpucc, GPUCC_GMU_RCGR,
+	    probe_read(&gpucc, GPUCC_GMU_RCGR) | RCG_CMD_ROOT_EN | RCG_UPDATE);
+	for (uint32_t waited = 0; waited <= 1000; waited += 5) {
+		value = probe_read(&gpucc, GPUCC_GMU_RCGR);
+		if (!(value & RCG_UPDATE) && !(value & RCG_CMD_ROOT_OFF)) {
+			printf("adreno-sdm845: power: GMU clock source updated (CMD=%#x CFG=%#x)\n",
+			    value, probe_read(&gpucc, GPUCC_GMU_RCGR_CFG));
+			return true;
+		}
+		delay_for_interval(5, NSEC_PER_USEC);
+	}
+	printf("adreno-sdm845: power: GMU clock source did not update (CMD=%#x)\n", value);
+	return false;
+}
+
 static bool
 polaris_gpu_cx_power_on(void)
 {
+	uint32_t value;
+
 	if (!map_block(&gpucc)) {
 		printf("adreno-sdm845: power: GPUCC is not mapped\n");
 		return false;
 	}
 	printf("adreno-sdm845: power: the CX switch and its clocks\n");
+	/* gdsc_init(): the clock-disable delay first, then clear the collapse bit. */
+	value = probe_read(&gpucc, GPUCC_CX_GDSCR);
+	probe_write(&gpucc, GPUCC_CX_GDSCR,
+	    (value & ~GDSCR_CLK_DIS_WAIT_MASK) | GDSCR_CLK_DIS_WAIT(CX_CLK_DIS_WAIT_VALUE));
+	value = probe_read(&gpucc, GPUCC_CX_GDSCR);
+	probe_write(&gpucc, GPUCC_CX_GDSCR, value & ~GDSC_SW_COLLAPSE);
+	delay_for_interval(1, NSEC_PER_USEC);
+	for (uint32_t i = 0; i < 500; i++) {
+		value = probe_read(&gpucc, GPUCC_CX_GDSCR);
+		if (value & GDSC_POWER_ON) {
+			break;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	printf("adreno-sdm845: power: gpu_cx_gdsc %s (GDSCR=%#x)\n",
+	    (value & GDSC_POWER_ON) ? "came on" : "does not come on", value);
+	if (!(value & GDSC_POWER_ON)) {
+		return false;
+	}
+	/* The GPU's branches hang on the GCC clocks; snoc_dvm is the second parent. */
 	if (!map_block(&gcc_gpu_clocks) ||
 	    !polaris_block_clock_on(&gcc_gpu_clocks, GCC_GPU_CFG_AHB_CBCR, "gcc_gpu_cfg_ahb_clk") ||
-	    !polaris_block_clock_on(&gcc_gpu_clocks, GCC_GPU_MEMNOC_GFX_CBCR, "gcc_gpu_memnoc_gfx_clk")) {
+	    !polaris_block_clock_on(&gcc_gpu_clocks, GCC_GPU_MEMNOC_GFX_CBCR, "gcc_gpu_memnoc_gfx_clk") ||
+	    !polaris_block_clock_on(&gcc_gpu_clocks, GCC_GPU_SNOC_DVM_GFX_CBCR, "gcc_gpu_snoc_dvm_gfx_clk")) {
 		return false;
 	}
-	if (!polaris_gpu_gdsc_on(GPUCC_CX_GDSCR, "gpu_cx_gdsc") ||
-	    !polaris_gpu_clock_on(0x1078u, "gpucc_ahb_clk") ||
-	    !polaris_gpu_clock_on(GPUCC_CXO_CBCR, "gpu_cc_cxo_clk") ||
-	    !polaris_gpu_clock_on(GPUCC_CX_GMU_CBCR, "gpu_cc_cx_gmu_clk") ||
-	    !polaris_gpu_clock_on(0x5000u, "gpucc_smmu_vote_clk")) {
+	if (!polaris_gmu_clock_source()) {
 		return false;
 	}
-	return true;
+	value = probe_read(&gpucc, GPUCC_CX_GMU_CBCR);
+	probe_write(&gpucc, GPUCC_CX_GMU_CBCR,
+	    (value & ~CX_GMU_CBCR_WAKE_SLEEP) | CX_GMU_CBCR_WAKE_SLEEP);
+	return polaris_gpu_clock_on(GPUCC_CXO_CBCR, "gpu_cc_cxo_clk") &&
+	    polaris_gpu_clock_on(GPUCC_CX_GMU_CBCR, "gpu_cc_cx_gmu_clk");
 }
 
 /*
@@ -3284,7 +3338,7 @@ polaris_gpu_cp_software_prepare(void)
 
 	printf("adreno-sdm845: step 16: map A630 SQE, CP ring and RPTR scratch into the detached 3D SID0 page table\n");
 	if (!polaris_sqe_safe || polaris_sqe_image == NULL ||
-	    polaris_sqe_image_size <= A630_SQE_FILE_PREFIX_BYTES || !polaris_smmu_gpu_route.valid ||
+	    polaris_sqe_image_size <= A630_SQE_FILE_PREFIX_BYTES ||
 	    polaris_gpu_core_ready || polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
 	    polaris_smmu_backend_faulted || !polaris_smmu_supports_4k ||
 	    !polaris_a630_cp_bootstrap_packets(cp_init, sizeof(cp_init) / sizeof(cp_init[0]),
@@ -8140,7 +8194,7 @@ sdm845_gpu_report(const char *why)
 static bool
 polaris_a630_gpu_domain_start(uint32_t step)
 {
-	static bool (*const step_probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core,
+	static bool (*const step_probes[])(void) = { probe_gpucc, probe_gmu, probe_core,
 	    probe_firmware, probe_pas_capabilities };
 
 	for (uint32_t i = 0; i < sizeof(step_probes) / sizeof(step_probes[0]); i++) {
@@ -8154,9 +8208,9 @@ polaris_a630_gpu_domain_start(uint32_t step)
 		printf("adreno-sdm845: step %u could not switch CX on and start its clocks\n", step);
 		return false;
 	}
+	/* fajita's ladder never reads the SMMU: on this SoC the registers do not answer. */
 	if (!probe_smmu()) {
-		printf("adreno-sdm845: step %u could not map the SMMU after power-on\n", step);
-		return false;
+		printf("adreno-sdm845: step %u: the SMMU did not answer; going on without its registers\n", step);
 	}
 	if (polaris_gpu_core_ready || polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
 	    polaris_smmu_backend_faulted || !polaris_gpu_cp_software_prepare()) {
