@@ -8521,15 +8521,16 @@ polaris_a630_gpu_domain_start(uint32_t step)
 		printf("adreno-sdm845: step %u could not switch GX on after the OOB request\n", step);
 		return false;
 	}
+	/* ZAP refuses while the core is not ready, so the 3D registers are read first. */
+	if (!probe_core() || !polaris_gpu_core_ready) {
+		polaris_gmu_hfi_stop_after_failure(step);
+		printf("adreno-sdm845: step %u GMU acknowledged GPU power, but GX/GFX3D readback failed; CP remains stopped\n", step);
+		return false;
+	}
 	/* ZAP is reset by its authentication, so it runs only now: CX and GX both on. */
 	if (!stage_zap_shader_authenticated()) {
 		polaris_gmu_hfi_stop_after_failure(step);
 		printf("adreno-sdm845: step %u could not authenticate ZAP with CX/GX running\n", step);
-		return false;
-	}
-	if (!probe_core() || !polaris_gpu_core_ready) {
-		polaris_gmu_hfi_stop_after_failure(step);
-		printf("adreno-sdm845: step %u GMU acknowledged GPU power, but GX/GFX3D readback failed; CP remains stopped\n", step);
 		return false;
 	}
 	return true;
