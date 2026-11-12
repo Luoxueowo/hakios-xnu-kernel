@@ -200,6 +200,7 @@ extern bool HakiosGPUStart(void);
 #define GPUCC_GMU_RCGR                  0x1120
 #define GPUCC_GMU_RCGR_CFG              0x1124
 #define GPUCC_PLL1_MODE                 0x0100
+#define GDSC_SW_COLLAPSE                (1u << 0)       /* gdscr.c: off, by software */
 #define GDSC_POWER_ON                   (1u << 31)
 #define CBCR_ENABLE                     (1u << 0)
 #define CBCR_OFF                        (1u << 31)
@@ -3177,6 +3178,97 @@ polaris_gpu_dma_buffer_allocate(struct polaris_gpu_dma_buffer *buffer, uint64_t 
 			return false;
 		}
 		mapped_size += POLARIS_SMMU_TABLE_BYTES;
+	}
+	return true;
+}
+
+/*
+ * The chain's first writes: the CX and GX switches, then the GPUCC clocks the ZAP handoff and the
+ * SMMU need. Order and bits are the ones gpucc-sdm845.c and gdsc.c use -- clear the collapse bit
+ * and wait for POWER_ON; set CLK_ENABLE and wait for CLK_OFF to drop.
+ */
+static bool
+polaris_gpu_gdsc_on(uint32_t offset, const char *name)
+{
+	uint32_t value = probe_read(&gpucc, offset);
+
+	if (value & GDSC_POWER_ON) {
+		printf("adreno-sdm845: power: %s is on already (GDSCR=%#x)\n", name, value);
+		return true;
+	}
+	probe_write(&gpucc, offset, value & ~GDSC_SW_COLLAPSE);
+	for (uint32_t i = 0; i < 500; i++) {
+		value = probe_read(&gpucc, offset);
+		if (value & GDSC_POWER_ON) {
+			printf("adreno-sdm845: power: %s came on (GDSCR=%#x)\n", name, value);
+			return true;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	printf("adreno-sdm845: power: %s does not come on (GDSCR=%#x)\n", name, value);
+	return false;
+}
+
+static bool
+polaris_block_clock_on(struct probe_block *block, uint32_t offset, const char *name)
+{
+	uint32_t value = probe_read(block, offset);
+
+	if ((value & (CBCR_ENABLE | CBCR_OFF)) == CBCR_ENABLE) {
+		printf("adreno-sdm845: power: %s runs already (CBCR=%#x)\n", name, value);
+		return true;
+	}
+	probe_write(block, offset, value | CBCR_ENABLE);
+	for (uint32_t i = 0; i < 100; i++) {
+		value = probe_read(block, offset);
+		if ((value & (CBCR_ENABLE | CBCR_OFF)) == CBCR_ENABLE) {
+			printf("adreno-sdm845: power: %s runs (CBCR=%#x)\n", name, value);
+			return true;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	printf("adreno-sdm845: power: %s does not start (CBCR=%#x)\n", name, value);
+	return false;
+}
+
+static bool
+polaris_gpu_clock_on(uint32_t offset, const char *name)
+{
+	return polaris_block_clock_on(&gpucc, offset, name);
+}
+
+static bool
+polaris_gpu_cx_power_on(void)
+{
+	if (!map_block(&gpucc)) {
+		printf("adreno-sdm845: power: GPUCC is not mapped\n");
+		return false;
+	}
+	printf("adreno-sdm845: power: the CX switch and its clocks\n");
+	if (!map_block(&gcc_gpu_clocks) ||
+	    !polaris_block_clock_on(&gcc_gpu_clocks, GCC_GPU_CFG_AHB_CBCR, "gcc_gpu_cfg_ahb_clk") ||
+	    !polaris_block_clock_on(&gcc_gpu_clocks, GCC_GPU_MEMNOC_GFX_CBCR, "gcc_gpu_memnoc_gfx_clk")) {
+		return false;
+	}
+	if (!polaris_gpu_gdsc_on(GPUCC_CX_GDSCR, "gpu_cx_gdsc") ||
+	    !polaris_gpu_clock_on(GPUCC_CXO_CBCR, "gpu_cc_cxo_clk") ||
+	    !polaris_gpu_clock_on(GPUCC_CX_GMU_CBCR, "gpu_cc_cx_gmu_clk")) {
+		return false;
+	}
+	return true;
+}
+
+/*
+ * The GX switch hangs on the vdd_gfx rail, which the GMU raises with its OOB request. Switching it
+ * before that request has been acknowledged cannot succeed: the switch stays collapsed.
+ */
+static bool
+polaris_gpu_gx_power_on(void)
+{
+	printf("adreno-sdm845: power: the GX switch and the 3D clock, after the GPU OOB request\n");
+	if (!polaris_gpu_gdsc_on(GPUCC_GX_GDSCR, "gpu_gx_gdsc") ||
+	    !polaris_gpu_clock_on(GPUCC_GX_GFX3D_CBCR, "gpu_cc_gx_gfx3d_clk")) {
+		return false;
 	}
 	return true;
 }
@@ -8047,13 +8139,22 @@ static bool
 polaris_a630_gpu_domain_start(uint32_t step)
 {
 	static bool (*const step_probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core,
-	    probe_firmware, probe_pas_capabilities, stage_zap_shader_authenticated };
+	    probe_firmware, probe_pas_capabilities };
 
 	for (uint32_t i = 0; i < sizeof(step_probes) / sizeof(step_probes[0]); i++) {
 		if (!step_probes[i]()) {
 			printf("adreno-sdm845: step %u prerequisite %u failed; GMU/GX startup is not attempted\n", step, i + 1u);
 			return false;
 		}
+	}
+	/* The reads above run with CX off; power it, then read the SMMU again and stage the ZAP. */
+	if (!polaris_gpu_cx_power_on()) {
+		printf("adreno-sdm845: step %u could not switch CX on and start its clocks\n", step);
+		return false;
+	}
+	if (!probe_smmu()) {
+		printf("adreno-sdm845: step %u could not map the SMMU after power-on\n", step);
+		return false;
 	}
 	if (polaris_gpu_core_ready || polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ||
 	    polaris_smmu_backend_faulted || !polaris_gpu_cp_software_prepare()) {
@@ -8074,6 +8175,17 @@ polaris_a630_gpu_domain_start(uint32_t step)
 	if (!polaris_gmu_gpu_oob_request()) {
 		polaris_gmu_hfi_stop_after_failure(step);
 		printf("adreno-sdm845: step %u GPU OOB request failed; no A6xx core or CP registers were written\n", step);
+		return false;
+	}
+	if (!polaris_gpu_gx_power_on()) {
+		polaris_gmu_hfi_stop_after_failure(step);
+		printf("adreno-sdm845: step %u could not switch GX on after the OOB request\n", step);
+		return false;
+	}
+	/* ZAP is reset by its authentication, so it runs only now: CX and GX both on. */
+	if (!stage_zap_shader_authenticated()) {
+		polaris_gmu_hfi_stop_after_failure(step);
+		printf("adreno-sdm845: step %u could not authenticate ZAP with CX/GX running\n", step);
 		return false;
 	}
 	if (!probe_core() || !polaris_gpu_core_ready) {

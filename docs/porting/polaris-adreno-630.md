@@ -59,6 +59,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   GX/GFX3D clocks must already be running, while this chain turns them on later. `PAS_IS_SUPPORTED`
   still answers 0 and is no longer used as a gate; the real calls are what matter. Reordering the
   clock setup ahead of the PAS handoff is the next change.
+- The chain now powers CX before it reads the SMMU and authenticates the ZAP: the CX GDSC, the GCC
+  GPU AHB clock and the GPUCC CX clocks, then a second SMMU read, then the ZAP handoff only after
+  the OOB request has raised `vdd_gfx` and GX is on. On the phone CX comes on (GDSCR `0x222001` ->
+  `0xf8222000`) and `gpu_cc_cxo_clk` / `gpu_cc_cx_gmu_clk` run, but `gcc_gpu_memnoc_gfx_clk` stays
+  halted (`CBCR 0x80004221`) with CLK_ENABLE already set, so the SMMU is still unreadable. Its
+  branch has no running parent: `gcc_gpu_memnoc_gfx_clk_src`'s RCG has to be programmed next.
 - On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
   `hakios.adreno.sdm845.o` (including the guarded A630 hang snapshot), `hakios.adreno.o`,
   `MiniIOSurface.cpo`, and the shared IOKit GPU service, including the new resource caps. The build
