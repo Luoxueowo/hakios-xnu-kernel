@@ -313,7 +313,7 @@ extern bool HakiosGPUStart(void);
 #define GMU_HFI_QTBL_INFO                GMU_WORD(0x5184)
 #define GMU_HFI_QTBL_ADDR                GMU_WORD(0x5185)
 #define GMU_HFI_CTRL_INIT                GMU_WORD(0x5186)
-#define GMU_HFI_CTRL_STATUS              GMU_WORD(0x5187)
+#define GMU_HFI_CTRL_STATUS              GMU_WORD(0x5180)
 #define GMU_GMU2HOST_INTR_CLR            GMU_WORD(0x5191)
 #define GMU_GMU2HOST_INTR_INFO           GMU_WORD(0x5192)
 #define GMU_HOST2GMU_INTR_SET            GMU_WORD(0x5194)
@@ -331,6 +331,7 @@ extern bool HakiosGPUStart(void);
 #define GMU_AO_GPU_CX_BUSY_STATUS        GMU_REGISTER_GLOBAL_WORD(0x23b0cu)
 #define GMU_AO_AHB_FENCE_CTRL            GMU_REGISTER_GLOBAL_WORD(0x23b10u)
 #define GMU_AHB_FENCE_RANGE_0            GMU_WORD(0x9311)
+#define GMU_CM3_CFG                      GMU_WORD(0x502d)
 #define A630_GMU_FW_MAX_BYTES           0x8000u
 #define A630_GMU_FW_READY                0xbabefaceu
 #define A630_GMU_BOOT_TCM                2u
@@ -5984,6 +5985,11 @@ polaris_gmu_hfi_start(uint32_t step)
 	probe_write(&gmu, GMU_ICACHE_CONFIG, 1u);
 	probe_write(&gmu, GMU_DCACHE_CONFIG, 1u);
 	probe_write(&gmu, GMU_PWR_COL_INTER_FRAME_CTRL, 0x09c40400u);
+	/*
+	 * CM3_CFG is what keeps the firmware's snapshot out of its NMI handler; fajita's bring-up
+	 * writes 0x4052 here and the GMU never initialised HFI without it.
+	 */
+	probe_write(&gmu, GMU_CM3_CFG, 0x4052u);
 	probe_write(&gmu, GMU_GMU2HOST_INTR_CLR, UINT32_MAX);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	if (probe_read(&gmu, GMU_CM3_FW_INIT_RESULT) != 0u ||
@@ -6042,6 +6048,23 @@ polaris_gmu_hfi_start(uint32_t step)
 		    probe_read(&gmu, GMU_GMU2HOST_INTR_INFO), probe_read(&gmu, GMU_ALWAYS_ON_COUNTER_L));
 		delay(1000);
 		printf("/%#x (counter moves: firmware is still running)\n", probe_read(&gmu, GMU_ALWAYS_ON_COUNTER_L));
+		{
+			/*
+			 * The firmware writes why it stopped into the log buffer it was given; print what
+			 * it left there, as characters, before the stop path wipes the shared memory.
+			 */
+			const uint8_t *log_bytes = (const uint8_t *)polaris_hfi_uncached +
+			    POLARIS_A630_HFI_ALLOCATION_BYTES + A630_GMU_HFI_DUMP_BYTES;
+			char line[97];
+
+			for (uint32_t i = 0; i < 96u; i++) {
+				uint8_t c = log_bytes[i];
+
+				line[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+			}
+			line[96] = '\0';
+			printf("adreno-sdm845: step 12 GMU log: %s\n", line);
+		}
 		polaris_gmu_hfi_stop_after_failure(step);
 		printf("adreno-sdm845: step 12 GMU HFI queue initialization timed out; CM3 was reset\n");
 		return false;
