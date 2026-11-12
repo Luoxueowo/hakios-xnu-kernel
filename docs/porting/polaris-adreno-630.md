@@ -72,6 +72,21 @@ allow it. A successful firmware boot alone is not a completed driver.
   using its software renderer, so this run does not validate A630. At the time the log was read,
   ADB identified the phone as Recovery. This proves the small-DT boot path works; it does not
   establish that the later imported-DT image booted.
+- On 2026-11-12, the 64 MiB Recovery copy of `logdump` taken after the 45-second GPU-on attempt
+  still contained the older `g6528b4a7-dirty` boot record, with `ufs_write=1` and no `gpu=1` or
+  timer-return marker. The attempted image used `gpu=1`, `ufs_write=0`, and
+  `loader_return_after=45`. The old record reaches SpringBoard but uses CoreAnimation's software
+  renderer; it is not evidence about the latest GPU-on run. Its extracted text is saved at
+  `out/logs/polaris-gpu-on-fastreturn-logdump-20261112.txt`.
+  The corresponding 8.5 MiB image was then flashed to the phone's single `/dev/block/by-name/boot`
+  partition (64 MiB; the device exposes no `_a`/`_b` boot entries). `fastboot flash` reported
+  `OKAY`; `fastboot fetch` is not
+  supported by this bootloader. The original 64 MiB boot partition was saved at
+  `out/backups/polaris-boot-before-gpu-flash-20261112.img` for rollback. After rebooting the
+  flashed image, the phone had not re-enumerated over USB after more than 85 seconds, so no log
+  from that run is available. The timer path stops A630 and then calls `sdm845_gpu_quiesce()`;
+  that function intentionally fail-stops if it cannot prove the DMA path safe. A quiesce failure
+  is a plausible explanation for the missing return, but the current run has no log to confirm it.
 - Comparing the failed imported-DT runs (`device tree` length about `0xd03a8`, `boot_args` at
   `0xfc600000`) with that successful small-DT run (`0x467c`, `0xfc410000`) points to the Android
   DT import as the leading boot-failure suspect. A concrete format mismatch is present in
