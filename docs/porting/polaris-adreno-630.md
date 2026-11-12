@@ -88,6 +88,16 @@ allow it. A successful firmware boot alone is not a completed driver.
   prefix exactly matched the image. The original 64 MiB boot partition was saved at
   `out/backups/polaris-boot-before-gpu-flash-20261112.img`; restoring it with `fastboot flash boot`
   also returned `OKAY`. The phone was then rebooted into Recovery.
+- The subsequent no-Android-DT GPU-on control has a fresh Recovery log at
+  `out/logs/polaris-nodt-gpu-on-control-logdump-20261112.txt`. It reports the small `0x467c`
+  device tree, `gpu=1`, `ufs_write=0`, `data_required=1`, and `loader_return_after=45`. XNU reaches
+  `VFS_ROOT`, init mounts the system and both cryptexes, then reports that `/dev/ufs_darwin_data`
+  does not exist and refuses the empty RAM data volume. This is explained by the diagnostic flags:
+  `ufs_write=0` keeps the writable data block device from being created, while `data_required=1`
+  makes init exit when that device is absent. The loader then records its expected 45-second timer
+  return; there is no panic record. The kernel message buffer also reports that it cannot find the
+  interrupt controller in the small tree. There are no A630 stage messages, so this run neither
+  explains the earlier imported-DT startup failure nor proves that the GPU started.
 - Comparing the failed imported-DT runs (`device tree` length about `0xd03a8`, `boot_args` at
   `0xfc600000`) with that successful small-DT run (`0x467c`, `0xfc410000`) points to the Android
   DT import as the leading boot-failure suspect. A concrete format mismatch is present in
