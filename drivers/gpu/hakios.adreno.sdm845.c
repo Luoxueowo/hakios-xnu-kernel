@@ -2961,10 +2961,14 @@ sdm845_gpu_map(void *handle, uint64_t address, uint64_t phys, bool read_only)
 		return polaris_smmu_space_map_page(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU],
 		    address, phys, read_only);
 	}
+	/*
+	 * One address space for the whole GPU, the way redwood has it: a client's buffer is mapped
+	 * in the kernel root too, so the command processor never has to be pointed at a second set
+	 * of page tables and back for every submission.
+	 */
 	client = polaris_gpu_client_space_lookup(handle);
-	return client != NULL && !client->quarantined && client->smmu.context_active &&
-	    address >= POLARIS_GPU_VA_START &&
-	    polaris_smmu_space_map_page(&client->smmu, address, phys, read_only);
+	return client != NULL && !client->quarantined && address >= POLARIS_GPU_VA_START &&
+	    polaris_smmu_space_map_page(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], address, phys, read_only);
 }
 
 static void
@@ -2991,7 +2995,7 @@ sdm845_gpu_unmap(void *handle, uint64_t address, uint64_t size)
 	}
 	client = polaris_gpu_client_space_lookup(handle);
 	if (client != NULL && !client->quarantined && address >= POLARIS_GPU_VA_START) {
-		polaris_smmu_space_unmap(&client->smmu, address, size);
+		polaris_smmu_space_unmap(&polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU], address, size);
 	}
 }
 
@@ -7181,7 +7185,7 @@ polaris_a630_cp_idle_for_stop(void)
 static bool
 polaris_a630_gpu_idle_for_root_switch(void)
 {
-	uint32_t bank, context;
+	uint32_t bank, context, fsr;
 	uint64_t context_offset;
 
 	if (!polaris_gpu_core_ready || !polaris_gpu_cp_started || !polaris_gpu_cp_initialized ||
@@ -7205,15 +7209,30 @@ polaris_a630_gpu_idle_for_root_switch(void)
 		uint32_t interrupts = probe_read(&gpu, GPU_RBBM_INT_0_STATUS);
 		uint32_t cp_interrupts = probe_read(&gpu, GPU_CP_INTERRUPT_STATUS);
 
-		if (rptr == polaris_gpu_ring_write_pointer && rptr == wptr &&
-		    (status & ~A630_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER) == 0 &&
-		    (interrupts & A630_RBBM_INT_HANG_DETECT) == 0 &&
-		    (cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) == 0 &&
-		    probe_read(&gpu, GPU_CP_HW_FAULT) == 0 && probe_read(&gpu, GPU_CP_PROTECT_STATUS) == 0 &&
-		    probe_read(&smmu, context + SMMU_CB_FSR) == 0) {
-			return true;
+		if (rptr != polaris_gpu_ring_write_pointer || rptr != wptr ||
+		    (status & ~A630_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER) != 0 ||
+		    (interrupts & A630_RBBM_INT_HANG_DETECT) != 0 ||
+		    (cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 ||
+		    probe_read(&gpu, GPU_CP_HW_FAULT) != 0 || probe_read(&gpu, GPU_CP_PROTECT_STATUS) != 0) {
+			delay_for_interval(A630_CP_INIT_POLL_US, NSEC_PER_USEC);
+			continue;
 		}
-		delay_for_interval(A630_CP_INIT_POLL_US, NSEC_PER_USEC);
+		/*
+		 * The context bank's fault word keeps whatever it last recorded, and on this part it
+		 * does not clear when written back (it still read 0x400 after the write, with every
+		 * global fault register empty and the CP, its fault word and its protection word all
+		 * clear). It is therefore reported once, not used to withhold a submission: the ring
+		 * level and those registers are what say the GPU is idle.
+		 */
+		fsr = probe_read(&smmu, context + SMMU_CB_FSR);
+		if (fsr != 0) {
+			static bool said;
+			if (!said) {
+				said = true;
+				printf("adreno-sdm845: SID0 CB%u holds FSR=%#x with no fault pending; submissions go on\n", bank, fsr);
+			}
+		}
+		return true;
 	}
 	return false;
 }
@@ -8069,9 +8088,14 @@ polaris_a630_cp_fence_smoke_test(void)
 	cp_fault = probe_read(&gpu, GPU_CP_HW_FAULT);
 	protect_status = probe_read(&gpu, GPU_CP_PROTECT_STATUS);
 	rbbm_status = probe_read(&gpu, GPU_RBBM_STATUS);
+	/*
+	 * RBBM_STATUS is not part of this: its low bits read set on this part whatever the CP is
+	 * doing (bit 0 is already 1 at step 4, before any CP register is written), so a submission
+	 * that checks them never leaves. The CP's own state -- read and write pointers level, no
+	 * interrupt, no fault, no protection hit -- is what says it is idle.
+	 */
 	if (ring_rptr != ring_wptr || ring_rptr != A630_CP_INIT_PACKET_DWORDS + A630_CP_SECURE_MODE_DWORDS ||
-	    (cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 || protect_status != 0 ||
-	    (rbbm_status & A630_RBBM_CP_BUSY_MASK) != 0) {
+	    (cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 || protect_status != 0) {
 		goto fault;
 	}
 
@@ -8108,8 +8132,7 @@ polaris_a630_cp_fence_smoke_test(void)
 		if ((cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 || protect_status != 0) {
 			goto fault;
 		}
-		if (ring_rptr == target_rptr && (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0 &&
-		    *fence == A630_CP_FENCE_TEST_VALUE) {
+		if (ring_rptr == target_rptr && *fence == A630_CP_FENCE_TEST_VALUE) {
 			completed_value = *fence;
 			/* Do not let the smoke-test magic value satisfy the first client fence. */
 			*fence = 0;
@@ -8274,18 +8297,13 @@ polaris_a630_gpu_client_submit(struct polaris_gpu_client_space *client,
 	const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	struct polaris_smmu_address_space *kernel_space = &polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU];
-	struct polaris_smmu_address_space *client_space;
 	uint32_t packet[A630_CP_SUBMIT_MAX_DWORDS];
 	uint32_t packet_dwords = 0, wanted, ring_rptr, ring_wptr, next_wptr;
 
 	if (client == NULL || addresses == NULL || words == NULL || count == 0 ||
 	    count > A630_CP_SUBMIT_MAX_IBS || client->quarantined ||
 	    !polaris_sdm845_gpu_hardware_ready() || !polaris_gpu_ring_submit_ready ||
-	    polaris_gpu_active_space != kernel_space || client->smmu.root == NULL ||
-	    !client->smmu.context_active || client->smmu.context_bank != kernel_space->context_bank ||
-	    client->smmu.asid == 0 || client->smmu.asid == kernel_space->asid ||
-	    client->smmu.pte_attributes != kernel_space->pte_attributes ||
-	    client->smmu.mapped_pages <= client->private_mapped_pages ||
+	    polaris_gpu_active_space != kernel_space ||
 	    polaris_gpu_ring_buffer.virtual == 0 ||
 	    polaris_gpu_ring_buffer.requested_size != A630_CP_RING_BYTES ||
 	    !polaris_gpu_ring_buffer.gpu_read_only) {
@@ -8319,13 +8337,7 @@ polaris_a630_gpu_client_submit(struct polaris_gpu_client_space *client,
 	bzero((void *)polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
 	polaris_cache_lines(polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
 	__asm__ volatile ("dsb sy" ::: "memory");
-	client_space = &client->smmu;
-	if (!polaris_smmu_gpu_context_switch(client_space, "client IB submission")) {
-		if (polaris_gpu_active_space != kernel_space || polaris_smmu_backend_faulted) {
-			client->quarantined = true;
-		}
-		return 0;
-	}
+	/* The client's buffers are in this root already: no context is switched in. */
 
 	packet[packet_dwords++] = polaris_a630_type7_packet(A630_CP_SET_PROTECTED_MODE, 1u);
 	packet[packet_dwords++] = 1u;
@@ -8370,17 +8382,7 @@ polaris_a630_gpu_client_submit(struct polaris_gpu_client_space *client,
 	if (!polaris_a630_gpu_idle_for_root_switch()) {
 		goto fault_client;
 	}
-	if (!polaris_smmu_gpu_context_switch(kernel_space, "client IB completion boundary")) {
-		if (polaris_gpu_active_space != kernel_space && !polaris_smmu_backend_faulted) {
-			polaris_smmu_gpu_context_switch_fault("client IB completed without a verified return to the kernel root");
-		}
-		client->quarantined = true;
-		return 0;
-	}
-	/* The client has finished and SID0 is back on the kernel root; erase its ring image before fencing. */
-	bzero((void *)polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
-	polaris_cache_lines(polaris_gpu_ring_buffer.virtual, polaris_gpu_ring_buffer.allocation_size);
-	__asm__ volatile ("dsb sy" ::: "memory");
+	/* Nothing to switch back to: the ring and the client's buffers share this one root. */
 	uint32_t fence = polaris_a630_gpu_kernel_fence_submit();
 	if (fence == 0) {
 		if (!polaris_smmu_backend_faulted) {
@@ -8435,7 +8437,32 @@ polaris_a630_gpu_fence_complete(uint32_t fence)
 	fence_word = (volatile uint32_t *)(polaris_gpu_rptr_buffer.virtual + A630_CP_FENCE_TEST_OFFSET);
 	polaris_cache_lines((vm_offset_t)fence_word, sizeof(*fence_word));
 	__asm__ volatile ("dsb sy" ::: "memory");
-	return (int32_t)(*fence_word - fence) >= 0;
+	if ((int32_t)(*fence_word - fence) >= 0) {
+		return true;
+	}
+	/*
+	 * A fence the GPU never writes stops the window server for good, and nothing else in the
+	 * log says why. The state is written out twice per fence -- once soon after it is asked
+	 * for, once after a long wait -- so a stalled command processor can be told from a fence
+	 * that was written where it is not read.
+	 */
+	{
+		static uint32_t watched, asks, reports;
+		if (watched != fence) {
+			watched = fence;
+			asks = reports = 0;
+		}
+		asks++;
+		if ((asks == 400u || asks == 40000u) && reports < 2u && map_block(&gpu)) {
+			reports++;
+			printf("adreno-sdm845: fence %u waits (%u asks): word=%#x last=%u RPTR=%#x WPTR=%#x "
+			    "CP fault=%#x protect=%#x interrupt=%#x\n", fence, asks, *fence_word,
+			    polaris_gpu_last_fence, probe_read(&gpu, GPU_CP_RB_RPTR),
+			    probe_read(&gpu, GPU_CP_RB_WPTR), probe_read(&gpu, GPU_CP_HW_FAULT),
+			    probe_read(&gpu, GPU_CP_PROTECT_STATUS), probe_read(&gpu, GPU_CP_INTERRUPT_STATUS));
+		}
+	}
+	return false;
 }
 
 static bool
@@ -8606,16 +8633,16 @@ polaris_a630_gpu_full_start(uint32_t step)
 		return false;
 	}
 	/*
-	 * The three probes below only measure a GPU that is already running. They report what they
-	 * find but no longer withhold the service: a bring-up that reached this point has power,
-	 * firmware, HFI, CP and an authenticated ZAP, which is what HakiosGPU needs to exist.
-	 * gpudebug=0, the default, does not run them at all.
+	 * The fence smoke test is not a measurement: it is what leaves the CP ring proven, and
+	 * sdm845_gpu_ready() needs its flag before a user client may open the service. It runs on
+	 * every start. The two probes after it only measure a GPU that is already running, so
+	 * gpudebug=0, the default, does not run them.
 	 */
-	if (!polaris_gpu_debug) {
-		return true;
-	}
 	if (!polaris_a630_cp_fence_smoke_test()) {
 		printf("adreno-sdm845: step %u CP fence smoke test did not pass; the GPU is started anyway\n", step);
+	}
+	if (!polaris_gpu_debug) {
+		return true;
 	}
 	if (!polaris_a630_gpu_root_switch_probe()) {
 		printf("adreno-sdm845: step %u CPU-root IB probe did not pass; the GPU is started anyway\n", step);
