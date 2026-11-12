@@ -75,17 +75,22 @@ allow it. A successful firmware boot alone is not a completed driver.
 - Comparing the failed imported-DT runs (`device tree` length about `0xd03a8`, `boot_args` at
   `0xfc600000`) with that successful small-DT run (`0x467c`, `0xfc410000`) points to the Android
   DT import as the leading boot-failure suspect. A concrete format mismatch is present in
-  `xnuloader/loader.c`: `fdt_copy_node()` copies FDT property payloads unchanged, but Android FDT
-  cells are big-endian while XNU's `IODeviceTreeSupport` reads cell values such as
-  `#interrupt-cells` and `interrupts` as native `uint32_t` values. Polaris's PDC and GIC both have
-  `#interrupt-cells = <3>`; XNU therefore reads the imported value as `0x03000000` on this
-  little-endian target. `IODeviceTreeAlloc()` maps interrupts across the tree during IOKit setup,
-  so malformed cell counts can break startup before the GPU backend runs. The A630 backend
-  currently decodes the same imported cells as big-endian, confirming that the tree has two
-  incompatible consumers. This is a strong source-level explanation, not a captured panic site:
-  the failed run still has no XNU panic, exception, or checkpoint log. Normalize the Apple-tree
-  cell values and update the A630 readers consistently before another boot attempt; keep `gpu=0`
-  for that isolation run. The A630 stages remain unvalidated on Polaris.
+  `xnuloader/loader.c`. The Polaris FDT root sets `interrupt-parent` to the PDC (phandle `1`), and
+  the DTB has 161 `/soc` nodes with `interrupts`; many inherit that root property instead of
+  carrying a local one. The importer copies the property onto the Apple tree root only. XNU's
+  `IODTFindInterruptParent()` checks the current node and then falls back to its immediate parent;
+  for a node such as `/soc/qcrypto@1de0000`, that fallback is `/soc`, which has neither
+  `interrupt-controller` nor `interrupt-map`. `IODTMapOneInterrupt()` does not advance past that
+  parent in this case, so its `do ... while (parent)` loop can hang while `IODeviceTreeAlloc()` maps
+  the imported interrupts. This matches a boot that stops without a panic or loader return. Two
+  further format mismatches compound it: XNU indexes controller handles under `AAPL,phandle` while
+  FDT supplies `phandle`, and FDT cell payloads are big-endian while XNU reads these fields as
+  native `uint32_t` values (`#interrupt-cells = <3>` would be read as `0x03000000` on Polaris).
+  These are concrete source-level defects and the leading explanation for the failed imported-DT
+  boot, but the absent failure log means the hang itself was not observed directly. Before another
+  boot, translate inherited interrupt parents and phandles for XNU and normalize its cell values;
+  update the A630 readers for the resulting representation. Keep `gpu=0` for that isolation run.
+  The A630 stages remain unvalidated on Polaris.
 - The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
   A completion wait of at least one second that expires blocks later GEM submissions before cache
   maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory
