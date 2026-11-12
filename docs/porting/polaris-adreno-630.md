@@ -29,6 +29,14 @@ allow it. A successful firmware boot alone is not a completed driver.
   A failed `gpu=1` bring-up also calls that stop path; it can quiesce a verified healthy boundary
   and deliberately retains resources if startup is faulted or safety cannot be confirmed. This
   runtime cleanup path has not yet been validated on the phone.
+- On 2026-11-12 the `loader_return_after` boot argument and its kernel timer were removed. The
+  timeout path ran `hakios_adreno_stop()` and could fail-stop in `sdm845_gpu_quiesce()` instead of
+  returning, and a kernel that hung before its timer ran produced no return at all; the argument
+  and `return_cpu`/`return_panic` no longer exist. The run that prompted this used `gpu=1` on the
+  imported Android device tree and left no XNU log. Comparing logs shows the imported tree
+  (`len e0314`) hangs before the first kernel line while the small tree (`len 467c`) boots, so the
+  device-tree import, not `gpu=1`, is the boot blocker. `xl stop`, the panic return and the
+  loader's return stub remain.
 - On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
   `hakios.adreno.sdm845.o` (including the guarded A630 hang snapshot), `hakios.adreno.o`,
   `MiniIOSurface.cpo`, and the shared IOKit GPU service, including the new resource caps. The build

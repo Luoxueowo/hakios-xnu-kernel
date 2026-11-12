@@ -26,9 +26,8 @@ XL_SB_DELAY=${XL_SB_DELAY:-600} XL_CMDLINE="debug=0x8 rd=md0 hv_wdt_pet=1 ${BASE
 echo "$(date +%T) state after run: $(./xl state)"
 L=$(ls -t logs/*-run.log.live | head -1); F=${L%.live}; echo "LOG=$F"
 cat $L $F 2>/dev/null | grep -a "mpss: \(7: \(THE\|the watch\)\|11\|rmtfs\|tftp\|servreg\|dms\|nas\|ipa: \(THE\|from node\|the modem\|a probe\)\|link: \(THE\|tftp\)\|LAST WORDS\|step 1[01]\)\|serving system\|panic(\|ipa: \|cell: \|net: en1\|wda: \|wds: \(THE\|the client\|about\)" | grep -v "about to ask\|about to tell" | sed 's/^\[ *[0-9.]*\]: //' | awk '!seen[$0]++' | cut -c1-230 | head -80
-# Where the phone is left (XL_END): "loader" (default) -- the kernel hands control back to our loader
-# at the end of the run (loader_return_after: the modem, the DSPs and the GPU stopped first), and the
-# phone stays there, in the loader's fastboot-protocol channel, ready for the next run with no reboot
+# Where the phone is left (XL_END): "loader" (default) -- "xl stop" hands control back to our loader,
+# and the phone stays there, in the loader's fastboot-protocol channel, ready for the next run with no reboot
 # at all; if the return failed and the watchdog reset the phone into Android, it is sent back to
 # fastboot, so a phone left alone always sits where it can be recovered. "android": the old way,
 # back to Android after every run.

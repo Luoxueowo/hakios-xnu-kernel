@@ -1,4 +1,4 @@
-ADRENO	arg	adreno	GPU and display	k	hakios.adreno.c	
+ADRENO	arg	adreno	GPU and display	k	hakios.adreno.c,hakios.adreno.sdm845.c	
 ADRENO_BLIND	arg	adreno_blind	GPU and display	k	hakios.adreno.c	
 ADRENO_DIRTY	arg	adreno_dirty	GPU and display	k	hakios.adreno.c	
 ADRENO_FINE	arg	adreno_fine	GPU and display	k	hakios.adreno.c	the newest step waits like that before every single access
@@ -216,8 +216,6 @@ REC_SOUND_MIC	arg	rec_sound_mic	Audio and battery	k	hakios.audio.c
 REC_START	arg	rec_start	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 REC_STEP	arg	rec_step	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 REGTRACE	arg	regtrace	CPU, memory and boot	k	(patch)	
-RETURN_CPU	arg	return_cpu	CPU, memory and boot	k	loader_return.c	
-RETURN_PANIC	arg	return_panic	CPU, memory and boot	k	loader_return.c	
 ROOT_APFS	arg	root_apfs	User space	u	init.c	the root is to be the Darwin root volume on /dev/DEV -- the phone's flash, read only
 SCREEN_LOG	arg	screen_log	Loader	l	loader.c	
 SERIAL	arg	serial	Loader	l	loader.c	

@@ -63,7 +63,7 @@ static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
 
 /*
  * The way out when nothing else is at hand: five fingers held on the screen for a second and a
- * half end the run -- control goes back to the loader, as when loader_return_after expires.
+ * half end the run -- control goes back to the loader, as when the host asks for an "xl stop".
  * Only a driver's fingers count, not samples a program writes to the device.
  */
 #define EXIT_FINGERS    5

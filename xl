@@ -26,7 +26,7 @@
 # Logs land in logs/. Environment for `run`:
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
 #               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
-#   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
+#   XL_SECS     seconds the host waits for a run before it gives up (default 8)
 #   XL_FOLLOW=N fetch the kernel's log every N seconds during a run (default 10; XL_FOLLOW= for never), so that a kernel
 #               that hangs leaves what it said in logs/<time>-run.log.live; after a hang `run` brings the phone back to
 #               Android itself, or says what to press if it is stuck on the logo
@@ -189,7 +189,7 @@ run() { # run <oem command> <label>
 	local stamp log result
 	stamp=$(date +%H%M%S); log="logs/$stamp-$2.log"
 	if [ "$1" != "oem selftest" ]; then
-		# The kernel hands control back after XL_SECS seconds even if it is just waiting.
+		# The host waits XL_SECS seconds for the run; the kernel does not return on its own.
 		local rd=${XL_RAMDISK:-userland/root.apfs}
 		case "$rd" in
 		none|resident) rd= ;;
@@ -220,7 +220,7 @@ run() { # run <oem command> <label>
 		case " $args " in
 		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac
-		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
+		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
 	local live=; live_loader && live=1

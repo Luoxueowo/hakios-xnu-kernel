@@ -415,67 +415,6 @@ loader_checkpoint(uint64_t n)
 }
 
 /*
- * boot-arg loader_return_after=<seconds>: hand control back to the loader
- * after that long, whatever the kernel is doing. This is how the log gets out
- * when the kernel does not panic but simply waits (e.g. for a root device).
- */
-/*
- * For trying the ways out when there is more than one processor: boot-arg return_cpu=<n> has
- * that processor make the timed return, from an interrupt handler -- any but the boot processor
- * has to hand it over (psci_smp_stop_others()) --, and return_panic=1 makes a panic of it.
- */
-static void
-loader_return_test(void *as_panic)
-{
-	if (as_panic != (void *)1) {
-		panic("return_panic: the panic that was asked for, on cpu %d", cpu_number());
-	}
-	loader_return();
-}
-
-static void
-loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
-{
-	static const char banner[] = "\n--- loader_return_after expired ---\n";
-	uint32_t cpu = 0, as_panic = 0;
-
-	for (const char *c = banner; *c; c++) {
-		loader_log_putc(*c);
-	}
-	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
-	if (!as_panic) {
-		hakios_var_save_on_return();   /* the data volume kept, while the system is still whole */
-		hakios_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
-		hakios_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
-		hakios_adsp_stop();            /* and the audio DSP */
-		hakios_mpss_stop();            /* and the modem */
-	}
-	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
-	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
-		for (;;) {
-			delay_for_interval(1000, NSEC_PER_MSEC);        /* that processor ends it */
-		}
-	}
-	loader_return_test((void *)(uintptr_t)(as_panic ? 2 : 1));
-}
-
-__startup_func
-static void
-loader_return_timer_init(void)
-{
-	uint32_t seconds = 0;
-	uint64_t deadline;
-
-	if (!PE_parse_boot_argn("loader_return_after", &seconds, sizeof(seconds)) || seconds == 0) {
-		return;
-	}
-	thread_call_t call = thread_call_allocate(loader_return_timer, NULL);
-	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
-	thread_call_enter_delayed(call, deadline);
-}
-STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
-
-/*
  * A loader that watches from another core also listens to the host, and passes on a request to
  * end the run ("xl stop") by setting loader_live.stop. Look once a second.
  */

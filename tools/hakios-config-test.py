@@ -173,8 +173,8 @@ try:
     # CONFIG_BOOTARGS: Linux's CMDLINE, but every name is checked against what the source reads
     hc.KERNEL_LINE = 607
     base = {"CPUS": "4", "FIRMWARE": '"device"'}
-    problems, a = hc.check(dict(base, BOOTARGS='"fb_beat=2 loader_return_after=5"'))
-    check("BOOTARGS: names the source reads are fine, and come after the symbols' own", not problems and a == ["cpus=4", "fb_beat=2", "loader_return_after=5"], (problems, a))
+    problems, a = hc.check(dict(base, BOOTARGS='"fb_beat=2 hv_wdt_pet=1"'))
+    check("BOOTARGS: names the source reads are fine, and come after the symbols' own", not problems and a == ["cpus=4", "fb_beat=2", "hv_wdt_pet=1"], (problems, a))
     problems, _ = hc.check(dict(base, BOOTARGS='"fb_beet=2"'))
     check("BOOTARGS: a name nothing reads is an error, with a suggestion", any("nothing reads the argument fb_beet" in p and "did you mean fb_beat" in p for p in problems), problems)
     problems, _ = hc.check(dict(base, BOOTARGS='"cpus=8"'))
