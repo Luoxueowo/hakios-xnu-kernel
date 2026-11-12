@@ -578,7 +578,41 @@ The userspace stack is not there yet. The phone boots to the window server at 11
 `Software renderer! Simulating crash!`. The plug-in binary is present (built into
 `userland/big/lib/HakiosMetal.bundle`, 8.4 MB, installed under `/usr/local/polaris`, linked from
 `/polaris/lib/HakiosMetal.bundle`), so this is a runtime failure whose `why` text leaves through
-stderr and does not reach the log partition.
+stderr and does not reach the log partition. What that error was, and how far the Metal path now
+gets, is the section after this one.
+
+## 2026-11-13, night: CoreAnimation reaches Metal, and stops at a black panel
+
+`configs/polaris-metal-boot.conf` adds `metal=3` and `ca_metallib=` to the working arguments; the
+metallib is built by `tools/ca-metallib.py` from the framework on the build machine and shipped in
+the ramdisk. With it the log shows the whole path running:
+
+```
+HakiosMetal[backboardd 11]: device: Adreno (hakios-metal, chip 0x6030001) on IOAcceleratorES service 0x5907
+HakiosMetal[backboardd 11]: CoreAnimation's shaders: 451 labelled variants ... 986 pipelines
+hakios: the server has an accelerated renderer (0x142d04080)
+HakiosGPU: submission 1: 1 command buffers, the first at 0x416a0000, 763 words
+MiniIOMobileFramebuffer: swap 1 layer 0: surface 3 (1125x2436 'BGRA') ...
+```
+
+Four things had to be right for that, and each was found from a device log:
+
+- The fence smoke test is not a measurement: `sdm845_gpu_ready()` needs the two flags it sets, and
+  with the test behind `gpudebug` they were never set, so `IOServiceOpen` answered
+  `kIOReturnUnsupported` (0xE00002C7) and the plug-in could not open the service at all.
+- `RBBM_STATUS` is not evidence of an idle command processor: bit 0 reads 1 from step 4 onwards,
+  bit 2 read 1 through a submission whose RPTR equalled WPTR with every fault word clear.
+- A client submission does not need a second set of page tables. Every buffer a client maps now
+  goes into the one GPU root, the way the Redwood backend has it, so no SMMU root is switched per
+  frame.
+- The context bank's fault word does not clear when written back on this part (it still read 0x400
+  with GFSR=0), so it is reported once instead of withholding submissions.
+
+What remains is that the panel stays black while the window server stops after those frames, with
+no fault, no quarantine and no fence left waiting. The two swapped surfaces are what the GPU wrote,
+so the question is now the content rather than the plumbing: whether the command stream draws
+anything, whether the render target's format and tiles match the A630, and whether the writes reach
+memory before the presenter copies them. `configs/polaris-boot.conf` stays the working image.
 
 ## Polaris hardware facts
 
