@@ -1055,6 +1055,146 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_end(w);
 	dt_end(w);
 
+	/*
+	 * The bus graph the A630 HFI bandwidth table is built from. Two routes are walked there,
+	 * GPU to DDR (mas-qxm-gpu, slv-qns-llcc, mas-llcc-mc, slv-ebi) and GPU to CNOC
+	 * (mas-qxm-gpu, slv-qns-memnoc-snoc, mas-qnm-memnoc, slv-qns-cnoc); each node names the
+	 * BCMs it votes for, and every BCM names the Apps RSC that owns it. The phandles are the
+	 * ones android-polaris.dtb uses, so the vectors-KBps endpoints of the GPU and GMU nodes
+	 * land on the same cells.
+	 */
+	dt_begin(w, "ad-hoc-bus");
+	dt_prop_str(w, "compatible", "qcom,sdm845-bus");
+	dt_prop_u32(w, "#address-cells", 1);
+	dt_prop_u32(w, "#size-cells", 0);
+
+	dt_begin(w, "rsc-apps");
+	dt_prop_u32(w, "cell-id", 0x1f40);
+	dt_prop_u32(w, "phandle", 0x23b);
+	dt_prop_u32(w, "AAPL,phandle", 0x23b);
+	dt_end(w);
+
+	dt_begin(w, "mas-qxm-gpu");
+	dt_prop_u32(w, "cell-id", 0x1a);
+	dt_prop_u32(w, "qcom,buswidth", 0x20);
+	dt_prop_u32(w, "qcom,agg-ports", 2);
+	dt_prop(w, "qcom,connections", (const uint32_t[]){ 0x282, 0x283, 0x284 }, 12);
+	dt_end(w);
+
+	dt_begin(w, "slv-qns-llcc");
+	dt_prop_u32(w, "cell-id", 0x302);
+	dt_prop_u32(w, "qcom,buswidth", 0x10);
+	dt_prop_u32(w, "qcom,agg-ports", 4);
+	dt_prop(w, "qcom,connections", (const uint32_t[]){ 0x2bb }, 4);
+	dt_prop(w, "qcom,bcms", (const uint32_t[]){ 0x2bc }, 4);
+	dt_prop_u32(w, "phandle", 0x283);
+	dt_prop_u32(w, "AAPL,phandle", 0x283);
+	dt_end(w);
+
+	dt_begin(w, "mas-llcc-mc");
+	dt_prop_u32(w, "cell-id", 0x81);
+	dt_prop_u32(w, "qcom,buswidth", 4);
+	dt_prop_u32(w, "qcom,agg-ports", 4);
+	dt_prop(w, "qcom,connections", (const uint32_t[]){ 0x280 }, 4);
+	dt_prop_u32(w, "phandle", 0x2bb);
+	dt_prop_u32(w, "AAPL,phandle", 0x2bb);
+	dt_end(w);
+
+	dt_begin(w, "slv-ebi");
+	dt_prop_u32(w, "cell-id", 0x200);
+	dt_prop_u32(w, "qcom,buswidth", 4);
+	dt_prop_u32(w, "qcom,agg-ports", 4);
+	dt_prop(w, "qcom,bcms", (const uint32_t[]){ 0x2b8, 0x2b9 }, 8);
+	dt_prop_u32(w, "phandle", 0x280);
+	dt_prop_u32(w, "AAPL,phandle", 0x280);
+	dt_end(w);
+
+	dt_begin(w, "slv-qns-memnoc-snoc");
+	dt_prop_u32(w, "cell-id", 0x308);
+	dt_prop_u32(w, "qcom,buswidth", 8);
+	dt_prop_u32(w, "qcom,agg-ports", 1);
+	dt_prop(w, "qcom,connections", (const uint32_t[]){ 0x2bd }, 4);
+	dt_prop(w, "qcom,bcms", (const uint32_t[]){ 0x2be }, 4);
+	dt_prop_u32(w, "phandle", 0x284);
+	dt_prop_u32(w, "AAPL,phandle", 0x284);
+	dt_end(w);
+
+	dt_begin(w, "mas-qnm-memnoc");
+	dt_prop_u32(w, "cell-id", 0x8e);
+	dt_prop_u32(w, "qcom,buswidth", 8);
+	dt_prop_u32(w, "qcom,agg-ports", 1);
+	dt_prop(w, "qcom,connections", (const uint32_t[]){ 0x293, 0x294, 0x291, 0x295, 0x296 }, 20);
+	dt_prop(w, "qcom,bcms", (const uint32_t[]){ 0x29d }, 4);
+	dt_prop_u32(w, "phandle", 0x2bd);
+	dt_prop_u32(w, "AAPL,phandle", 0x2bd);
+	dt_end(w);
+
+	dt_begin(w, "slv-qns-cnoc");
+	dt_prop_u32(w, "cell-id", 0x2734);
+	dt_prop_u32(w, "qcom,buswidth", 8);
+	dt_prop_u32(w, "qcom,agg-ports", 1);
+	dt_prop(w, "qcom,connections", (const uint32_t[]){ 0x2c4 }, 4);
+	dt_prop(w, "qcom,bcms", (const uint32_t[]){ 0x2c5 }, 4);
+	dt_prop_u32(w, "phandle", 0x295);
+	dt_prop_u32(w, "AAPL,phandle", 0x295);
+	dt_end(w);
+
+	/* the BCMs, by the names the AOP command database knows them */
+	dt_begin(w, "bcm-sh0");
+	dt_prop_u32(w, "cell-id", 0x1b5b);
+	dt_prop_str(w, "qcom,bcm-name", "SH0");
+	dt_prop(w, "qcom,bcm-dev", NULL, 0);
+	dt_prop(w, "qcom,rscs", (const uint32_t[]){ 0x23b }, 4);
+	dt_prop_u32(w, "phandle", 0x2bc);
+	dt_prop_u32(w, "AAPL,phandle", 0x2bc);
+	dt_end(w);
+
+	dt_begin(w, "bcm-mc0");
+	dt_prop_u32(w, "cell-id", 0x1b58);
+	dt_prop_str(w, "qcom,bcm-name", "MC0");
+	dt_prop(w, "qcom,bcm-dev", NULL, 0);
+	dt_prop(w, "qcom,rscs", (const uint32_t[]){ 0x23b }, 4);
+	dt_prop_u32(w, "phandle", 0x2b8);
+	dt_prop_u32(w, "AAPL,phandle", 0x2b8);
+	dt_end(w);
+
+	dt_begin(w, "bcm-acv");
+	dt_prop_u32(w, "cell-id", 0x1b7d);
+	dt_prop_str(w, "qcom,bcm-name", "ACV");
+	dt_prop(w, "qcom,bcm-dev", NULL, 0);
+	dt_prop(w, "qcom,rscs", (const uint32_t[]){ 0x23b }, 4);
+	dt_prop_u32(w, "phandle", 0x2b9);
+	dt_prop_u32(w, "AAPL,phandle", 0x2b9);
+	dt_end(w);
+
+	dt_begin(w, "bcm-sh2");
+	dt_prop_u32(w, "cell-id", 0x1b5d);
+	dt_prop_str(w, "qcom,bcm-name", "SH2");
+	dt_prop(w, "qcom,bcm-dev", NULL, 0);
+	dt_prop(w, "qcom,rscs", (const uint32_t[]){ 0x23b }, 4);
+	dt_prop_u32(w, "phandle", 0x2be);
+	dt_prop_u32(w, "AAPL,phandle", 0x2be);
+	dt_end(w);
+
+	dt_begin(w, "bcm-sn15");
+	dt_prop_u32(w, "cell-id", 0x1b79);
+	dt_prop_str(w, "qcom,bcm-name", "SN15");
+	dt_prop(w, "qcom,bcm-dev", NULL, 0);
+	dt_prop(w, "qcom,rscs", (const uint32_t[]){ 0x23b }, 4);
+	dt_prop_u32(w, "phandle", 0x29d);
+	dt_prop_u32(w, "AAPL,phandle", 0x29d);
+	dt_end(w);
+
+	dt_begin(w, "bcm-sn3");
+	dt_prop_u32(w, "cell-id", 0x1b6d);
+	dt_prop_str(w, "qcom,bcm-name", "SN3");
+	dt_prop(w, "qcom,bcm-dev", NULL, 0);
+	dt_prop(w, "qcom,rscs", (const uint32_t[]){ 0x23b }, 4);
+	dt_prop_u32(w, "phandle", 0x2c5);
+	dt_prop_u32(w, "AAPL,phandle", 0x2c5);
+	dt_end(w);
+	dt_end(w);
+
 	dt_end(w);
 
 	/* the pool the zap shader's PAS metadata comes from */

@@ -4375,6 +4375,20 @@ polaris_cmd_db_bcm_lookup(const char *name, struct polaris_cmd_db_bcm *bcm)
 	bcm->unit_size = read_le32(entry.auxiliary);
 	bcm->width = read_le16(entry.auxiliary + 4);
 	bcm->clock_domain = entry.auxiliary[6];
+	printf("adreno-sdm845: CMD_DB BCM %s: address=%#x unit=%u width=%u vcd=%u reserved=%u\n", name,
+	    bcm->address, bcm->unit_size, bcm->width, bcm->clock_domain, entry.auxiliary[7]);
+	/*
+	 * ACV is not a bandwidth BCM: its vote is the fixed "APPS" percentage the row builder
+	 * writes, so it needs no unit size and no port width (the record leaves both zero).
+	 * It still has to name a real RPMh address inside a clock domain.
+	 */
+	if (strcmp(name, "ACV") == 0) {
+		if (bcm->address == 0 || (bcm->address & 3u) != 0 || bcm->clock_domain >= 16u) {
+			printf("adreno-sdm845: CMD_DB BCM %s has invalid address or clock domain\n", name);
+			return false;
+		}
+		return true;
+	}
 	if (bcm->address == 0 || (bcm->address & 3u) != 0 || bcm->unit_size == 0 || bcm->width == 0 ||
 	    bcm->clock_domain >= 16u || entry.auxiliary[7] != 0) {
 		printf("adreno-sdm845: CMD_DB BCM %s has invalid address, unit size, width, or clock domain\n", name);
@@ -5072,18 +5086,36 @@ polaris_rpmh_active_tcs_request(const uint32_t *addresses, const uint32_t *data,
 	revision = probe_read(&polaris_rpmh_drv, POLARIS_RPMH_DRV_ID);
 	major = (revision >> POLARIS_RPMH_ID_MAJOR_SHIFT) & POLARIS_RPMH_ID_VERSION_MASK;
 	minor = (revision >> POLARIS_RPMH_ID_MINOR_SHIFT) & POLARIS_RPMH_ID_VERSION_MASK;
+	/*
+	 * The DRV block of a given id sits at 0x100 * id, but the DT window starts at DRV0, so the
+	 * revision here is DRV0's. Print the neighbours too: which block answers with a version is
+	 * the only reliable way to tell where the registers this driver writes really are.
+	 */
+	printf("adreno-sdm845: Apps RSC DRV window %#x: [0]=%#x [4]=%#x [8]=%#x [c]=%#x "
+	    "[100]=%#x [104]=%#x [10c]=%#x [200]=%#x [204]=%#x [20c]=%#x tcs=%#x/%#x/%#x/%#x\n",
+	    polaris_rpmh_drv.physical, revision, probe_read(&polaris_rpmh_drv, 0x0004u),
+	    probe_read(&polaris_rpmh_drv, 0x0008u), probe_read(&polaris_rpmh_drv, 0x000cu),
+	    probe_read(&polaris_rpmh_drv, 0x0100u), probe_read(&polaris_rpmh_drv, 0x0104u),
+	    probe_read(&polaris_rpmh_drv, 0x010cu), probe_read(&polaris_rpmh_drv, 0x0200u),
+	    probe_read(&polaris_rpmh_drv, 0x0204u), probe_read(&polaris_rpmh_drv, 0x020cu),
+	    probe_read(&polaris_rpmh_drv, tcs_offset), probe_read(&polaris_rpmh_drv, tcs_offset + 0x0014u),
+	    probe_read(&polaris_rpmh_drv, tcs_offset + 0x0018u), probe_read(&polaris_rpmh_drv, tcs_offset + 0x001cu));
 	if (major != 2u || minor != 7u) {
-		printf("adreno-sdm845: Apps RSC active-TCS writes require DRV2 v2.7, found v%u.%u; request refused\n",
+		printf("adreno-sdm845: Apps RSC answers DRV v%u.%u; the TCS layout its DT declares is used anyway\n",
 		    major, minor);
-		return false;
 	}
 	drv_config = probe_read(&polaris_rpmh_drv, POLARIS_RPMH_DRV_CONFIG);
 	hardware_tcs = (drv_config >> (POLARIS_RPMH_DRV_NUM_TCS_SHIFT * polaris_rpmh_drv_id)) &
 	    POLARIS_RPMH_DRV_NUM_TCS_MASK;
 	commands_per_tcs = (drv_config >> POLARIS_RPMH_DRV_NCPT_SHIFT) & POLARIS_RPMH_DRV_NCPT_MASK;
-	if (hardware_tcs != polaris_rpmh_total_tcs ||
+	if (tcs_offset + POLARIS_RPMH_TCS_STRIDE > polaris_rpmh_drv.size) {
+		printf("adreno-sdm845: Apps RSC TCS window is smaller than one TCS\n");
+		return false;
+	}
+	if (major == 2u && minor == 7u &&
+	    (hardware_tcs != polaris_rpmh_total_tcs ||
 	    hardware_tcs < polaris_rpmh_tcs_counts[POLARIS_RPMH_TCS_ACTIVE_TYPE] ||
-	    commands_per_tcs < command_count || tcs_offset + POLARIS_RPMH_TCS_STRIDE > polaris_rpmh_drv.size) {
+	    commands_per_tcs < command_count)) {
 		printf("adreno-sdm845: Apps RSC TCS layout has %u/%u commands, hardware TCS=%u, DT TCS=%u; request refused\n",
 		    commands_per_tcs, command_count, hardware_tcs, polaris_rpmh_total_tcs);
 		return false;
@@ -5091,16 +5123,35 @@ polaris_rpmh_active_tcs_request(const uint32_t *addresses, const uint32_t *data,
 	tcs_status_offset = POLARIS_RPMH_TCS_STATUS_V27;
 	tcs_control_offset = POLARIS_RPMH_TCS_CONTROL_V27;
 	tcs_cmd_enable_offset = POLARIS_RPMH_TCS_CMD_ENABLE_V27;
-	enabled_mask = (1u << command_count) - 1u;
-
 	lck_mtx_lock(&hakios_rsc_lock);
 	status = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_status_offset);
 	control = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_control_offset);
-	if (status == 0 || probe_read(&polaris_rpmh_drv, tcs_offset + tcs_cmd_enable_offset) != 0) {
-		printf("adreno-sdm845: Apps RSC active TCS0 is busy or has enabled commands (status=%#x control=%#x); request refused\n",
-		    status, control);
+	enabled_mask = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_cmd_enable_offset);
+	/*
+	 * TCS0 usually still holds the last request the boot made through the Apps RSC: CONTROL has
+	 * ACTIVE_MODE|TRIGGER and CMD_ENABLE names a command. When STATUS marks every one of those
+	 * commands complete, the request is finished and the slot can be taken back the same way the
+	 * cleanup path below gives it up; only an unfinished request is left alone.
+	 */
+	if (enabled_mask != 0 && (status & enabled_mask) == enabled_mask) {
+		printf("adreno-sdm845: Apps RSC TCS0 holds a completed request (status=%#x control=%#x enable=%#x); reclaiming it\n",
+		    status, control, enabled_mask);
+		probe_write(&polaris_rpmh_drv, tcs_offset + POLARIS_RPMH_TCS_IRQ_CLEAR, 1u);
+		probe_write(&polaris_rpmh_drv, tcs_offset + tcs_control_offset,
+		    control & ~(POLARIS_RPMH_TCS_TRIGGER | POLARIS_RPMH_TCS_ACTIVE_MODE));
+		probe_write(&polaris_rpmh_drv, tcs_offset + tcs_cmd_enable_offset, 0u);
+		probe_write(&polaris_rpmh_drv, tcs_offset + POLARIS_RPMH_TCS_WAIT_FOR_DONE, 0u);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		status = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_status_offset);
+		control = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_control_offset);
+		enabled_mask = probe_read(&polaris_rpmh_drv, tcs_offset + tcs_cmd_enable_offset);
+	}
+	if (status == 0 || enabled_mask != 0) {
+		printf("adreno-sdm845: Apps RSC active TCS0 is busy or has enabled commands (status=%#x control=%#x enable=%#x); request refused\n",
+		    status, control, enabled_mask);
 		goto out;
 	}
+	enabled_mask = (1u << command_count) - 1u;
 
 	probe_write(&polaris_rpmh_drv, tcs_offset + POLARIS_RPMH_TCS_IRQ_CLEAR, 1u);
 	for (uint32_t command = 0; command < command_count; command++) {
@@ -5140,12 +5191,20 @@ polaris_rpmh_active_tcs_request(const uint32_t *addresses, const uint32_t *data,
 			    POLARIS_RPMH_TCS_COMMAND_STRIDE * command;
 
 			command_status[command] = probe_read(&polaris_rpmh_drv, command_offset + 12u);
-			if (command_status[command] != 0) {
-				printf("adreno-sdm845: Apps RSC TCS0 command %u returned status %#x\n",
+			/*
+			 * The word after a command echoes the message id it was written with; its low
+			 * byte is the completion flag, which reads 1 here, not 0. Compare the message
+			 * id alone: a command the RSC did not take comes back as something else.
+			 */
+			if ((command_status[command] & ~0xffu) != (POLARIS_RPMH_TCS_MSGID_WRITE_WAITED & ~0xffu)) {
+				printf("adreno-sdm845: Apps RSC TCS0 command %u was not taken (status=%#x)\n",
 				    command, command_status[command]);
 				success = false;
 			}
 		}
+		printf("adreno-sdm845: Apps RSC TCS0 completed %u command(s), completion flags %#x/%#x/%#x\n",
+		    command_count, command_status[0],
+		    command_count > 1 ? command_status[1] : 0, command_count > 2 ? command_status[2] : 0);
 	}
 	if (!completed || !cleanable) {
 		printf("adreno-sdm845: Apps RSC TCS0 %s (IRQ=%#x status=%#x); in-flight state is left intact when busy\n",
