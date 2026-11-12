@@ -322,6 +322,14 @@ extern bool HakiosGPUStart(void);
 #define A630_GMU_SPTPRAC_ON_VALUE        0x778000u
 #define A630_GMU_SPTPRAC_ON_MASK         0x38u
 #define A630_GMU_SPTPRAC_ON_WANT         0x28u
+/* The GPU's own RPMh sequencer, which the firmware votes through (a6xx_gmu.c). */
+#define GMU_RPMH_CTRL                    GMU_WORD(0x50e8)
+#define A630_GMU_RPMH_CTRL_MASK          0xf11u
+#define POLARIS_GMU_RSCC_OFFSET          0x00023000u
+#define POLARIS_RSCC_SEQ_BUSY_DRV0_WORD  0x101u
+#define POLARIS_PDC_PHYS                 0x0b280000ul
+#define POLARIS_PDC_SEQ_PHYS             0x0b480000ul
+#define POLARIS_PDC_SIZE                 0x00010000ul
 #define GMU_GMU2HOST_INTR_CLR            GMU_WORD(0x5191)
 #define GMU_GMU2HOST_INTR_INFO           GMU_WORD(0x5192)
 #define GMU_HOST2GMU_INTR_SET            GMU_WORD(0x5194)
@@ -1019,6 +1027,8 @@ static struct probe_block gpu = { "3d-core", POLARIS_GPU_PHYS, POLARIS_GPU_SIZE,
 static struct probe_block gcc_gpu_clocks = { "gcc-gpu-clocks", POLARIS_GCC_GPU_CLOCKS_PHYS,
 	POLARIS_GCC_GPU_CLOCKS_SIZE, 0 };
 static struct probe_block polaris_rpmh_drv = { "apps-rpmh-drv2", 0, 0, 0 };
+static struct probe_block gmu_pdc = { "gmu-pdc", POLARIS_PDC_PHYS, POLARIS_PDC_SIZE, 0 };
+static struct probe_block gmu_pdc_seq = { "gmu-pdc-seq", POLARIS_PDC_SEQ_PHYS, POLARIS_PDC_SIZE, 0 };
 
 static bool sdm845_gpu_client_space_create(void **space);
 static void sdm845_gpu_client_space_destroy(void *space, bool safe_to_free);
@@ -5955,6 +5965,110 @@ polaris_gmu_hfi_stop_after_failure(uint32_t step)
 }
 
 /* Boot GMU/HFI with the host DDR vote; the GMU-user and GMU-kernel contexts are both active. */
+enum { POLARIS_RPMH_REGION_RSCC, POLARIS_RPMH_REGION_PDC, POLARIS_RPMH_REGION_PDC_SEQ };
+
+/*
+ * a6xx_gmu_rpmh_init() of Linux: the GPU has its own RSC and PDC, and its firmware votes for
+ * vdd_gfx/vdd_mx through them. Without these tables the boot OOB request never raises the rail,
+ * because the vote it writes has no sequencer to carry it to RPMh. Values are the ones mi8's
+ * bring-up uses, word offsets in each region's own window.
+ */
+struct polaris_rpmh_write {
+	uint8_t region;
+	uint16_t word;
+	uint32_t value;
+};
+
+static const struct polaris_rpmh_write polaris_rpmh_writes[] = {
+	/* the RSC block at GMU + 0x23000: status, slave id, then the PDC sequence it runs */
+	{ POLARIS_RPMH_REGION_RSCC, 0x0004, 1u << 24 },
+	{ POLARIS_RPMH_REGION_RSCC, 0x000b, 1u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x000d, 0u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x000e, 0u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x000f, 0u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0010, 0u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0011, 0u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0012, 0x80000000u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0100, 0u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0008, 0x4520u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0009, 0x4510u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x000a, 0x4514u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0180, 0xa7a506a0u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0181, 0xa1e6a6e7u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0182, 0xa2e081e1u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0183, 0xe9a982e2u },
+	{ POLARIS_RPMH_REGION_RSCC, 0x0184, 0x0020e8a8u },
+	/* the sequencer's own program memory */
+	{ POLARIS_RPMH_REGION_PDC_SEQ, 0x0000, 0xfebea1e1u },
+	{ POLARIS_RPMH_REGION_PDC_SEQ, 0x0001, 0xa5a4a3a2u },
+	{ POLARIS_RPMH_REGION_PDC_SEQ, 0x0002, 0x8382a6e0u },
+	{ POLARIS_RPMH_REGION_PDC_SEQ, 0x0003, 0xbce3e284u },
+	{ POLARIS_RPMH_REGION_PDC_SEQ, 0x0004, 0x002081fcu },
+	/* TCS1 and TCS3 of the PDC, then the enable bit */
+	{ POLARIS_RPMH_REGION_PDC, 0x1573, 7u },
+	{ POLARIS_RPMH_REGION_PDC, 0x1574, 0u },
+	{ POLARIS_RPMH_REGION_PDC, 0x1572, 0u },
+	{ POLARIS_RPMH_REGION_PDC, 0x1575, 0x10108u },
+	{ POLARIS_RPMH_REGION_PDC, 0x1576, 0x30010u },
+	{ POLARIS_RPMH_REGION_PDC, 0x1577, 1u },
+	{ POLARIS_RPMH_REGION_PDC, 0x1579, 0x10108u },
+	{ POLARIS_RPMH_REGION_PDC, 0x157a, 0x30000u },
+	{ POLARIS_RPMH_REGION_PDC, 0x157b, 0u },
+	{ POLARIS_RPMH_REGION_PDC, 0x157d, 0x10108u },
+	{ POLARIS_RPMH_REGION_PDC, 0x157e, 0x30080u },
+	{ POLARIS_RPMH_REGION_PDC, 0x157f, 0u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15d7, 7u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15d8, 0u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15d6, 0u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15d9, 0x10108u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15da, 0x30010u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15db, 2u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15dd, 0x10108u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15de, 0x30000u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15df, 3u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15e1, 0x10108u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15e2, 0x30080u },
+	{ POLARIS_RPMH_REGION_PDC, 0x15e3, 3u },
+	{ POLARIS_RPMH_REGION_PDC, 0x1148, 0u },
+	{ POLARIS_RPMH_REGION_PDC, 0x1140, 0x80000001u },
+};
+
+#define POLARIS_RPMH_WRITE_COUNT (sizeof(polaris_rpmh_writes) / sizeof(polaris_rpmh_writes[0]))
+
+static bool
+polaris_gmu_rpmh_sequencer(void)
+{
+	if (!map_block(&gmu) || !map_block(&gmu_pdc) || !map_block(&gmu_pdc_seq)) {
+		printf("adreno-sdm845: step 12 cannot map the GPU RPMh sequencer windows\n");
+		return false;
+	}
+	for (uint32_t i = 0; i < POLARIS_RPMH_WRITE_COUNT; i++) {
+		const struct polaris_rpmh_write *write = &polaris_rpmh_writes[i];
+		struct probe_block *block = &gmu_pdc_seq;
+		uint32_t offset = 4u * write->word;
+
+		if (write->region == POLARIS_RPMH_REGION_RSCC) {
+			block = &gmu;
+			offset += POLARIS_GMU_RSCC_OFFSET;
+		} else if (write->region == POLARIS_RPMH_REGION_PDC) {
+			block = &gmu_pdc;
+		}
+		probe_write(block, offset, write->value);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	/* The sequencer has to be idle before the firmware is let out of reset. */
+	for (uint32_t poll = 0; poll < 100u; poll++) {
+		if (probe_read(&gmu, POLARIS_GMU_RSCC_OFFSET + 4u * POLARIS_RSCC_SEQ_BUSY_DRV0_WORD) == 0) {
+			printf("adreno-sdm845: step 12 GPU RPMh sequencer primed (%u writes), RSC idle\n",
+			    (uint32_t)POLARIS_RPMH_WRITE_COUNT);
+			return true;
+		}
+		delay(10);
+	}
+	printf("adreno-sdm845: step 12 GPU RPMh sequencer is still busy after priming\n");
+	return false;
+}
+
 static bool
 polaris_gmu_hfi_start(uint32_t step)
 {
@@ -6009,6 +6123,11 @@ polaris_gmu_hfi_start(uint32_t step)
 	log_info = A630_GMU_LOG_VA | (A630_GMU_LOG_BYTES / POLARIS_SMMU_TABLE_BYTES - 1u);
 	printf("adreno-sdm845: step 12: configure TCM/HFI memory and A630 SFR ID; hold the DT-default DDR vote before starting CM3, request GX/MX, then initialize HFI\n");
 
+	/* the sequencer the firmware's rail votes go through, before it is released */
+	if (!polaris_gmu_rpmh_sequencer()) {
+		return false;
+	}
+
 	polaris_gmu_hfi_perf_table_ready = false;
 	polaris_gmu_hfi_bw_table_ready = false;
 	/* Qualcomm's TCM boot setup: all shared-memory addresses are in GMU-kernel SID5. */
@@ -6030,6 +6149,8 @@ polaris_gmu_hfi_start(uint32_t step)
 	 * writes 0x4052 here and the GMU never initialised HFI without it.
 	 */
 	probe_write(&gmu, GMU_CM3_CFG, 0x4052u);
+	/* let the firmware's votes out to RPMh through the sequencer primed above */
+	probe_write(&gmu, GMU_RPMH_CTRL, probe_read(&gmu, GMU_RPMH_CTRL) | A630_GMU_RPMH_CTRL_MASK);
 	/* mi8 masks both GMU interrupt masks before the reset goes away. */
 	probe_write(&gmu, GMU_AO_HOST_INTR_MASK, UINT32_MAX);
 	probe_write(&gmu, GMU_GMU2HOST_INTR_MASK, UINT32_MAX);
