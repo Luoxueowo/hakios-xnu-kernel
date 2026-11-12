@@ -87,10 +87,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   FDT supplies `phandle`, and FDT cell payloads are big-endian while XNU reads these fields as
   native `uint32_t` values (`#interrupt-cells = <3>` would be read as `0x03000000` on Polaris).
   These are concrete source-level defects and the leading explanation for the failed imported-DT
-  boot, but the absent failure log means the hang itself was not observed directly. Before another
-  boot, translate inherited interrupt parents and phandles for XNU and normalize its cell values;
-  update the A630 readers for the resulting representation. Keep `gpu=0` for that isolation run.
-  The A630 stages remain unvalidated on Polaris.
+  boot, but the absent failure log means the hang itself was not observed directly. The Polaris
+  importer now writes inherited interrupt parents onto each affected node, adds native
+  `AAPL,phandle` aliases, and converts the XNU-consumed FDT cell properties to native cells. It
+  preserves raw `reg` bytes under `fdt,reg`, and the A630 DT readers use that raw alias. The updated
+  loader and kernel compiled, and a GPU-disabled temporary boot image packaged successfully; the
+  kernel build still reports the existing XNU kext symbol-set import-list failures after emitting
+  `hakios-kernel`. `fastboot boot` accepted the image, but USB has not re-enumerated yet, so this
+  run's logdump is not available and the fix is not hardware-validated. The A630 stages remain
+  unvalidated on Polaris.
 - The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
   A completion wait of at least one second that expires blocks later GEM submissions before cache
   maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory

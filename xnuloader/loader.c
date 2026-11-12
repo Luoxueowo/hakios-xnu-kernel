@@ -763,6 +763,36 @@ fdt_be32(const uint8_t *p)
 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
+/* Apple DeviceTree consumers in XNU read these standard cell properties as native integers. */
+static int
+fdt_apple_cell_property(const char *name)
+{
+	return name[0] == '#' || str_eq(name, "reg") || str_eq(name, "ranges") || str_eq(name, "dma-ranges") ||
+	    str_eq(name, "interrupts") || str_eq(name, "interrupts-extended") ||
+	    str_eq(name, "interrupt-map") || str_eq(name, "interrupt-map-mask");
+}
+
+static int
+dt_prop_fdt_cells(struct dt_writer *w, const char *name, const uint8_t *data, uint32_t len)
+{
+	uint64_t padded = ((uint64_t)len + 3) & ~3ULL;
+
+	if ((len & 3u) != 0 || w->overflow || str_len(name) > 32 ||
+	    (uint64_t)(w->end - w->cur) < 36 + padded) {
+		w->overflow = 1;
+		return 0;
+	}
+	memset(w->cur, 0, 32);
+	memcpy(w->cur, name, str_len(name));
+	*(uint32_t *)(w->cur + 32) = len;
+	for (uint32_t offset = 0; offset < len; offset += sizeof(uint32_t)) {
+		*(uint32_t *)(w->cur + 36 + offset) = fdt_be32(data + offset);
+	}
+	w->cur += 36 + padded;
+	w->counts[w->depth - 1][0]++;
+	return 1;
+}
+
 static int
 fdt_read_node_name(struct fdt_reader *r, const char **name)
 {
@@ -780,12 +810,43 @@ fdt_read_node_name(struct fdt_reader *r, const char **name)
 	return r->offset <= end;
 }
 
+static int
+fdt_finish_interrupt_parent(struct dt_writer *w, const char *node_name, int write_node,
+	int has_interrupts, int has_local_parent, int parent_emitted, uint32_t effective_parent,
+	int parent_can_route)
+{
+	if (!write_node || !has_interrupts || parent_emitted) {
+		return 1;
+	}
+	if (has_local_parent) {
+		if (effective_parent == 0) {
+			print("Polaris Android DT node %s has an invalid zero interrupt-parent\n", node_name);
+			return 0;
+		}
+		return 1;
+	}
+	if (effective_parent == 0) {
+		if (parent_can_route) {
+			return 1;       /* XNU can use its immediate-parent fallback for a controller or nexus. */
+		}
+		print("Polaris Android DT node %s has interrupts but no resolvable interrupt-parent\n", node_name);
+		return 0;
+	}
+	dt_prop_u32(w, "interrupt-parent", effective_parent);
+	return !w->overflow;
+}
+
 /* Consume one FDT node and copy it when it belongs to /soc or /reserved-memory. */
 static int
-fdt_copy_node(struct fdt_reader *r, struct dt_writer *w, const char *node_name, uint32_t depth, int emit)
+fdt_copy_node(struct fdt_reader *r, struct dt_writer *w, const char *node_name, uint32_t depth, int emit,
+	uint32_t inherited_interrupt_parent, int parent_can_route)
 {
 	uint32_t end = r->struct_offset + r->struct_size;
+	uint32_t effective_interrupt_parent = inherited_interrupt_parent;
+	uint32_t aapl_phandle = 0;
 	int write_node = emit && str_len(node_name) <= 32;
+	int has_local_interrupt_parent = 0, has_interrupts = 0, parent_emitted = 0;
+	int have_aapl_phandle = 0, node_can_route = 0, children_started = 0;
 
 	if (depth > FDT_MAX_DEPTH) {
 		return 0;
@@ -805,6 +866,12 @@ fdt_copy_node(struct fdt_reader *r, struct dt_writer *w, const char *node_name, 
 			const char *child_name;
 			int child_emit;
 
+			if (!fdt_finish_interrupt_parent(w, node_name, write_node, has_interrupts,
+			    has_local_interrupt_parent, parent_emitted, effective_interrupt_parent, parent_can_route)) {
+				return 0;
+			}
+			parent_emitted = has_interrupts && !has_local_interrupt_parent && effective_interrupt_parent != 0;
+			children_started = 1;
 			if (!fdt_read_node_name(r, &child_name)) {
 				return 0;
 			}
@@ -816,7 +883,8 @@ fdt_copy_node(struct fdt_reader *r, struct dt_writer *w, const char *node_name, 
 			} else {
 				child_emit = write_node;
 			}
-			if (!fdt_copy_node(r, w, child_name, depth + 1, child_emit)) {
+			if (!fdt_copy_node(r, w, child_name, depth + 1, child_emit, effective_interrupt_parent,
+			    node_can_route)) {
 				return 0;
 			}
 		} else if (token == FDT_PROP) {
@@ -826,6 +894,10 @@ fdt_copy_node(struct fdt_reader *r, struct dt_writer *w, const char *node_name, 
 			uint32_t name_end;
 
 			if (r->offset > end || end - r->offset < 8) {
+				return 0;
+			}
+			if (children_started) {
+				print("Polaris Android DT node %s has a property after a child\n", node_name);
 				return 0;
 			}
 			length = fdt_be32(r->blob + r->offset);
@@ -843,15 +915,78 @@ fdt_copy_node(struct fdt_reader *r, struct dt_writer *w, const char *node_name, 
 			if (name_end == strings_end) {
 				return 0;
 			}
-			if ((write_node && !str_eq(prop_name, "name") && str_len(prop_name) <= 32) ||
-			    (depth == 0 && str_eq(prop_name, "interrupt-parent"))) {
-				dt_prop(w, prop_name, r->blob + data_offset, length);
+			if (str_eq(prop_name, "interrupt-parent")) {
+				if (length != sizeof(uint32_t)) {
+					print("Polaris Android DT node %s has a malformed interrupt-parent\n", node_name);
+					return 0;
+				}
+				effective_interrupt_parent = fdt_be32(r->blob + data_offset);
+				has_local_interrupt_parent = 1;
+				if (write_node || depth == 0) {
+					dt_prop_u32(w, prop_name, effective_interrupt_parent);
+				}
+			} else if (str_eq(prop_name, "interrupts")) {
+				has_interrupts = 1;
+				if (write_node && !dt_prop_fdt_cells(w, prop_name, r->blob + data_offset, length)) {
+					return 0;
+				}
+			} else if (str_eq(prop_name, "phandle") || str_eq(prop_name, "linux,phandle") ||
+			    str_eq(prop_name, "AAPL,phandle")) {
+				uint32_t value;
+
+				if (length != sizeof(uint32_t)) {
+					print("Polaris Android DT node %s has a malformed phandle\n", node_name);
+					return 0;
+				}
+				value = fdt_be32(r->blob + data_offset);
+				if (write_node || depth == 0) {
+					if (!str_eq(prop_name, "AAPL,phandle")) {
+						dt_prop(w, prop_name, r->blob + data_offset, length);
+					}
+					if (have_aapl_phandle && aapl_phandle != value) {
+						print("Polaris Android DT node %s has conflicting phandle properties\n", node_name);
+						return 0;
+					}
+					if (!have_aapl_phandle) {
+						dt_prop_u32(w, "AAPL,phandle", value);
+						aapl_phandle = value;
+						have_aapl_phandle = 1;
+					}
+				}
+			} else if (str_eq(prop_name, "interrupt-controller")) {
+				node_can_route = 1;
+				if (write_node) {
+					dt_prop(w, prop_name, r->blob + data_offset, length);
+				}
+			} else if (str_eq(prop_name, "interrupt-map")) {
+				node_can_route = 1;
+				if (write_node && !dt_prop_fdt_cells(w, prop_name, r->blob + data_offset, length)) {
+					return 0;
+				}
+			} else if (write_node && !str_eq(prop_name, "name") && str_len(prop_name) <= 32) {
+				if (fdt_apple_cell_property(prop_name)) {
+					if (str_eq(prop_name, "reg")) {
+						dt_prop(w, "fdt,reg", r->blob + data_offset, length);
+						if (w->overflow) {
+							return 0;
+						}
+					}
+					if (!dt_prop_fdt_cells(w, prop_name, r->blob + data_offset, length)) {
+						return 0;
+					}
+				} else {
+					dt_prop(w, prop_name, r->blob + data_offset, length);
+				}
 			}
 			r->offset = (data_offset + length + 3) & ~3u;
 			if (r->offset > end) {
 				return 0;
 			}
 		} else if (token == FDT_END_NODE) {
+			if (!fdt_finish_interrupt_parent(w, node_name, write_node, has_interrupts,
+			    has_local_interrupt_parent, parent_emitted, effective_interrupt_parent, parent_can_route)) {
+				return 0;
+			}
 			if (write_node) {
 				dt_end(w);
 			}
@@ -898,7 +1033,7 @@ dt_import_polaris_android(struct dt_writer *w)
 	}
 	r.offset += 4;
 	if (!fdt_read_node_name(&r, &root_name) || root_name[0] != 0 ||
-	    !fdt_copy_node(&r, w, root_name, 0, 0)) {
+	    !fdt_copy_node(&r, w, root_name, 0, 0, 0, 0)) {
 		print("Polaris Android DTB structure is malformed\n");
 		return 0;
 	}

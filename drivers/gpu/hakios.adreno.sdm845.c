@@ -1125,6 +1125,19 @@ polaris_dt_be32(const uint8_t *data)
 	return (uint32_t)data[0] << 24 | (uint32_t)data[1] << 16 | (uint32_t)data[2] << 8 | data[3];
 }
 
+/* The loader exposes Apple's native-cell `reg` plus this raw FDT alias for the A630 validator. */
+static bool
+polaris_dt_get_raw_reg(DTEntry node, const uint8_t **reg, unsigned int *size)
+{
+	if (node == NULL || reg == NULL || size == NULL) {
+		return false;
+	}
+	if (SecureDTGetProperty(node, "fdt,reg", (const void **)reg, size) != kSuccess) {
+		return SecureDTGetProperty(node, "reg", (const void **)reg, size) == kSuccess && *reg != NULL;
+	}
+	return *reg != NULL;
+}
+
 static bool
 polaris_dt_has_compatible(DTEntry node, const char *expected)
 {
@@ -1157,7 +1170,7 @@ polaris_dt_has_reg(DTEntry node, uint32_t address, uint32_t length)
 	const uint8_t *reg;
 	unsigned int size = 0;
 
-	if (SecureDTGetProperty(node, "reg", (const void **)&reg, &size) != kSuccess || reg == NULL || size == 0 ||
+	if (!polaris_dt_get_raw_reg(node, &reg, &size) || size == 0 ||
 	    (size & 7u) != 0) {
 		return false;
 	}
@@ -1174,8 +1187,17 @@ polaris_dt_get_u32(DTEntry node, const char *name, uint32_t *value)
 {
 	const uint8_t *property;
 	unsigned int size = 0;
+	int result;
 
-	if (SecureDTGetProperty(node, name, (const void **)&property, &size) != kSuccess || property == NULL || size != 4) {
+	if (strcmp(name, "reg") == 0) {
+		result = SecureDTGetProperty(node, "fdt,reg", (const void **)&property, &size);
+		if (result != kSuccess) {
+			result = SecureDTGetProperty(node, name, (const void **)&property, &size);
+		}
+	} else {
+		result = SecureDTGetProperty(node, name, (const void **)&property, &size);
+	}
+	if (result != kSuccess || property == NULL || size != 4) {
 		return false;
 	}
 	*value = polaris_dt_be32(property);
@@ -1436,7 +1458,7 @@ polaris_dt_has_reg64(DTEntry node, uint64_t address, uint64_t length)
 	unsigned int size = 0;
 
 	/* The Polaris reserved-memory parent uses two address cells and two size cells. */
-	if (SecureDTGetProperty(node, "reg", (const void **)&reg, &size) != kSuccess || reg == NULL || size == 0 ||
+	if (!polaris_dt_get_raw_reg(node, &reg, &size) || size == 0 ||
 	    (size & 15u) != 0) {
 		return false;
 	}
@@ -1459,7 +1481,7 @@ polaris_dt_reg64_contains(DTEntry node, uint64_t address, uint64_t length)
 	uint64_t end;
 
 	if (length == 0 || address > UINT64_MAX - length ||
-	    SecureDTGetProperty(node, "reg", (const void **)&reg, &size) != kSuccess || reg == NULL || size == 0 ||
+	    !polaris_dt_get_raw_reg(node, &reg, &size) || size == 0 ||
 	    (size & 15u) != 0) {
 		return false;
 	}
@@ -1481,8 +1503,7 @@ polaris_dt_get_reg32(DTEntry node, uint32_t index, uint32_t *address, uint32_t *
 	const uint8_t *reg;
 	unsigned int size = 0;
 
-	if (address == NULL || length == NULL ||
-	    SecureDTGetProperty(node, "reg", (const void **)&reg, &size) != kSuccess || reg == NULL || size == 0 ||
+	if (address == NULL || length == NULL || !polaris_dt_get_raw_reg(node, &reg, &size) || size == 0 ||
 	    (size & 7u) != 0 || index >= size / 8u) {
 		return false;
 	}
