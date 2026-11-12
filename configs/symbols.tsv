@@ -139,6 +139,7 @@ GPU_CACHED	arg	gpu_cached	GPU and display	k	hakios.gpu.cpp
 GPU_EXACT	arg	gpu_exact	GPU and display	k	hakios.adreno.c	
 GPU_KEEP	arg	gpu_keep	GPU and display	k	hakios.gpu.cpp	
 GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c	
+GPUDEBUG	arg	gpudebug	GPU and display	k	hakios.adreno.sdm845.c	report every guarded step. Off by default, the GPU is simply started.
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
 M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	

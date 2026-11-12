@@ -719,6 +719,8 @@ static uint32_t polaris_rpmh_total_tcs;
 static const uint8_t *polaris_cmd_db;
 static struct polaris_gpu_operating_point polaris_gpu_pwrlevels[POLARIS_MAX_GPU_PWRLEVELS];
 static uint32_t polaris_gpu_pwrlevel_count;
+/* gpudebug=1: report every guarded step. Off by default, the GPU is simply started. */
+static bool polaris_gpu_debug;
 static uint32_t polaris_gpu_initial_pwrlevel;
 static struct polaris_msm_bus_vector polaris_gpu_bus_levels[POLARIS_MAX_GPU_BUS_LEVELS];
 static uint32_t polaris_gpu_bus_level_count;
@@ -6200,6 +6202,30 @@ polaris_gmu_hfi_start(uint32_t step)
 	 * Ask again a few times before calling it a failure.
 	 */
 	for (uint32_t attempt = 0; attempt < 3u; attempt++) {
+		{
+			/*
+			 * Every attempt starts from a clean CM3: a warm reboot or a previous handoff can
+			 * leave the firmware running with HFI state of its own, and then HFI_CTRL_INIT is
+			 * accepted but no queue is ever brought up.
+			 */
+			probe_write(&gmu, GMU_CM3_SYSRESET, 1u);
+			delay(1000);
+			probe_write(&gmu, GMU_CM3_FW_INIT_RESULT, 0u);
+			probe_write(&gmu, GMU_CM3_BOOT_CONFIG, A630_GMU_BOOT_TCM);
+			probe_write(&gmu, GMU_HFI_QTBL_ADDR, polaris_hfi_state.gmu_address);
+			probe_write(&gmu, GMU_HFI_QTBL_INFO, 1u);
+			probe_write(&gmu, GMU_CM3_CFG, 0x4052u);
+			probe_write(&gmu, GMU_GMU2HOST_INTR_CLR, UINT32_MAX);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			probe_write(&gmu, GMU_CM3_SYSRESET, 0u);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			for (uint32_t poll = 0; poll < A630_GMU_HFI_QUEUE_START_POLLS; poll++) {
+				if (probe_read(&gmu, GMU_CM3_FW_INIT_RESULT) == A630_GMU_FW_READY) {
+					break;
+				}
+				delay(A630_GMU_HFI_POLL_DELAY_US);
+			}
+		}
 		probe_write(&gmu, GMU_HFI_CTRL_INIT, 1u);
 		__asm__ volatile ("dsb sy" ::: "memory");
 		for (uint32_t poll = 0; poll < A630_GMU_HFI_QUEUE_START_POLLS; poll++) {
@@ -8583,7 +8609,11 @@ polaris_a630_gpu_full_start(uint32_t step)
 	 * The three probes below only measure a GPU that is already running. They report what they
 	 * find but no longer withhold the service: a bring-up that reached this point has power,
 	 * firmware, HFI, CP and an authenticated ZAP, which is what HakiosGPU needs to exist.
+	 * gpudebug=0, the default, does not run them at all.
 	 */
+	if (!polaris_gpu_debug) {
+		return true;
+	}
 	if (!polaris_a630_cp_fence_smoke_test()) {
 		printf("adreno-sdm845: step %u CP fence smoke test did not pass; the GPU is started anyway\n", step);
 	}
@@ -8599,7 +8629,7 @@ polaris_a630_gpu_full_start(uint32_t step)
 void
 hakios_adreno_sdm845_init(void)
 {
-	uint32_t last_step = 0, gpu_enabled = 0;
+	uint32_t last_step = 0, gpu_enabled = 0, gpu_debug = 0;
 	bool requested_probe;
 	static bool (*const probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core, probe_firmware,
 	    probe_pas_capabilities, stage_zap_shader };
@@ -8610,12 +8640,15 @@ hakios_adreno_sdm845_init(void)
 	polaris_gpu_va_init();
 	requested_probe = PE_parse_boot_argn("adreno", &last_step, sizeof(last_step)) && last_step != 0;
 	PE_parse_boot_argn("gpu", &gpu_enabled, sizeof(gpu_enabled));
+	/* gpudebug=1 restores the step-by-step bring-up report; off by default, it starts the GPU. */
+	polaris_gpu_debug = PE_parse_boot_argn("gpudebug", &gpu_debug, sizeof(gpu_debug)) && gpu_debug != 0;
 	if ((requested_probe || gpu_enabled) && !polaris_runtime_dt_validate()) {
 		return;
 	}
 	if (!requested_probe) {
 		if (gpu_enabled) {
-			printf("adreno-sdm845: gpu=1 requests the Polaris A630 runtime; completing guarded steps 21–23 before starting HakiosGPU\n");
+			printf("adreno-sdm845: gpu=1: starting the Polaris A630%s\n",
+			    polaris_gpu_debug ? " with the guarded step report (gpudebug=1)" : "");
 			if (!polaris_a630_gpu_full_start(23u)) {
 				printf("adreno-sdm845: Polaris A630 startup/CPU-root IB probe failed; HakiosGPU is not started\n");
 				/* Try the same bounded stop used after service-creation failure. It

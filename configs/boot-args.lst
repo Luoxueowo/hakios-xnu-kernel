@@ -149,6 +149,7 @@ gpu_cached	k
 gpu_exact	k
 gpu_keep	k
 gpu_log	k
+gpudebug	k
 hakios_kver	k
 haptic	k
 haptic_effect	k
