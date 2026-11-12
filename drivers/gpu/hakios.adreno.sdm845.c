@@ -3218,7 +3218,7 @@ polaris_block_clock_on(struct probe_block *block, uint32_t offset, const char *n
 		printf("adreno-sdm845: power: %s runs already (CBCR=%#x)\n", name, value);
 		return true;
 	}
-	probe_write(block, offset, value | CBCR_ENABLE);
+	probe_write(block, offset, (value & ~CBCR_OFF) | CBCR_ENABLE);
 	for (uint32_t i = 0; i < 100; i++) {
 		value = probe_read(block, offset);
 		if ((value & (CBCR_ENABLE | CBCR_OFF)) == CBCR_ENABLE) {
@@ -3251,8 +3251,10 @@ polaris_gpu_cx_power_on(void)
 		return false;
 	}
 	if (!polaris_gpu_gdsc_on(GPUCC_CX_GDSCR, "gpu_cx_gdsc") ||
+	    !polaris_gpu_clock_on(0x1078u, "gpucc_ahb_clk") ||
 	    !polaris_gpu_clock_on(GPUCC_CXO_CBCR, "gpu_cc_cxo_clk") ||
-	    !polaris_gpu_clock_on(GPUCC_CX_GMU_CBCR, "gpu_cc_cx_gmu_clk")) {
+	    !polaris_gpu_clock_on(GPUCC_CX_GMU_CBCR, "gpu_cc_cx_gmu_clk") ||
+	    !polaris_gpu_clock_on(0x5000u, "gpucc_smmu_vote_clk")) {
 		return false;
 	}
 	return true;
