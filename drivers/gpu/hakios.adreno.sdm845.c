@@ -7742,6 +7742,8 @@ polaris_a630_gpu_core_initialize(void)
 			expected = value;
 		}
 		if (probe_read(&gpu, GPU_CP_PROTECT_REG + i * sizeof(uint32_t)) != expected) {
+			printf("adreno-sdm845: step 18 CP_PROTECT[%u] reads %#x, wrote %#x\n", i,
+			    probe_read(&gpu, GPU_CP_PROTECT_REG + i * sizeof(uint32_t)), expected);
 			goto fault;
 		}
 	}
@@ -7755,6 +7757,16 @@ polaris_a630_gpu_core_initialize(void)
 	    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_2) != 0x010000c0u ||
 	    probe_read(&gpu, GPU_CP_PROTECT_CNTL) != 0x3u ||
 	    probe_read(&gpu, GPU_RBBM_INTERFACE_HANG_INT_CNTL) != ((1u << 30) | 0x001fffffu)) {
+		printf("adreno-sdm845: step 18 readback CLOCK_CNTL=%#x(expected %#x) VBIF_GATE=%#x(9) VBIF_QOS=%#x(3) "
+		    "GMEM=%#x..%#x(expected %#x..%#x) ROQ1=%#x(%#x) ROQ2=%#x(%#x) PROTECT_CNTL=%#x(3) HANG=%#x(%#x)\n",
+		    probe_read(&gpu, GPU_RBBM_CLOCK_CNTL), A630_RBBM_CLOCK_CNTL_ON,
+		    probe_read(&gpu, GPU_VBIF_GATE_OFF_WRREQ_EN), probe_read(&gpu, GPU_RBBM_VBIF_CLIENT_QOS_CNTL),
+		    probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MIN_LO), probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MAX_LO),
+		    A630_GMEM_BASE, A630_GMEM_BASE + A630_GMEM_SIZE - 1u,
+		    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_1), 0x8040362cu,
+		    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_2), 0x010000c0u,
+		    probe_read(&gpu, GPU_CP_PROTECT_CNTL),
+		    probe_read(&gpu, GPU_RBBM_INTERFACE_HANG_INT_CNTL), (1u << 30) | 0x001fffffu);
 		goto fault;
 	}
 	polaris_gpu_core_configured = true;
