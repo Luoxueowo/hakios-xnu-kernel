@@ -6243,7 +6243,7 @@ polaris_zap_pas_load(uint32_t step, bool authenticate)
 
 	printf("adreno-sdm845: step %u: stage A630 ZAP metadata/segments through PAS%s\n", step,
 	    authenticate ? " and authenticate/reset image 13" : "; no AUTH_AND_RESET");
-	if (!polaris_zap_manifest_valid || !polaris_pas_calls_ready || !polaris_pas_gpu_supported ||
+	if (!polaris_zap_manifest_valid || !polaris_pas_calls_ready ||
 	    polaris_zap_memory_phys == 0 || polaris_zap_memory_size == 0 || polaris_zap_memory_setup_size == 0) {
 		printf("adreno-sdm845: step %u refused: firmware manifest, PAS 13 support/calls, or reserved memory is not verified\n", step);
 		return false;
@@ -6369,6 +6369,17 @@ static bool
 stage_zap_shader(void)
 {
 	return polaris_zap_pas_load(7u, false);
+}
+
+/*
+ * The full startup chain needs a resident, authenticated ZAP image before it can build the
+ * SID0 context and the CP buffers. Step 7's probe stages the image and shuts it down again;
+ * this one keeps it, which is what every step from 17 on used to assume had happened.
+ */
+static bool
+stage_zap_shader_authenticated(void)
+{
+	return polaris_zap_pas_load(7u, true);
 }
 
 static void
@@ -8036,7 +8047,7 @@ static bool
 polaris_a630_gpu_domain_start(uint32_t step)
 {
 	static bool (*const step_probes[])(void) = { probe_gpucc, probe_smmu, probe_gmu, probe_core,
-	    probe_firmware, probe_pas_capabilities };
+	    probe_firmware, probe_pas_capabilities, stage_zap_shader_authenticated };
 
 	for (uint32_t i = 0; i < sizeof(step_probes) / sizeof(step_probes[0]); i++) {
 		if (!step_probes[i]()) {

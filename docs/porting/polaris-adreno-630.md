@@ -53,6 +53,12 @@ allow it. A successful firmware boot alone is not a completed driver.
   the chain that far: the validator reads device-tree cells natively (the loader writes
   Apple-format cells), and the ZAP load-map bound uses `0xFFF` instead of `PAGE_MASK`, which
   aligned a 0x57b0 segment end to 4 GiB on this configuration.
+- The full-start chain now stages and authenticates the ZAP before its SID0/CP prerequisite check;
+  that step was missing from `polaris_a630_gpu_domain_start()` entirely, so `gpu=1` could never
+  satisfy the check. On the phone it now stops at step 7's own prerequisite: the CX/GMU and
+  GX/GFX3D clocks must already be running, while this chain turns them on later. `PAS_IS_SUPPORTED`
+  still answers 0 and is no longer used as a gate; the real calls are what matter. Reordering the
+  clock setup ahead of the PAS handoff is the next change.
 - On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
   `hakios.adreno.sdm845.o` (including the guarded A630 hang snapshot), `hakios.adreno.o`,
   `MiniIOSurface.cpo`, and the shared IOKit GPU service, including the new resource caps. The build
