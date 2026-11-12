@@ -37,6 +37,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   (`len e0314`) hangs before the first kernel line while the small tree (`len 467c`) boots, so the
   device-tree import, not `gpu=1`, is the boot blocker. `xl stop`, the panic return and the
   loader's return stub remain.
+- The Android device-tree import was removed on 2026-11-12. Importing `/soc` and
+  `/reserved-memory` whole made XNU hang before its first log line: the 161 `/soc` nodes inherit
+  the root `interrupt-parent` (the PDC at phandle 1), and `IODTFindInterruptParent()` only walks
+  one level up, so `IODTMapOneInterrupt()` could not leave its loop. The loader now writes only the
+  twelve nodes the A630 backend and the two GPU GDSCs look up (clock providers, Apps RSC mailbox,
+  command DB, both GDSCs, the KGSL SMMU, the zap PAS node, the GMU with its two SMMU contexts and
+  its operating points, the 3D core with its eight operating points, and the GPU reserved-memory
+  pool). None of them carries an interrupt. The values are the ones `android-polaris.dtb` declares;
+  the driver's DT paths are unchanged.
 - On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
   `hakios.adreno.sdm845.o` (including the guarded A630 hang snapshot), `hakios.adreno.o`,
   `MiniIOSurface.cpo`, and the shared IOKit GPU service, including the new resource caps. The build

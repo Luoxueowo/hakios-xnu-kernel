@@ -12,9 +12,6 @@
 #include "efi.h"
 #include "identity.h"         /* who Darwin shall think we are: from the iPhone's own device tree (mkidentity.py) */
 #include "identity_conf.h"    /* the serial number and the UDID's inputs: devices/<device>/identity.conf (mkidentityconf.py) */
-#ifdef HAVE_POLARIS_ANDROID_DTB
-#include "polaris_android_dtb.h"
-#endif
 
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
@@ -589,7 +586,9 @@ dt_prop(struct dt_writer *w, const char *name, const void *data, uint32_t len)
 	memcpy(w->cur, name, str_len(name));
 	*(uint32_t *)(w->cur + 32) = len;
 	memset(w->cur + 36, 0, (size_t)padded);
-	memcpy(w->cur + 36, data, len);
+	if (len != 0) {
+		memcpy(w->cur + 36, data, len);
+	}
 	w->cur += 36 + padded;
 	w->counts[w->depth - 1][0]++;
 }
@@ -737,318 +736,284 @@ dt_end(struct dt_writer *w)
 	w->depth--;
 }
 
-#ifdef HAVE_POLARIS_ANDROID_DTB
-/* The Polaris loader receives an Apple-format tree, while SoC drivers use the Android DT paths. */
-struct fdt_reader {
-	const uint8_t *blob;
-	uint32_t struct_offset, struct_size;
-	uint32_t strings_offset, strings_size;
-	uint32_t offset;
-	uint32_t selected_nodes;
-};
-
-enum {
-	FDT_BEGIN_NODE = 1,
-	FDT_END_NODE = 2,
-	FDT_PROP = 3,
-	FDT_NOP = 4,
-	FDT_END = 9,
-	FDT_MAX_DEPTH = 12,
-};
-#define FDT_MAGIC 0xd00dfeedu
-
-static uint32_t
-fdt_be32(const uint8_t *p)
+/*
+ * The A630 backend and the two GPU power domains resolve their hardware by Android device-tree
+ * path. The phone's own tree used to be imported whole, but its 161 /soc nodes and the interrupt
+ * parents they inherit sent XNU's interrupt mapping into a loop before it could log a line. Only
+ * the nodes below are needed, and none of them carries an interrupt, so they are written here
+ * from the values android-polaris.dtb declares.
+ */
+static void
+dt_polaris_gpu_nodes(struct dt_writer *w)
 {
-	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+	dt_begin(w, "soc");
+	dt_prop_str(w, "compatible", "simple-bus");
+	dt_prop_u32(w, "#address-cells", 2);
+	dt_prop_u32(w, "#size-cells", 2);
+
+	/* clock providers, by the phandles the GPU nodes refer to */
+	dt_begin(w, "qcom,gcc@100000");
+	dt_prop_str(w, "compatible", "qcom,gcc-sdm845-v2.1");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x100000, 0x1f0000 }, 8);
+	dt_prop_u32(w, "#clock-cells", 1);
+	dt_prop_u32(w, "#reset-cells", 1);
+	dt_prop_u32(w, "phandle", 0x22);
+	dt_prop_u32(w, "AAPL,phandle", 0x22);
+	dt_end(w);
+
+	dt_begin(w, "qcom,gpucc@5090000");
+	dt_prop_str(w, "compatible", "qcom,gpucc-sdm845-v2");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x5090000, 0x9000 }, 8);
+	dt_prop_u32(w, "#clock-cells", 1);
+	dt_prop_u32(w, "#reset-cells", 1);
+	dt_prop_u32(w, "phandle", 0xd6);
+	dt_prop_u32(w, "AAPL,phandle", 0xd6);
+	dt_end(w);
+
+	dt_begin(w, "qcom,gfxcc@5090000");
+	dt_prop_str(w, "compatible", "qcom,gfxcc-sdm845-v2");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x5090000, 0x9000 }, 8);
+	dt_prop_u32(w, "#clock-cells", 1);
+	dt_prop_u32(w, "#reset-cells", 1);
+	dt_prop_u32(w, "phandle", 0x1c);
+	dt_prop_u32(w, "AAPL,phandle", 0x1c);
+	dt_end(w);
+
+	dt_begin(w, "qcom,cpucc@0x17d41000");
+	dt_prop_str(w, "compatible", "qcom,clk-cpu-osm-v2");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x17d41000, 0x1400, 0x17d43000, 0x1400, 0x17d45800, 0x1400 }, 24);
+	dt_prop_u32(w, "#clock-cells", 1);
+	dt_prop_u32(w, "phandle", 0xb6);
+	dt_prop_u32(w, "AAPL,phandle", 0xb6);
+	dt_end(w);
+
+	/* the Apps RSC mailbox and the command DB the GMU's RPMh votes go through */
+	dt_begin(w, "mailbox@179e0000");
+	dt_prop_str(w, "compatible", "qcom,tcs-drv");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x179e0000, 0x100, 0x179e0d00, 0x3000 }, 16);
+	dt_prop_u32(w, "#mbox-cells", 1);
+	dt_prop_u32(w, "qcom,drv-id", 2);
+	dt_prop(w, "qcom,tcs-config", (const uint32_t[]){ 2, 2, 0, 3, 1, 3, 3, 1 }, 32);
+	dt_prop_str(w, "label", "apps_rsc");
+	dt_prop_u32(w, "phandle", 0xba);
+	dt_prop_u32(w, "AAPL,phandle", 0xba);
+	dt_end(w);
+
+	dt_begin(w, "qcom,cmd-db@861e0000");
+	dt_prop_str(w, "compatible", "qcom,cmd-db");
+	dt_prop(w, "reg", (const uint32_t[]){ 0xc3f000c, 0x8 }, 8);
+	dt_end(w);
+
+	/* the two GPU power domains */
+	dt_begin(w, "qcom,gdsc@0x509106c");
+	dt_prop_str(w, "compatible", "qcom,gdsc");
+	dt_prop_str(w, "regulator-name", "gpu_cx_gdsc");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x509106c, 4 }, 8);
+	dt_prop_u32(w, "hw-ctrl-addr", 0x1a);
+	dt_prop_u32(w, "qcom,gds-timeout", 0x1f4);
+	dt_prop_u32(w, "qcom,clk-dis-wait-val", 8);
+	dt_prop_u32(w, "phandle", 0x1fc);
+	dt_prop_u32(w, "AAPL,phandle", 0x1fc);
+	dt_end(w);
+
+	dt_begin(w, "qcom,gdsc@0x509100c");
+	dt_prop_str(w, "compatible", "qcom,gdsc");
+	dt_prop_str(w, "regulator-name", "gpu_gx_gdsc");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x509100c, 4 }, 8);
+	dt_prop_u32(w, "domain-addr", 0x1e);
+	dt_prop_u32(w, "sw-reset", 0x1f);
+	dt_prop(w, "clocks", (const uint32_t[]){ 0x1c, 2 }, 8);
+	dt_prop_str(w, "clock-names", "core_root_clk");
+	dt_prop_u32(w, "phandle", 0x334);
+	dt_prop_u32(w, "AAPL,phandle", 0x334);
+	dt_end(w);
+
+	/* the KGSL SMMU, and the zap shader's PAS node */
+	dt_begin(w, "arm,smmu-kgsl@5040000");
+	dt_prop_str(w, "compatible", "qcom,smmu-v2");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x5040000, 0x10000 }, 8);
+	dt_prop_u32(w, "#iommu-cells", 1);
+	dt_prop_u32(w, "#global-interrupts", 2);
+	dt_prop(w, "attach-impl-defs", (const uint32_t[]){
+		0x6000, 0x2378, 0x6060, 0x1055, 0x678c, 0x8, 0x6794, 0x28,
+		0x6800, 0x6, 0x6900, 0x3ff, 0x6924, 0x204, 0x6928, 0x11000,
+		0x6930, 0x800, 0x6960, 0xffffffff, 0x6b64, 0x1a5551, 0x6b68, 0x9a82a382,
+	}, 96);
+	dt_prop(w, "clocks", (const uint32_t[]){ 0x22, 0x29 }, 8);
+	dt_prop_str(w, "clock-names", "gcc_gpu_memnoc_gfx_clk");
+	dt_prop_str(w, "qcom,regulator-names", "vdd");
+	dt_prop_u32(w, "phandle", 0x204);
+	dt_prop_u32(w, "AAPL,phandle", 0x204);
+	dt_end(w);
+
+	dt_begin(w, "qcom,kgsl-hyp");
+	dt_prop_str(w, "compatible", "qcom,pil-tz-generic");
+	dt_prop_str(w, "qcom,firmware-name", "a630_zap");
+	dt_prop_u32(w, "qcom,pas-id", 0xd);
+	dt_prop_u32(w, "memory-region", 0x332);
+	dt_end(w);
+
+	/* the GMU: registers, the cnoc vote, and its two SMMU contexts */
+	dt_begin(w, "qcom,gmu");
+	dt_prop_str(w, "compatible", "qcom,gpu-gmu");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x506a000, 0x30000, 0xb200000, 0x300000 }, 16);
+	dt_prop_str(w, "reg-names", "kgsl_gmu_reg");
+	dt_prop(w, "clocks", (const uint32_t[]){ 0xd6, 4, 0xd6, 0xa, 0x22, 0x1a, 0x22, 0x29 }, 32);
+	dt_prop_str(w, "clock-names", "gmu_clk");
+	dt_prop_str(w, "regulator-names", "vddcx");
+	dt_prop_u32(w, "vddcx-supply", 0x1fc);
+	dt_prop_u32(w, "vdd-supply", 0x334);
+	dt_prop_str(w, "label", "kgsl-gmu");
+	dt_prop_str(w, "qcom,msm-bus,name", "cnoc");
+	dt_prop_u32(w, "qcom,msm-bus,num-cases", 2);
+	dt_prop_u32(w, "qcom,msm-bus,num-paths", 1);
+	dt_prop(w, "qcom,msm-bus,vectors-KBps", (const uint32_t[]){ 0x1a, 0x2734, 0, 0, 0x1a, 0x2734, 0, 0x64 }, 32);
+	dt_prop_u32(w, "phandle", 0xcc);
+	dt_prop_u32(w, "AAPL,phandle", 0xcc);
+	dt_begin(w, "gmu_kernel");
+	dt_prop_str(w, "compatible", "qcom,smmu-gmu-kernel-cb");
+	dt_prop(w, "iommus", (const uint32_t[]){ 0x204, 5 }, 8);
+	dt_end(w);
+	dt_begin(w, "gmu_user");
+	dt_prop_str(w, "compatible", "qcom,smmu-gmu-user-cb");
+	dt_prop(w, "iommus", (const uint32_t[]){ 0x204, 4 }, 8);
+	dt_end(w);
+	dt_begin(w, "qcom,gmu-pwrlevels");
+	dt_prop_str(w, "compatible", "qcom,gmu-pwrlevels");
+	dt_prop_u32(w, "#address-cells", 1);
+	dt_prop_u32(w, "#size-cells", 0);
+	dt_begin(w, "qcom,gmu-pwrlevel@0");
+	dt_prop_u32(w, "reg", 0);
+	dt_prop_u32(w, "qcom,gmu-freq", 0);
+	dt_end(w);
+	dt_begin(w, "qcom,gmu-pwrlevel@1");
+	dt_prop_u32(w, "reg", 1);
+	dt_prop_u32(w, "qcom,gmu-freq", 0xbebc200);
+	dt_end(w);
+	dt_begin(w, "qcom,gmu-pwrlevel@2");
+	dt_prop_u32(w, "reg", 2);
+	dt_prop_u32(w, "qcom,gmu-freq", 0x1dcd6500);
+	dt_end(w);
+	dt_end(w);
+	dt_end(w);
+
+	/* the 3D core and its operating points */
+	dt_begin(w, "qcom,kgsl-3d0@5000000");
+	dt_prop_str(w, "compatible", "qcom,kgsl-3d0");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x5000000, 0x40000, 0x5061000, 0x800, 0x509e000, 0x1000 }, 24);
+	dt_prop_str(w, "reg-names", "kgsl_3d0_reg_memory");
+	dt_prop_u32(w, "qcom,chipid", 0x6030001);
+	dt_prop_u32(w, "qcom,id", 0);
+	dt_prop_u32(w, "qcom,initial-pwrlevel", 6);
+	dt_prop_u32(w, "qcom,idle-timeout", 0x50);
+	dt_prop_u32(w, "qcom,ubwc-mode", 2);
+	dt_prop_u32(w, "qcom,bus-width", 0x20);
+	dt_prop_u32(w, "qcom,min-access-length", 0x20);
+	dt_prop_u32(w, "qcom,highest-bank-bit", 0xf);
+	dt_prop_u32(w, "qcom,snapshot-size", 0x100000);
+	dt_prop_u32(w, "qcom,pm-qos-active-latency", 0x1cc);
+	dt_prop(w, "qcom,gpu-qdss-stm", (const uint32_t[]){ 0x161c0000, 0x40000 }, 8);
+	dt_prop(w, "cache-slices", (const uint32_t[]){ 0x32, 0xc, 0x32, 0xb }, 16);
+	dt_prop_str(w, "cache-slice-names", "gpu");
+	dt_prop(w, "clocks",
+	    (const uint32_t[]){ 0x1c, 3, 0xd6, 0xa, 0x22, 0x1a, 0x22, 0x29, 0xd6, 4, 0xb6, 0x10 }, 48);
+	dt_prop_str(w, "clock-names", "core_clk");
+	dt_prop_u32(w, "vddcx-supply", 0x1fc);
+	dt_prop_u32(w, "vdd-supply", 0x334);
+	dt_prop_str(w, "qcom,msm-bus,name", "grp3d");
+	dt_prop_u32(w, "qcom,msm-bus,num-cases", 0xd);
+	dt_prop_u32(w, "qcom,msm-bus,num-paths", 1);
+	dt_prop(w, "qcom,msm-bus,vectors-KBps", (const uint32_t[]){
+		0x1a, 0x200, 0x0, 0x0, 0x1a, 0x200, 0x0, 0x61a80,
+		0x1a, 0x200, 0x0, 0x927c0, 0x1a, 0x200, 0x0, 0xc3500,
+		0x1a, 0x200, 0x0, 0x124f80, 0x1a, 0x200, 0x0, 0x192580,
+		0x1a, 0x200, 0x0, 0x2162e0, 0x1a, 0x200, 0x0, 0x2990a0,
+		0x1a, 0x200, 0x0, 0x2ee000, 0x1a, 0x200, 0x0, 0x3e12a0,
+		0x1a, 0x200, 0x0, 0x4f1a00, 0x1a, 0x200, 0x0, 0x5ee8e0,
+		0x1a, 0x200, 0x0, 0x6e1b80,
+	}, 208);
+	dt_prop_str(w, "label", "kgsl-3d0");
+	dt_prop_u32(w, "phandle", 0xcd);
+	dt_prop_u32(w, "AAPL,phandle", 0xcd);
+	dt_begin(w, "qcom,gpu-pwrlevels");
+	dt_prop_str(w, "compatible", "qcom,gpu-pwrlevels");
+	dt_prop_u32(w, "#address-cells", 1);
+	dt_prop_u32(w, "#size-cells", 0);
+	dt_begin(w, "qcom,gpu-pwrlevel@0");
+	dt_prop_u32(w, "reg", 0);
+	dt_prop_u32(w, "qcom,gpu-freq", 0x2a51bd80);
+	dt_prop_u32(w, "qcom,bus-freq", 0xc);
+	dt_prop_u32(w, "qcom,bus-min", 0xc);
+	dt_prop_u32(w, "qcom,bus-max", 0xc);
+	dt_end(w);
+	dt_begin(w, "qcom,gpu-pwrlevel@1");
+	dt_prop_u32(w, "reg", 1);
+	dt_prop_u32(w, "qcom,gpu-freq", 0x283baec0);
+	dt_prop_u32(w, "qcom,bus-freq", 0xc);
+	dt_prop_u32(w, "qcom,bus-min", 0xa);
+	dt_prop_u32(w, "qcom,bus-max", 0xc);
+	dt_end(w);
+	dt_begin(w, "qcom,gpu-pwrlevel@2");
+	dt_prop_u32(w, "reg", 2);
+	dt_prop_u32(w, "qcom,gpu-freq", 0x23863d00);
+	dt_prop_u32(w, "qcom,bus-freq", 0xa);
+	dt_prop_u32(w, "qcom,bus-min", 9);
+	dt_prop_u32(w, "qcom,bus-max", 0xc);
+	dt_end(w);
+	dt_begin(w, "qcom,gpu-pwrlevel@3");
+	dt_prop_u32(w, "reg", 3);
+	dt_prop_u32(w, "qcom,gpu-freq", 0x1efe9200);
+	dt_prop_u32(w, "qcom,bus-freq", 9);
+	dt_prop_u32(w, "qcom,bus-min", 8);
+	dt_prop_u32(w, "qcom,bus-max", 0xb);
+	dt_end(w);
+	dt_begin(w, "qcom,gpu-pwrlevel@4");
+	dt_prop_u32(w, "reg", 4);
+	dt_prop_u32(w, "qcom,gpu-freq", 0x18ad2380);
+	dt_prop_u32(w, "qcom,bus-freq", 8);
+	dt_prop_u32(w, "qcom,bus-min", 7);
+	dt_prop_u32(w, "qcom,bus-max", 9);
+	dt_end(w);
+	dt_begin(w, "qcom,gpu-pwrlevel@5");
+	dt_prop_u32(w, "reg", 5);
+	dt_prop_u32(w, "qcom,gpu-freq", 0x14628180);
+	dt_prop_u32(w, "qcom,bus-freq", 6);
+	dt_prop_u32(w, "qcom,bus-min", 5);
+	dt_prop_u32(w, "qcom,bus-max", 7);
+	dt_end(w);
+	dt_begin(w, "qcom,gpu-pwrlevel@6");
+	dt_prop_u32(w, "reg", 6);
+	dt_prop_u32(w, "qcom,gpu-freq", 0xf518240);
+	dt_prop_u32(w, "qcom,bus-freq", 4);
+	dt_prop_u32(w, "qcom,bus-min", 3);
+	dt_prop_u32(w, "qcom,bus-max", 5);
+	dt_end(w);
+	dt_begin(w, "qcom,gpu-pwrlevel@7");
+	dt_prop_u32(w, "reg", 7);
+	dt_prop_u32(w, "qcom,gpu-freq", 0);
+	dt_prop_u32(w, "qcom,bus-freq", 0);
+	dt_prop_u32(w, "qcom,bus-min", 0);
+	dt_prop_u32(w, "qcom,bus-max", 0);
+	dt_end(w);
+	dt_end(w);
+	dt_end(w);
+
+	dt_end(w);
+
+	/* the pool the zap shader's PAS metadata comes from */
+	dt_begin(w, "reserved-memory");
+	dt_prop_u32(w, "#address-cells", 2);
+	dt_prop_u32(w, "#size-cells", 2);
+	dt_begin(w, "gpu_region@0x8c415000");
+	dt_prop_str(w, "compatible", "removed-dma-pool");
+	dt_prop(w, "reg", (const uint32_t[]){ 0, 0x8c415000, 0, 0x2000 }, 16);
+	dt_prop(w, "no-map", NULL, 0);
+	dt_prop_u32(w, "phandle", 0x332);
+	dt_prop_u32(w, "AAPL,phandle", 0x332);
+	dt_end(w);
+	dt_end(w);
 }
 
-/* Apple DeviceTree consumers in XNU read these standard cell properties as native integers. */
-static int
-fdt_apple_cell_property(const char *name)
-{
-	return name[0] == '#' || str_eq(name, "reg") || str_eq(name, "ranges") || str_eq(name, "dma-ranges") ||
-	    str_eq(name, "interrupts") || str_eq(name, "interrupts-extended") ||
-	    str_eq(name, "interrupt-map") || str_eq(name, "interrupt-map-mask");
-}
-
-static int
-dt_prop_fdt_cells(struct dt_writer *w, const char *name, const uint8_t *data, uint32_t len)
-{
-	uint64_t padded = ((uint64_t)len + 3) & ~3ULL;
-
-	if ((len & 3u) != 0 || w->overflow || str_len(name) > 32 ||
-	    (uint64_t)(w->end - w->cur) < 36 + padded) {
-		w->overflow = 1;
-		return 0;
-	}
-	memset(w->cur, 0, 32);
-	memcpy(w->cur, name, str_len(name));
-	*(uint32_t *)(w->cur + 32) = len;
-	for (uint32_t offset = 0; offset < len; offset += sizeof(uint32_t)) {
-		*(uint32_t *)(w->cur + 36 + offset) = fdt_be32(data + offset);
-	}
-	w->cur += 36 + padded;
-	w->counts[w->depth - 1][0]++;
-	return 1;
-}
-
-static int
-fdt_read_node_name(struct fdt_reader *r, const char **name)
-{
-	uint32_t start = r->offset;
-	uint32_t end = r->struct_offset + r->struct_size;
-
-	while (r->offset < end && r->blob[r->offset] != 0) {
-		r->offset++;
-	}
-	if (r->offset == end) {
-		return 0;
-	}
-	*name = (const char *)(r->blob + start);
-	r->offset = (r->offset + 4) & ~3u;
-	return r->offset <= end;
-}
-
-static int
-fdt_finish_interrupt_parent(struct dt_writer *w, const char *node_name, int write_node,
-	int has_interrupts, int has_local_parent, int parent_emitted, uint32_t effective_parent,
-	int parent_can_route)
-{
-	if (!write_node || !has_interrupts || parent_emitted) {
-		return 1;
-	}
-	if (has_local_parent) {
-		if (effective_parent == 0) {
-			print("Polaris Android DT node %s has an invalid zero interrupt-parent\n", node_name);
-			return 0;
-		}
-		return 1;
-	}
-	if (effective_parent == 0) {
-		if (parent_can_route) {
-			return 1;       /* XNU can use its immediate-parent fallback for a controller or nexus. */
-		}
-		print("Polaris Android DT node %s has interrupts but no resolvable interrupt-parent\n", node_name);
-		return 0;
-	}
-	dt_prop_u32(w, "interrupt-parent", effective_parent);
-	return !w->overflow;
-}
-
-/* Consume one FDT node and copy it when it belongs to /soc or /reserved-memory. */
-static int
-fdt_copy_node(struct fdt_reader *r, struct dt_writer *w, const char *node_name, uint32_t depth, int emit,
-	uint32_t inherited_interrupt_parent, int parent_can_route)
-{
-	uint32_t end = r->struct_offset + r->struct_size;
-	uint32_t effective_interrupt_parent = inherited_interrupt_parent;
-	uint32_t aapl_phandle = 0;
-	int write_node = emit && str_len(node_name) <= 32;
-	int has_local_interrupt_parent = 0, has_interrupts = 0, parent_emitted = 0;
-	int have_aapl_phandle = 0, node_can_route = 0, children_started = 0;
-
-	if (depth > FDT_MAX_DEPTH) {
-		return 0;
-	}
-	if (write_node) {
-		dt_begin(w, node_name);
-	}
-	for (;;) {
-		uint32_t token;
-
-		if (r->offset > end || end - r->offset < 4) {
-			return 0;
-		}
-		token = fdt_be32(r->blob + r->offset);
-		r->offset += 4;
-		if (token == FDT_BEGIN_NODE) {
-			const char *child_name;
-			int child_emit;
-
-			if (!fdt_finish_interrupt_parent(w, node_name, write_node, has_interrupts,
-			    has_local_interrupt_parent, parent_emitted, effective_interrupt_parent, parent_can_route)) {
-				return 0;
-			}
-			parent_emitted = has_interrupts && !has_local_interrupt_parent && effective_interrupt_parent != 0;
-			children_started = 1;
-			if (!fdt_read_node_name(r, &child_name)) {
-				return 0;
-			}
-			if (depth == 0) {
-				child_emit = str_eq(child_name, "soc") || str_eq(child_name, "reserved-memory");
-				if (child_emit) {
-					r->selected_nodes++;
-				}
-			} else {
-				child_emit = write_node;
-			}
-			if (!fdt_copy_node(r, w, child_name, depth + 1, child_emit, effective_interrupt_parent,
-			    node_can_route)) {
-				return 0;
-			}
-		} else if (token == FDT_PROP) {
-			uint32_t length, name_offset, data_offset;
-			const char *prop_name;
-			uint32_t strings_end = r->strings_offset + r->strings_size;
-			uint32_t name_end;
-
-			if (r->offset > end || end - r->offset < 8) {
-				return 0;
-			}
-			if (children_started) {
-				print("Polaris Android DT node %s has a property after a child\n", node_name);
-				return 0;
-			}
-			length = fdt_be32(r->blob + r->offset);
-			name_offset = fdt_be32(r->blob + r->offset + 4);
-			r->offset += 8;
-			data_offset = (r->offset + 3) & ~3u;
-			if (name_offset >= r->strings_size || data_offset > end || length > end - data_offset) {
-				return 0;
-			}
-			prop_name = (const char *)(r->blob + r->strings_offset + name_offset);
-			name_end = r->strings_offset + name_offset;
-			while (name_end < strings_end && r->blob[name_end] != 0) {
-				name_end++;
-			}
-			if (name_end == strings_end) {
-				return 0;
-			}
-			if (str_eq(prop_name, "interrupt-parent")) {
-				if (length != sizeof(uint32_t)) {
-					print("Polaris Android DT node %s has a malformed interrupt-parent\n", node_name);
-					return 0;
-				}
-				effective_interrupt_parent = fdt_be32(r->blob + data_offset);
-				has_local_interrupt_parent = 1;
-				if (write_node || depth == 0) {
-					dt_prop_u32(w, prop_name, effective_interrupt_parent);
-				}
-			} else if (str_eq(prop_name, "interrupts")) {
-				has_interrupts = 1;
-				if (write_node && !dt_prop_fdt_cells(w, prop_name, r->blob + data_offset, length)) {
-					return 0;
-				}
-			} else if (str_eq(prop_name, "phandle") || str_eq(prop_name, "linux,phandle") ||
-			    str_eq(prop_name, "AAPL,phandle")) {
-				uint32_t value;
-
-				if (length != sizeof(uint32_t)) {
-					print("Polaris Android DT node %s has a malformed phandle\n", node_name);
-					return 0;
-				}
-				value = fdt_be32(r->blob + data_offset);
-				if (write_node || depth == 0) {
-					if (!str_eq(prop_name, "AAPL,phandle")) {
-						dt_prop(w, prop_name, r->blob + data_offset, length);
-					}
-					if (have_aapl_phandle && aapl_phandle != value) {
-						print("Polaris Android DT node %s has conflicting phandle properties\n", node_name);
-						return 0;
-					}
-					if (!have_aapl_phandle) {
-						dt_prop_u32(w, "AAPL,phandle", value);
-						aapl_phandle = value;
-						have_aapl_phandle = 1;
-					}
-				}
-			} else if (str_eq(prop_name, "interrupt-controller")) {
-				node_can_route = 1;
-				if (write_node) {
-					dt_prop(w, prop_name, r->blob + data_offset, length);
-				}
-			} else if (str_eq(prop_name, "interrupt-map")) {
-				node_can_route = 1;
-				if (write_node && !dt_prop_fdt_cells(w, prop_name, r->blob + data_offset, length)) {
-					return 0;
-				}
-			} else if (write_node && !str_eq(prop_name, "name") && str_len(prop_name) <= 32) {
-				if (fdt_apple_cell_property(prop_name)) {
-					if (str_eq(prop_name, "reg")) {
-						dt_prop(w, "fdt,reg", r->blob + data_offset, length);
-						if (w->overflow) {
-							return 0;
-						}
-					}
-					if (!dt_prop_fdt_cells(w, prop_name, r->blob + data_offset, length)) {
-						return 0;
-					}
-				} else {
-					dt_prop(w, prop_name, r->blob + data_offset, length);
-				}
-			}
-			r->offset = (data_offset + length + 3) & ~3u;
-			if (r->offset > end) {
-				return 0;
-			}
-		} else if (token == FDT_END_NODE) {
-			if (!fdt_finish_interrupt_parent(w, node_name, write_node, has_interrupts,
-			    has_local_interrupt_parent, parent_emitted, effective_interrupt_parent, parent_can_route)) {
-				return 0;
-			}
-			if (write_node) {
-				dt_end(w);
-			}
-			return 1;
-		} else if (token == FDT_NOP) {
-			continue;
-		} else {
-			return 0;
-		}
-	}
-}
-
-static int
-dt_import_polaris_android(struct dt_writer *w)
-{
-	struct fdt_reader r = { .blob = polaris_android_dtb };
-	const uint8_t *blob = polaris_android_dtb;
-	uint32_t total_size, struct_offset, strings_offset, struct_size, strings_size;
-	const char *root_name;
-
-	if (sizeof(polaris_android_dtb) < 40 || fdt_be32(blob) != FDT_MAGIC) {
-		print("Polaris Android DTB has an invalid header\n");
-		return 0;
-	}
-	total_size = fdt_be32(blob + 4);
-	struct_offset = fdt_be32(blob + 8);
-	strings_offset = fdt_be32(blob + 12);
-	struct_size = fdt_be32(blob + 36);
-	strings_size = fdt_be32(blob + 32);
-	if (total_size > sizeof(polaris_android_dtb) || total_size < 40 || struct_offset > total_size ||
-	    struct_size > total_size - struct_offset || strings_offset > total_size ||
-	    strings_size > total_size - strings_offset || struct_offset < 40 || strings_offset < 40) {
-		print("Polaris Android DTB has invalid section bounds\n");
-		return 0;
-	}
-	r.struct_offset = struct_offset;
-	r.struct_size = struct_size;
-	r.strings_offset = strings_offset;
-	r.strings_size = strings_size;
-	r.offset = struct_offset;
-	if (struct_size < 8 || fdt_be32(blob + r.offset) != FDT_BEGIN_NODE) {
-		print("Polaris Android DTB has no root node\n");
-		return 0;
-	}
-	r.offset += 4;
-	if (!fdt_read_node_name(&r, &root_name) || root_name[0] != 0 ||
-	    !fdt_copy_node(&r, w, root_name, 0, 0, 0, 0)) {
-		print("Polaris Android DTB structure is malformed\n");
-		return 0;
-	}
-	while (r.offset + 4 <= struct_offset + struct_size && fdt_be32(blob + r.offset) == FDT_NOP) {
-		r.offset += 4;
-	}
-	if (r.offset + 4 > struct_offset + struct_size || fdt_be32(blob + r.offset) != FDT_END ||
-	    r.selected_nodes != 2) {
-		print("Polaris Android DTB is missing /soc or /reserved-memory\n");
-		return 0;
-	}
-	print("Polaris Android DT: imported /soc and /reserved-memory\n");
-	return 1;
-}
-#endif /* HAVE_POLARIS_ANDROID_DTB */
 
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
@@ -3679,12 +3644,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* everything up to topOfKernelData is the kernel's static region: it must cover both images */
 	uint64_t dt_pa = rd1_size != 0 ? rd1_pa + rd1_size : rd_pa + rd_size;
 	uint64_t dt_max = 0x10000;
-#ifdef HAVE_POLARIS_ANDROID_DTB
-	/* Polaris includes the SoC and reserved-memory subtrees from its Android DTB. */
-	if (PLAT == &platform_polaris) {
-		dt_max = 0x200000;
-	}
-#endif
 	uint64_t ba_pa = dt_pa + dt_max;
 	uint64_t top = ba_pa + PAGE_SIZE_MAX;
 
@@ -4217,13 +4176,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_end(&w);
 	}
 	dt_end(&w);
-	/* The A630 and other Polaris SoC drivers resolve their MMIO, clocks and reserved memory by Android DT path. */
-#ifdef HAVE_POLARIS_ANDROID_DTB
-	if (plat == &platform_polaris && !dt_import_polaris_android(&w)) {
-		return 0;
+	if (plat == &platform_polaris) {
+		dt_polaris_gpu_nodes(&w);
 	}
-#endif
-
 	dt_end(&w);
 
 	/* a tree that did not fit in the room before boot_args was cut short by dt_prop: not handed to the kernel */
