@@ -40,8 +40,8 @@ allow it. A successful firmware boot alone is not a completed driver.
   embeds the checked-in Android DTB at build time and imports its `/soc` and `/reserved-memory`
   subtrees into the Apple-format tree, preserving the root `interrupt-parent`. Names longer than
   the Apple tree's 32-byte fields are omitted. The loader reserves 2 MiB for the resulting tree
-  and aborts before kernel handoff if it does not fit. This makes the runtime DT paths used by the
-  Polaris drivers available; it is build/source evidence only, not a phone boot. A read-only
+  and aborts before kernel handoff if it does not fit. This exposes the runtime DT paths to XNU;
+  confirming that the drivers match them still needs runtime validation. A read-only
   Recovery inspection on 2026-11-12 found the KGSL interrupt tuple `<0 0x12c 0>`. The KGSL node
   inherits root interrupt-parent phandle `1` (`qcom,pdc-sdm845-v2`), whose parent is the GICv3
   node at `0x17a00000` (phandle `0xa2`). The existing generic XNU GICv3 path has an SPI attach
@@ -49,6 +49,22 @@ allow it. A successful firmware boot alone is not a completed driver.
   200 microseconds. The Recovery parent chain and loader profile establish the interrupt
   description only; PDC-to-GIC routing, delivery, source acknowledgement, and fence behavior
   remain to be validated on the running HakiOS kernel.
+- On 2026-11-12, a temporary `fastboot boot` diagnostic image (not flashed) reached the XNU
+  handoff with `gpu=1 bootcpu=7 cpus=8 loader_return_after=120`; `ufs_write=1` was absent. The
+  loader surveyed UFS, imported `/soc` and `/reserved-memory`, received PSCI status 0 (request
+  accepted) for MPIDR `0x700`, and jumped to the kernel entry. The captured live-log/message-buffer
+  sections were empty: there was no XNU panic/exception text, timer-return message, or Adreno
+  stage output. A matching `gpu=0`/`bootcpu=7` boot also returned to Recovery before the timer,
+  so the available logs do not implicate A630 initialization. `gpu=0 bootcpu=0 cpus=8` remained
+  off USB longer, then returned to Recovery without an XNU log. `gpu=0 bootcpu=0 cpus=1` remained
+  unenumerated by USB for more than 180 seconds; no final log could be retrieved. Recovery exposed
+  neither pstore data nor `/proc/last_kmsg`, and its boot-reason properties were `unknown`.
+- The project's `xl enter` route could not establish its USB loader session: its loader log says
+  `usb: device protocol not found`, and no kernel payload was uploaded. The firmware did not
+  expose the USB device protocol this mode requires. The direct-boot attempts confirm kernel
+  handoff but do not show whether XNU's normal logging path starts. Keep the A630 stages
+  unvalidated until XNU logging works on Polaris. The last single-core attempt left the phone absent from ADB and
+  fastboot; it may need a manual button restart.
 - The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
   A completion wait of at least one second that expires blocks later GEM submissions before cache
   maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory
