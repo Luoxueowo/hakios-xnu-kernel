@@ -63,9 +63,29 @@ allow it. A successful firmware boot alone is not a completed driver.
   `unknown`.
 - The project's `xl enter` route could not establish its USB loader session: its loader log says
   `usb: device protocol not found`, and no kernel payload was uploaded. The firmware did not
-  expose the USB device protocol this mode requires. The direct-boot attempts confirm kernel
-  handoff but do not show whether XNU's normal logging path starts. Keep the A630 stages
-  unvalidated until XNU logging works on Polaris.
+  expose the USB device protocol this mode requires.
+- A later read-only Recovery copy of `/dev/block/by-name/logdump` captured a successful HakiOS
+  run from the older loader configuration, not the failed full-DT diagnostic image. Its kernel
+  version is `g6528b4a7-dirty`; it reports a `0x467c` device tree, `bootcpu=7 cpus=8 cpufreq=1`,
+  and no `gpu=` boot argument. The live log says the kernel is still running, reaches `/polaris`
+  init, mounts the system and data volumes, and starts SpringBoard. It also says CoreAnimation is
+  using its software renderer, so this run does not validate A630. At the time the log was read,
+  ADB identified the phone as Recovery. This proves the small-DT boot path works; it does not
+  establish that the later imported-DT image booted.
+- Comparing the failed imported-DT runs (`device tree` length about `0xd03a8`, `boot_args` at
+  `0xfc600000`) with that successful small-DT run (`0x467c`, `0xfc410000`) points to the Android
+  DT import as the leading boot-failure suspect. A concrete format mismatch is present in
+  `xnuloader/loader.c`: `fdt_copy_node()` copies FDT property payloads unchanged, but Android FDT
+  cells are big-endian while XNU's `IODeviceTreeSupport` reads cell values such as
+  `#interrupt-cells` and `interrupts` as native `uint32_t` values. Polaris's PDC and GIC both have
+  `#interrupt-cells = <3>`; XNU therefore reads the imported value as `0x03000000` on this
+  little-endian target. `IODeviceTreeAlloc()` maps interrupts across the tree during IOKit setup,
+  so malformed cell counts can break startup before the GPU backend runs. The A630 backend
+  currently decodes the same imported cells as big-endian, confirming that the tree has two
+  incompatible consumers. This is a strong source-level explanation, not a captured panic site:
+  the failed run still has no XNU panic, exception, or checkpoint log. Normalize the Apple-tree
+  cell values and update the A630 readers consistently before another boot attempt; keep `gpu=0`
+  for that isolation run. The A630 stages remain unvalidated on Polaris.
 - The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
   A completion wait of at least one second that expires blocks later GEM submissions before cache
   maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory
