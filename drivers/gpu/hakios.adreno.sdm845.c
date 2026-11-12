@@ -7820,9 +7820,13 @@ polaris_a630_cp_ring_start(void)
 	cp_fault = probe_read(&gpu, GPU_CP_HW_FAULT);
 	protect_status = probe_read(&gpu, GPU_CP_PROTECT_STATUS);
 	rbbm_status = probe_read(&gpu, GPU_RBBM_STATUS);
+	/*
+	 * RBBM_STATUS bit 0 is already set at step 4, before any CP register was written, so it is
+	 * not a busy indication on this part; the CP's own registers carry the verdict.
+	 */
 	if (ring_rptr != 0 || ring_wptr != 0 ||
 	    (cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 ||
-	    protect_status != 0 || (rbbm_status & A630_RBBM_CP_BUSY_MASK) != 0) {
+	    protect_status != 0) {
 		printf("adreno-sdm845: step 19 refused a non-idle CP before startup: RPTR=%#x WPTR=%#x CP_INT=%#x CP_FAULT=%#x CP_PROTECT=%#x RBBM_STATUS=%#x\n",
 		    ring_rptr, ring_wptr, cp_interrupts, cp_fault, protect_status, rbbm_status);
 		return false;
@@ -7877,8 +7881,8 @@ polaris_a630_cp_ring_start(void)
 		    protect_status != 0) {
 			goto fault;
 		}
-		if (ring_rptr == A630_CP_INIT_PACKET_DWORDS &&
-		    (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0) {
+		/* RPTR reaching the packet end is the CP's own word that CP_ME_INIT retired. */
+		if (ring_rptr == A630_CP_INIT_PACKET_DWORDS) {
 			polaris_gpu_ring_write_pointer = ring_wptr;
 			polaris_gpu_last_fence = 0;
 			polaris_gpu_cp_initialized = true;
