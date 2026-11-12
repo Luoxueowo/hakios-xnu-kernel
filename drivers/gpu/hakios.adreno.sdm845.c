@@ -1118,11 +1118,18 @@ map_block(struct probe_block *block)
 	return true;
 }
 
-/* Flattened device-tree cells are big-endian, including on the little-endian SDM845 CPU. */
+/*
+ * XNU hands the kernel an Apple-format tree, whose cells are native 32-bit values -- unlike the
+ * big-endian cells of a raw FDT. The loader writes the GPU nodes itself, so they are read here
+ * exactly as the tree stores them.
+ */
 static uint32_t
-polaris_dt_be32(const uint8_t *data)
+polaris_dt_cell(const uint8_t *data)
 {
-	return (uint32_t)data[0] << 24 | (uint32_t)data[1] << 16 | (uint32_t)data[2] << 8 | data[3];
+	uint32_t value;
+
+	memcpy(&value, data, sizeof(value));
+	return value;
 }
 
 /* The loader exposes Apple's native-cell `reg` plus this raw FDT alias for the A630 validator. */
@@ -1175,7 +1182,7 @@ polaris_dt_has_reg(DTEntry node, uint32_t address, uint32_t length)
 		return false;
 	}
 	for (unsigned int offset = 0; offset < size; offset += 8) {
-		if (polaris_dt_be32(reg + offset) == address && polaris_dt_be32(reg + offset + 4) == length) {
+		if (polaris_dt_cell(reg + offset) == address && polaris_dt_cell(reg + offset + 4) == length) {
 			return true;
 		}
 	}
@@ -1200,7 +1207,7 @@ polaris_dt_get_u32(DTEntry node, const char *name, uint32_t *value)
 	if (result != kSuccess || property == NULL || size != 4) {
 		return false;
 	}
-	*value = polaris_dt_be32(property);
+	*value = polaris_dt_cell(property);
 	return true;
 }
 
@@ -1255,8 +1262,8 @@ polaris_dt_clocks_match(DTEntry node, const char *name, const struct polaris_dt_
 	for (uint32_t i = 0; i < expected_count; i++) {
 		DTEntry provider = NULL;
 		uint32_t phandle;
-		uint32_t actual_phandle = polaris_dt_be32(property + i * 8u);
-		uint32_t actual_id = polaris_dt_be32(property + i * 8u + 4u);
+		uint32_t actual_phandle = polaris_dt_cell(property + i * 8u);
+		uint32_t actual_id = polaris_dt_cell(property + i * 8u + 4u);
 
 		if (SecureDTLookupEntry(NULL, expected[i].provider_path, &provider) != kSuccess || provider == NULL ||
 		    !polaris_dt_get_u32(provider, "phandle", &phandle) || actual_phandle != phandle ||
@@ -1405,10 +1412,10 @@ polaris_dt_bus_vectors_read(DTEntry node, const char *expected_name, uint32_t ex
 		struct polaris_msm_bus_vector *vector = &vectors[i];
 		const uint8_t *cells = property + i * 4u * sizeof(uint32_t);
 
-		vector->source = polaris_dt_be32(cells);
-		vector->destination = polaris_dt_be32(cells + sizeof(uint32_t));
-		vector->average_kbps = polaris_dt_be32(cells + 2u * sizeof(uint32_t));
-		vector->instantaneous_kbps = polaris_dt_be32(cells + 3u * sizeof(uint32_t));
+		vector->source = polaris_dt_cell(cells);
+		vector->destination = polaris_dt_cell(cells + sizeof(uint32_t));
+		vector->average_kbps = polaris_dt_cell(cells + 2u * sizeof(uint32_t));
+		vector->instantaneous_kbps = polaris_dt_cell(cells + 3u * sizeof(uint32_t));
 		if (vector->source == 0 || vector->destination == 0 ||
 		    (i == 0 && (vector->average_kbps != 0 || vector->instantaneous_kbps != 0)) ||
 		    (i != 0 && (vector->source != vectors[0].source || vector->destination != vectors[0].destination ||
@@ -1463,8 +1470,8 @@ polaris_dt_has_reg64(DTEntry node, uint64_t address, uint64_t length)
 		return false;
 	}
 	for (unsigned int offset = 0; offset < size; offset += 16) {
-		uint64_t start = (uint64_t)polaris_dt_be32(reg + offset) << 32 | polaris_dt_be32(reg + offset + 4);
-		uint64_t bytes = (uint64_t)polaris_dt_be32(reg + offset + 8) << 32 | polaris_dt_be32(reg + offset + 12);
+		uint64_t start = (uint64_t)polaris_dt_cell(reg + offset) << 32 | polaris_dt_cell(reg + offset + 4);
+		uint64_t bytes = (uint64_t)polaris_dt_cell(reg + offset + 8) << 32 | polaris_dt_cell(reg + offset + 12);
 
 		if (start == address && bytes == length) {
 			return true;
@@ -1487,8 +1494,8 @@ polaris_dt_reg64_contains(DTEntry node, uint64_t address, uint64_t length)
 	}
 	end = address + length;
 	for (unsigned int offset = 0; offset < size; offset += 16) {
-		uint64_t start = (uint64_t)polaris_dt_be32(reg + offset) << 32 | polaris_dt_be32(reg + offset + 4);
-		uint64_t bytes = (uint64_t)polaris_dt_be32(reg + offset + 8) << 32 | polaris_dt_be32(reg + offset + 12);
+		uint64_t start = (uint64_t)polaris_dt_cell(reg + offset) << 32 | polaris_dt_cell(reg + offset + 4);
+		uint64_t bytes = (uint64_t)polaris_dt_cell(reg + offset + 8) << 32 | polaris_dt_cell(reg + offset + 12);
 
 		if (bytes != 0 && start <= UINT64_MAX - bytes && address >= start && end <= start + bytes) {
 			return true;
@@ -1507,8 +1514,8 @@ polaris_dt_get_reg32(DTEntry node, uint32_t index, uint32_t *address, uint32_t *
 	    (size & 7u) != 0 || index >= size / 8u) {
 		return false;
 	}
-	*address = polaris_dt_be32(reg + index * 8u);
-	*length = polaris_dt_be32(reg + index * 8u + 4u);
+	*address = polaris_dt_cell(reg + index * 8u);
+	*length = polaris_dt_cell(reg + index * 8u + 4u);
 	return *length != 0;
 }
 
@@ -1524,7 +1531,7 @@ polaris_dt_mboxes_match(const char *path, uint32_t provider_phandle)
 	    size != 8u) {
 		return false;
 	}
-	return polaris_dt_be32(mboxes) == provider_phandle && polaris_dt_be32(mboxes + 4) == 0;
+	return polaris_dt_cell(mboxes) == provider_phandle && polaris_dt_cell(mboxes + 4) == 0;
 }
 
 static bool
@@ -1586,8 +1593,8 @@ polaris_runtime_rpmh_validate(void)
 	}
 
 	for (uint32_t i = 0; i < 4; i++) {
-		uint32_t type = polaris_dt_be32(tcs_config + i * 8u);
-		uint32_t count = polaris_dt_be32(tcs_config + i * 8u + 4u);
+		uint32_t type = polaris_dt_cell(tcs_config + i * 8u);
+		uint32_t count = polaris_dt_cell(tcs_config + i * 8u + 4u);
 
 		if (type != expected_types[i] || count != expected_counts[i]) {
 			printf("adreno-sdm845: runtime RPMh TCS group %u is type=%u count=%u; expected type=%u count=%u\n",
@@ -1639,8 +1646,8 @@ polaris_dt_iommu_streams_match(const char *path, uint32_t smmu_phandle, const ui
 		return false;
 	}
 	for (uint32_t i = 0; i < expected_count; i++) {
-		uint32_t phandle = polaris_dt_be32(iommus + i * 8u);
-		uint32_t stream_id = polaris_dt_be32(iommus + i * 8u + 4u);
+		uint32_t phandle = polaris_dt_cell(iommus + i * 8u);
+		uint32_t stream_id = polaris_dt_cell(iommus + i * 8u + 4u);
 		bool seen = false;
 
 		if (phandle != smmu_phandle || stream_id != expected_ids[i]) {
@@ -1687,8 +1694,8 @@ polaris_runtime_iommu_validate(DTEntry smmu_node, uint32_t smmu_phandle)
 	    SecureDTLookupEntry(NULL, "/soc/qcom,kgsl-iommu", &kgsl_iommu_node) != kSuccess || kgsl_iommu_node == NULL ||
 	    !polaris_dt_has_compatible(kgsl_iommu_node, "qcom,kgsl-smmu-v2") ||
 	    SecureDTGetProperty(kgsl_iommu_node, "qcom,protect", (const void **)&protect, &protect_size) != kSuccess ||
-	    protect == NULL || protect_size != 8u || polaris_dt_be32(protect) != 0x40000u ||
-	    polaris_dt_be32(protect + 4u) != 0xc000u ||
+	    protect == NULL || protect_size != 8u || polaris_dt_cell(protect) != 0x40000u ||
+	    polaris_dt_cell(protect + 4u) != 0xc000u ||
 	    !polaris_dt_has_empty_property(kgsl_iommu_node, "qcom,hyp_secure_alloc") ||
 	    SecureDTLookupEntry(NULL, "/soc/qcom,kgsl-iommu/gfx3d_user", &gfx3d_user_node) != kSuccess ||
 	    gfx3d_user_node == NULL || !polaris_dt_get_u32(gfx3d_user_node, "qcom,gpu-offset", &gpu_offset) ||
@@ -1741,7 +1748,7 @@ polaris_runtime_pas_validate(void)
 		printf("adreno-sdm845: runtime DT has no valid A630 PAS 13 firmware/memory-region description\n");
 		return false;
 	}
-	region_phandle = polaris_dt_be32(memory_region);
+	region_phandle = polaris_dt_cell(memory_region);
 	if (SecureDTLookupEntry(NULL, POLARIS_GPU_MEMORY_DT_PATH, &memory_node) != kSuccess || memory_node == NULL ||
 	    !polaris_dt_get_u32(memory_node, "phandle", &memory_phandle) || memory_phandle != region_phandle ||
 	    !polaris_dt_has_empty_property(memory_node, "no-map") ||
@@ -1880,7 +1887,7 @@ polaris_runtime_dt_validate(void)
 		printf("adreno-sdm845: runtime device-tree validation failed; no GPU MMIO was accessed\n");
 		return false;
 	}
-	actual_chip_id = polaris_dt_be32(chip_id);
+	actual_chip_id = polaris_dt_cell(chip_id);
 	if (actual_chip_id != POLARIS_GPU_CHIP_ID) {
 		printf("adreno-sdm845: runtime GPU chip ID is %#x, expected Polaris A630 %#x; probe refused\n",
 		    actual_chip_id, POLARIS_GPU_CHIP_ID);
@@ -4562,7 +4569,7 @@ polaris_dt_u32_array_contains(DTEntry node, const char *name, uint32_t value)
 		return false;
 	}
 	for (unsigned int offset = 0; offset < size; offset += sizeof(uint32_t)) {
-		if (polaris_dt_be32(property + offset) == value) {
+		if (polaris_dt_cell(property + offset) == value) {
 			return true;
 		}
 	}
@@ -4587,7 +4594,7 @@ polaris_dt_u32_array_equals(DTEntry node, const char *name, const uint32_t *valu
 		return false;
 	}
 	for (uint32_t i = 0; i < count; i++) {
-		if (polaris_dt_be32(property + i * sizeof(uint32_t)) != values[i]) {
+		if (polaris_dt_cell(property + i * sizeof(uint32_t)) != values[i]) {
 			return false;
 		}
 	}
@@ -5130,7 +5137,7 @@ probe_zap_mdt(const uint8_t *header, uint64_t size)
 			min_address = address;
 		}
 		uint64_t segment_end = (uint64_t)address + memory_size;
-		uint64_t aligned_end = (segment_end + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+		uint64_t aligned_end = (segment_end + 0xFFFull) & ~0xFFFull;
 		if (aligned_end < segment_end) {
 			printf("adreno-sdm845: ZAP loadable segment %u page-alignment overflows\n", i);
 			return false;
@@ -5166,6 +5173,9 @@ probe_zap_mdt(const uint8_t *header, uint64_t size)
 	    (size != header_size && size != (uint64_t)header_size + hash_size) ||
 	    min_address == UINT32_MAX || max_address <= min_address || !relocatable ||
 	    max_address - min_address > polaris_zap_memory_size || max_address - min_address > UINT32_MAX) {
+		printf("adreno-sdm845: ZAP MDT check: hash=%u loadable=%u hash_size=%#llx header=%#x size=%#llx min=%#x max=%#llx region=%#llx relocatable=%d\n",
+		    hash_index, loadable, hash_size, header_size, size, min_address, max_address,
+		    polaris_zap_memory_size, relocatable ? 1 : 0);
 		printf("adreno-sdm845: ZAP MDT header/hash/load map does not fit the validated PAS memory-region\n");
 		return false;
 	}
@@ -7218,8 +7228,8 @@ polaris_a630_gpu_core_initialize(void)
 	if ((min_access_length != 0u && min_access_length != 32u && min_access_length != 64u) || ubwc_mode > 2u ||
 	    SecureDTLookupEntry(NULL, "/soc/qcom,kgsl-iommu", &iommu_node) != kSuccess || iommu_node == NULL ||
 	    SecureDTGetProperty(iommu_node, "qcom,protect", (const void **)&protect, &protect_size) != kSuccess ||
-	    protect == NULL || protect_size != 8u || polaris_dt_be32(protect) != 0x40000u ||
-	    polaris_dt_be32(protect + 4u) != 0xc000u) {
+	    protect == NULL || protect_size != 8u || polaris_dt_cell(protect) != 0x40000u ||
+	    polaris_dt_cell(protect + 4u) != 0xc000u) {
 		printf("adreno-sdm845: step 18 refused unsupported A630 memory attributes or a changed KGSL protect aperture\n");
 		return false;
 	}
@@ -7228,8 +7238,8 @@ polaris_a630_gpu_core_initialize(void)
 	rb_mode = (mal_field << 3) | (bank_field << 1) | (ubwc_mode == 1u ? 1u : 0u);
 	tpl1_mode = (mal_field << 3) | (bank_field << 1) | (ubwc_mode == 1u ? 1u : 0u);
 	uche_mode = (mal_field << 23) | (bank_field << 21);
-	protect_base = polaris_dt_be32(protect) / sizeof(uint32_t);
-	protect_words = polaris_dt_be32(protect + 4u) / sizeof(uint32_t);
+	protect_base = polaris_dt_cell(protect) / sizeof(uint32_t);
+	protect_words = polaris_dt_cell(protect + 4u) / sizeof(uint32_t);
 	protect_range = 1u;
 	while (protect_range <= protect_words / 2u) {
 		protect_range <<= 1;

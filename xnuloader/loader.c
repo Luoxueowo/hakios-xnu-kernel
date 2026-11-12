@@ -766,6 +766,8 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_prop(w, "reg", (const uint32_t[]){ 0x5090000, 0x9000 }, 8);
 	dt_prop_u32(w, "#clock-cells", 1);
 	dt_prop_u32(w, "#reset-cells", 1);
+	dt_prop_u32(w, "vdd_cx-supply", 0x1b);
+	dt_prop_u32(w, "vdd_mx-supply", 0xbc);
 	dt_prop_u32(w, "phandle", 0xd6);
 	dt_prop_u32(w, "AAPL,phandle", 0xd6);
 	dt_end(w);
@@ -775,6 +777,7 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_prop(w, "reg", (const uint32_t[]){ 0x5090000, 0x9000 }, 8);
 	dt_prop_u32(w, "#clock-cells", 1);
 	dt_prop_u32(w, "#reset-cells", 1);
+	dt_prop_u32(w, "vdd_gfx-supply", 0x1d);
 	dt_prop_u32(w, "phandle", 0x1c);
 	dt_prop_u32(w, "AAPL,phandle", 0x1c);
 	dt_end(w);
@@ -812,6 +815,7 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_prop_u32(w, "hw-ctrl-addr", 0x1a);
 	dt_prop_u32(w, "qcom,gds-timeout", 0x1f4);
 	dt_prop_u32(w, "qcom,clk-dis-wait-val", 8);
+	dt_prop_u32(w, "parent-supply", 0x1b);
 	dt_prop_u32(w, "phandle", 0x1fc);
 	dt_prop_u32(w, "AAPL,phandle", 0x1fc);
 	dt_end(w);
@@ -822,10 +826,24 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_prop(w, "reg", (const uint32_t[]){ 0x509100c, 4 }, 8);
 	dt_prop_u32(w, "domain-addr", 0x1e);
 	dt_prop_u32(w, "sw-reset", 0x1f);
+	dt_prop_u32(w, "parent-supply", 0x1d);
 	dt_prop(w, "clocks", (const uint32_t[]){ 0x1c, 2 }, 8);
 	dt_prop_str(w, "clock-names", "core_root_clk");
 	dt_prop_u32(w, "phandle", 0x334);
 	dt_prop_u32(w, "AAPL,phandle", 0x334);
+	dt_end(w);
+
+	/* the two ARC regulators the GMU votes on through Apps RSC */
+	dt_begin(w, "rpmh-regulator-cxlvl");
+	dt_prop_str(w, "compatible", "qcom,rpmh-arc-regulator");
+	dt_prop_str(w, "qcom,resource-name", "cx.lvl");
+	dt_prop(w, "mboxes", (const uint32_t[]){ 0xba, 0 }, 8);
+	dt_end(w);
+
+	dt_begin(w, "rpmh-regulator-gfxlvl");
+	dt_prop_str(w, "compatible", "qcom,rpmh-arc-regulator");
+	dt_prop_str(w, "qcom,resource-name", "gfx.lvl");
+	dt_prop(w, "mboxes", (const uint32_t[]){ 0xba, 0 }, 8);
 	dt_end(w);
 
 	/* the KGSL SMMU, and the zap shader's PAS node */
@@ -842,8 +860,33 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_prop(w, "clocks", (const uint32_t[]){ 0x22, 0x29 }, 8);
 	dt_prop_str(w, "clock-names", "gcc_gpu_memnoc_gfx_clk");
 	dt_prop_str(w, "qcom,regulator-names", "vdd");
+	dt_prop_u32(w, "vdd-supply", 0x1fc);
+	dt_prop(w, "qcom,dynamic", NULL, 0);
+	dt_prop(w, "qcom,use-3-lvl-tables", NULL, 0);
+	dt_prop(w, "qcom,disable-atos", NULL, 0);
 	dt_prop_u32(w, "phandle", 0x204);
 	dt_prop_u32(w, "AAPL,phandle", 0x204);
+	dt_end(w);
+
+	dt_begin(w, "qcom,kgsl-iommu");
+	dt_prop_str(w, "compatible", "qcom,kgsl-smmu-v2");
+	dt_prop(w, "reg", (const uint32_t[]){ 0x5040000, 0x10000 }, 8);
+	dt_prop(w, "qcom,protect", (const uint32_t[]){ 0x40000, 0xc000 }, 8);
+	dt_prop(w, "qcom,hyp_secure_alloc", NULL, 0);
+	dt_prop(w, "qcom,retention", NULL, 0);
+	dt_prop_u32(w, "qcom,micro-mmu-control", 0x6000);
+	dt_prop_u32(w, "qcom,secure_align_mask", 0xfff);
+	dt_prop(w, "clocks", (const uint32_t[]){ 0x22, 0x26, 0x22, 0x1a, 0x22, 0x29 }, 24);
+	dt_begin(w, "gfx3d_user");
+	dt_prop_str(w, "compatible", "qcom,smmu-kgsl-cb");
+	dt_prop_u32(w, "qcom,gpu-offset", 0x48000);
+	dt_prop_str(w, "label", "gfx3d_user");
+	dt_prop(w, "iommus", (const uint32_t[]){ 0x204, 0 }, 8);
+	dt_end(w);
+	dt_begin(w, "gfx3d_secure");
+	dt_prop_str(w, "compatible", "qcom,smmu-kgsl-cb");
+	dt_prop(w, "iommus", (const uint32_t[]){ 0x204, 2, 0x204, 1 }, 16);
+	dt_end(w);
 	dt_end(w);
 
 	dt_begin(w, "qcom,kgsl-hyp");
@@ -859,8 +902,14 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_prop(w, "reg", (const uint32_t[]){ 0x506a000, 0x30000, 0xb200000, 0x300000 }, 16);
 	dt_prop_str(w, "reg-names", "kgsl_gmu_reg");
 	dt_prop(w, "clocks", (const uint32_t[]){ 0xd6, 4, 0xd6, 0xa, 0x22, 0x1a, 0x22, 0x29 }, 32);
-	dt_prop_str(w, "clock-names", "gmu_clk");
-	dt_prop_str(w, "regulator-names", "vddcx");
+	{
+		static const char names[] = "gmu_clk\0" "cxo_clk\0" "axi_clk\0" "memnoc_clk";
+		dt_prop(w, "clock-names", names, sizeof(names));
+	}
+	{
+		static const char regulators[] = "vddcx\0" "vdd";
+		dt_prop(w, "regulator-names", regulators, sizeof(regulators));
+	}
 	dt_prop_u32(w, "vddcx-supply", 0x1fc);
 	dt_prop_u32(w, "vdd-supply", 0x334);
 	dt_prop_str(w, "label", "kgsl-gmu");
@@ -917,7 +966,15 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_prop_str(w, "cache-slice-names", "gpu");
 	dt_prop(w, "clocks",
 	    (const uint32_t[]){ 0x1c, 3, 0xd6, 0xa, 0x22, 0x1a, 0x22, 0x29, 0xd6, 4, 0xb6, 0x10 }, 48);
-	dt_prop_str(w, "clock-names", "core_clk");
+	{
+		static const char names[] = "core_clk\0" "rbbmtimer_clk\0" "mem_clk\0" "mem_iface_clk\0" "gmu_clk\0"
+		    "l3_vote";
+		dt_prop(w, "clock-names", names, sizeof(names));
+	}
+	{
+		static const char regulators[] = "vddcx\0" "vdd";
+		dt_prop(w, "regulator-names", regulators, sizeof(regulators));
+	}
 	dt_prop_u32(w, "vddcx-supply", 0x1fc);
 	dt_prop_u32(w, "vdd-supply", 0x334);
 	dt_prop_str(w, "qcom,msm-bus,name", "grp3d");
@@ -1010,6 +1067,10 @@ dt_polaris_gpu_nodes(struct dt_writer *w)
 	dt_prop(w, "no-map", NULL, 0);
 	dt_prop_u32(w, "phandle", 0x332);
 	dt_prop_u32(w, "AAPL,phandle", 0x332);
+	dt_end(w);
+	dt_begin(w, "removed_region@85fc0000");
+	dt_prop(w, "reg", (const uint32_t[]){ 0, 0x85fc0000, 0, 0x4940000 }, 16);
+	dt_prop(w, "no-map", NULL, 0);
 	dt_end(w);
 	dt_end(w);
 }

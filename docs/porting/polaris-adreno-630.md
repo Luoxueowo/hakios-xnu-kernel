@@ -46,6 +46,13 @@ allow it. A successful firmware boot alone is not a completed driver.
   its operating points, the 3D core with its eight operating points, and the GPU reserved-memory
   pool). None of them carries an interrupt. The values are the ones `android-polaris.dtb` declares;
   the driver's DT paths are unchanged.
+- On 2026-11-12 the runtime DT chain completed on the phone. The loader's nodes now satisfy the
+  clock/supply, RPMh/cmd-db, operating-point, bus-table and SMMUv2 validators, and steps 1-5 ran
+  (`gpu=1`). Step 6 found every PAS call available, but `PAS_IS_SUPPORTED` for image 13 (GPU ZAP)
+  answered 0, so no `PAS_INIT_IMAGE` was issued and the later steps could not run. Two fixes got
+  the chain that far: the validator reads device-tree cells natively (the loader writes
+  Apple-format cells), and the ZAP load-map bound uses `0xFFF` instead of `PAGE_MASK`, which
+  aligned a 0x57b0 segment end to 4 GiB on this configuration.
 - On 2026-11-12, `make DEVICE=polaris JOBS=8 kernel` selected 10 Polaris drivers and compiled
   `hakios.adreno.sdm845.o` (including the guarded A630 hang snapshot), `hakios.adreno.o`,
   `MiniIOSurface.cpo`, and the shared IOKit GPU service, including the new resource caps. The build
