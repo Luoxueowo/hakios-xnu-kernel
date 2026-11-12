@@ -314,6 +314,14 @@ extern bool HakiosGPUStart(void);
 #define GMU_HFI_QTBL_ADDR                GMU_WORD(0x5185)
 #define GMU_HFI_CTRL_INIT                GMU_WORD(0x5186)
 #define GMU_HFI_CTRL_STATUS              GMU_WORD(0x5180)
+/* mi8's bring-up: mask both GMU interrupt masks, and raise SPTPRAC after the boot OOB. */
+#define GMU_AO_HOST_INTR_MASK            GMU_WORD(0x9306)
+#define GMU_GMU2HOST_INTR_MASK           GMU_WORD(0x5193)
+#define GMU_SPTPRAC_CTRL                 GMU_WORD(0x81)
+#define GMU_SPTPRAC_STATUS               GMU_WORD(0x50d0)
+#define A630_GMU_SPTPRAC_ON_VALUE        0x778000u
+#define A630_GMU_SPTPRAC_ON_MASK         0x38u
+#define A630_GMU_SPTPRAC_ON_WANT         0x28u
 #define GMU_GMU2HOST_INTR_CLR            GMU_WORD(0x5191)
 #define GMU_GMU2HOST_INTR_INFO           GMU_WORD(0x5192)
 #define GMU_HOST2GMU_INTR_SET            GMU_WORD(0x5194)
@@ -3322,12 +3330,21 @@ polaris_gpu_cx_power_on(void)
 static bool
 polaris_gpu_gx_power_on(void)
 {
+	uint32_t gdscr;
+
 	printf("adreno-sdm845: power: the GX switch and the 3D clock, after the GPU OOB request\n");
-	if (!polaris_gpu_gdsc_on(GPUCC_GX_GDSCR, "gpu_gx_gdsc") ||
-	    !polaris_gpu_clock_on(GPUCC_GX_GFX3D_CBCR, "gpu_cc_gx_gfx3d_clk")) {
+	if (!map_block(&gpucc)) {
+		printf("adreno-sdm845: power: GPUCC is not mapped\n");
 		return false;
 	}
-	return true;
+	gdscr = probe_read(&gpucc, GPUCC_GX_GDSCR);
+	if ((gdscr & GDSC_POWER_ON) != 0) {
+		/* The boot OOB and SPTPRAC already brought the rail up; the switch is not touched. */
+		printf("adreno-sdm845: power: gpu_gx_gdsc is on already (GDSCR=%#x)\n", gdscr);
+	} else if (!polaris_gpu_gdsc_on(GPUCC_GX_GDSCR, "gpu_gx_gdsc")) {
+		return false;
+	}
+	return polaris_gpu_clock_on(GPUCC_GX_GFX3D_CBCR, "gpu_cc_gx_gfx3d_clk");
 }
 
 static bool
@@ -4599,6 +4616,29 @@ polaris_gmu_boot_rail_request(void)
 		return false;
 	}
 	polaris_gmu_boot_rail_active = true;
+	/*
+	 * The rail is up; mi8 then raises SPTPRAC, which is what actually powers the GX domain
+	 * inside the GMU. Waiting until hw_init (as this chain did) leaves the 3D registers dead.
+	 */
+	{
+		uint32_t sptprac = 0;
+		bool on = false;
+
+		probe_write(&gmu, GMU_SPTPRAC_CTRL, A630_GMU_SPTPRAC_ON_VALUE);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		for (uint32_t poll = 0; poll < 100u; poll++) {
+			sptprac = probe_read(&gmu, GMU_SPTPRAC_STATUS);
+			if ((sptprac & A630_GMU_SPTPRAC_ON_MASK) == A630_GMU_SPTPRAC_ON_WANT) {
+				on = true;
+				break;
+			}
+			delay(10);
+		}
+		printf("adreno-sdm845: step 12 SPTPRAC %s (status=%#x)\n", on ? "came up" : "did not come up", sptprac);
+		if (!on) {
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -5990,6 +6030,9 @@ polaris_gmu_hfi_start(uint32_t step)
 	 * writes 0x4052 here and the GMU never initialised HFI without it.
 	 */
 	probe_write(&gmu, GMU_CM3_CFG, 0x4052u);
+	/* mi8 masks both GMU interrupt masks before the reset goes away. */
+	probe_write(&gmu, GMU_AO_HOST_INTR_MASK, UINT32_MAX);
+	probe_write(&gmu, GMU_GMU2HOST_INTR_MASK, UINT32_MAX);
 	probe_write(&gmu, GMU_GMU2HOST_INTR_CLR, UINT32_MAX);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	if (probe_read(&gmu, GMU_CM3_FW_INIT_RESULT) != 0u ||
@@ -6069,13 +6112,15 @@ polaris_gmu_hfi_start(uint32_t step)
 		printf("adreno-sdm845: step 12 GMU HFI queue initialization timed out; CM3 was reset\n");
 		return false;
 	}
+	/*
+	 * The version register stays zero on this firmware; mi8 asks the firmware over HFI
+	 * (HFI_H2F_MSG_FW_VERSION) and that answer is the one that describes the protocol. Keep
+	 * the register in the log, but let the messages decide whether HFI is usable.
+	 */
 	hfi_version = probe_read(&gmu, GMU_HFI_VERSION_INFO);
-	if (((hfi_version >> 28) & 0xfu) != 1u || !polaris_gmu_hfi_send_init() ||
-	    !polaris_gmu_hfi_verify_firmware_version(&firmware_version)) {
-		if (((hfi_version >> 28) & 0xfu) != 1u) {
-			printf("adreno-sdm845: step 12 expected legacy HFI v1 for A630, register reports %#x; CM3 was reset\n",
-			    hfi_version);
-		}
+	printf("adreno-sdm845: step 12 HFI queues are up (status=%#x version-register=%#x); asking the firmware for its version\n",
+	    probe_read(&gmu, GMU_HFI_CTRL_STATUS), hfi_version);
+	if (!polaris_gmu_hfi_send_init() || !polaris_gmu_hfi_verify_firmware_version(&firmware_version)) {
 		polaris_gmu_hfi_stop_after_failure(step);
 		return false;
 	}
