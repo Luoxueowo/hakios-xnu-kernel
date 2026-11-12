@@ -57,14 +57,15 @@ allow it. A successful firmware boot alone is not a completed driver.
   stage output. A matching `gpu=0`/`bootcpu=7` boot also returned to Recovery before the timer,
   so the available logs do not implicate A630 initialization. `gpu=0 bootcpu=0 cpus=8` remained
   off USB longer, then returned to Recovery without an XNU log. `gpu=0 bootcpu=0 cpus=1` remained
-  unenumerated by USB for more than 180 seconds; no final log could be retrieved. Recovery exposed
-  neither pstore data nor `/proc/last_kmsg`, and its boot-reason properties were `unknown`.
+  unenumerated by USB for more than 180 seconds, then reappeared in Recovery. Its final logdump
+  still ends at the kernel jump, with no XNU text, panic/exception, or timer-return message.
+  Recovery exposed neither pstore data nor `/proc/last_kmsg`, and its boot-reason properties were
+  `unknown`.
 - The project's `xl enter` route could not establish its USB loader session: its loader log says
   `usb: device protocol not found`, and no kernel payload was uploaded. The firmware did not
   expose the USB device protocol this mode requires. The direct-boot attempts confirm kernel
   handoff but do not show whether XNU's normal logging path starts. Keep the A630 stages
-  unvalidated until XNU logging works on Polaris. The last single-core attempt left the phone absent from ADB and
-  fastboot; it may need a manual button restart.
+  unvalidated until XNU logging works on Polaris.
 - The shared service now separates its one-shot diagnostic latch from the unresponsive-GPU latch.
   A completion wait of at least one second that expires blocks later GEM submissions before cache
   maintenance or CP work, but leaves backend readiness unchanged so possibly in-flight DMA memory
