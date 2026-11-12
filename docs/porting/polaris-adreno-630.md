@@ -23,8 +23,10 @@ allow it. A successful firmware boot alone is not a completed driver.
   apply here. The Polaris backend stays separate and follows the MIX 2S tree plus A630-specific
   Qualcomm sources.
 - `CONFIG_HAKIOS_ADRENO=y` now includes the Polaris backend in the MIX 2S kernel build. The driver
-  does not start the GPU by default; the explicit `gpu=1` boot argument runs guarded stages 21–23,
-  then starts HakiosGPU only if the client-root IB and kernel-root fence probe passes. If IOKit
+  does not start the GPU by default; the explicit `gpu=1` boot argument runs the guarded bring-up
+  and then creates HakiosGPU. Since 2026-11-12 the three measurement probes (fence smoke test,
+  CPU-root IB, client IB) no longer gate the service: `gpudebug=1` runs and reports them, the
+  default `gpudebug=0` skips them and starts the GPU. If IOKit
   service creation fails, it closes the client gate and requests the existing bounded orderly stop.
   A failed `gpu=1` bring-up also calls that stop path; it can quiesce a verified healthy boundary
   and deliberately retains resources if startup is faulted or safety cannot be confirmed. This
@@ -529,6 +531,54 @@ allow it. A successful firmware boot alone is not a completed driver.
   mappings. Failures after GMU firmware release, ARC/DCVS or boot-rail votes, PAS activity, core
   configuration, or CP startup still use conservative retention unless they reach the verified
   healthy stop boundary. Neither shutdown path has been run on-device.
+
+## 2026-11-12, evening: the A630 chain runs on the phone
+
+`gpu=1` completed the whole bring-up on the MIX 2S and created the HakiosGPU IOKit service. The
+boot now prints, in order, `step 18 programmed A630 HWCG, VBIF, 1-MiB GMEM/UCHE, bank-bit 15, and
+28 CP-protect descriptors`, `step 19 CP_ME_INIT retired: RPTR=12`, `step 20
+CP_SET_SECURE_MODE(0) retired: RPTR=14` and `A630 client submission gate opened ...; starting
+HakiosGPU`, with no service-creation failure. What it took, in the order the chain hit it:
+
+- The loader now writes `/soc/ad-hoc-bus`: the two routes the HFI bandwidth table walks (GPU→DDR
+  `mas-qxm-gpu`→`slv-qns-llcc`→`mas-llcc-mc`→`slv-ebi`, GPU→CNOC →`slv-qns-memnoc-snoc`→
+  `mas-qnm-memnoc`→`slv-qns-cnoc`), six BCMs and `rsc-apps`, with android-polaris.dtb's phandles so
+  the `vectors-KBps` endpoints resolve. ACV is validated on its address and clock domain only: it
+  votes a fixed percentage, so the command database leaves its width at zero.
+- The Apps RSC answers DRV v1.1, not the v2.7 the code demanded, but `DRV_CONFIG` resolves to the
+  eight TCS the DT declares (2+3+3), so the version is reported instead of enforced. TCS0 holds the
+  boot's last request; it is reclaimed when `STATUS` marks every enabled command complete, and a
+  command's trailing word is compared on its message id because the completion flag reads 1.
+- `gfx.lvl` reads 0, 16, 48, 64, 128, 192, 256, 320 and `mx.lvl` reads 0, 16, 16, 256, 384: the
+  first level may be zero and neighbours may share a level, so the tables are only required to be
+  monotonic. The initial 257 MHz powerlevel resolves to GX 3 / MX 3.
+- `GMU_HFI_CTRL_STATUS` is word `0x5180`, not `0x5187`; the version register stays zero on this
+  firmware, so the HFI `FW_VERSION` answer is what counts. The boot OOB request is asked for only
+  after HFI is up, and CM3 is rebooted from a fresh reset on every attempt: a warm reboot leaves
+  the firmware running with HFI state of its own, and that made one boot in four report
+  `HFI_CTRL_STATUS 0` while the firmware still answered `0xbabeface` and its counter moved.
+- The GPU's own RPMh sequencer was never programmed, which is why the boot OOB request had no way
+  to raise `vdd_gfx`. `a6xx_gmu_rpmh_init`'s 48 writes now go to the RSC block at `GMU+0x23000`,
+  the PDC at `0xb280000` and its program memory at `0xb480000`, `SEQ_BUSY_DRV0` is polled idle, and
+  `GMU_RPMH_CTRL` is ORed with `0xf11`.
+- SPTPRAC is raised right after the OOB acknowledgement (`GMU_GX_SPTPRAC_POWER_CONTROL`, word
+  `0x81`, value `0x778000`, status `0x28`), not in `hw_init`. GX then reports
+  `GDSCR 0xf8222000` and the GFX3D branch `CBCR 0x4221`; the switch is only forced when the GDSCR
+  does not already report power, because the firmware owns that rail.
+- The 3D core is read before the ZAP handoff, since ZAP refuses while the core-ready flag is
+  unset: `RBBM_STATUS=0x1 CP_HW_FAULT=0`, then TrustZone answers `PAS_INIT_IMAGE`,
+  `PAS_MEM_SETUP` and `PAS_AUTH_AND_RESET` with status 0 for image 13.
+- Step 18 compares `UCHE_GMEM_RANGE_MAX_LO` page-aligned: the register keeps only the page number,
+  so `0x1fffff` reads back `0x1ff000`.
+- `RBBM_STATUS` bit 0 is already set at step 4, before any CP register is written, so the busy mask
+  is `0x6` and `RPTR` reaching the packet end is the CP's witness that a packet retired.
+
+The userspace stack is not there yet. The phone boots to the window server at 1125×2436 @3x, then
+`backboardd` reports `CoreAnimation: Failed to initialize Metal or OpenGLES contexts!` and
+`Software renderer! Simulating crash!`. The plug-in binary is present (built into
+`userland/big/lib/HakiosMetal.bundle`, 8.4 MB, installed under `/usr/local/polaris`, linked from
+`/polaris/lib/HakiosMetal.bundle`), so this is a runtime failure whose `why` text leaves through
+stderr and does not reach the log partition.
 
 ## Polaris hardware facts
 
