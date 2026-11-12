@@ -4345,6 +4345,17 @@ polaris_cmd_db_resource_lookup(const char *name, struct polaris_cmd_db_resource 
 	}
 	memset(resource, 0, sizeof(*resource));
 	resource->address = entry.address;
+	{
+		uint8_t dump[16] = { 0 };
+		uint32_t dump_size = entry.auxiliary_length < sizeof(dump) ? entry.auxiliary_length : sizeof(dump);
+
+		for (uint32_t i = 0; i < dump_size; i++) {
+			dump[i] = entry.auxiliary[i];
+		}
+		printf("adreno-sdm845: CMD_DB ARC %s: address=%#x aux_len=%u bytes=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		    name, entry.address, entry.auxiliary_length, dump[0], dump[1], dump[2], dump[3], dump[4], dump[5],
+		    dump[6], dump[7], dump[8], dump[9], dump[10], dump[11], dump[12], dump[13], dump[14], dump[15]);
+	}
 	level_count = entry.auxiliary_length / sizeof(uint16_t);
 	for (uint32_t level_index = 0; level_index < level_count; level_index++) {
 		uint16_t level = read_le16(entry.auxiliary + level_index * sizeof(uint16_t));
@@ -4352,14 +4363,21 @@ polaris_cmd_db_resource_lookup(const char *name, struct polaris_cmd_db_resource 
 		if (level_index != 0 && level == 0) {
 			break;
 		}
-		if (level == 0 || (level_index != 0 && level <= resource->levels[level_index - 1u])) {
-			printf("adreno-sdm845: CMD_DB resource %s levels are zero or not strictly ascending\n", name);
+		/*
+		 * A level of zero is the lowest corner of the table, not a missing entry: gfx.lvl
+		 * reads 0, 16, 48, 64, 128, 192, 256, 320 ... Zero only terminates the list, which
+		 * the check above already does for every position but the first. Neighbouring
+		 * corners may name the same level -- mx.lvl reads 0, 16, 16, 256, 384 -- because a
+		 * corner is looked up as the first level at least as high as the one before it.
+		 */
+		if (level_index != 0 && level < resource->levels[level_index - 1u]) {
+			printf("adreno-sdm845: CMD_DB resource %s levels are not monotonic\n", name);
 			return false;
 		}
 		resource->levels[level_index] = level;
 		resource->level_count++;
 	}
-	return resource->address != 0 && resource->level_count != 0 && resource->levels[0] != 0;
+	return resource->address != 0 && resource->level_count != 0;
 }
 
 static bool
@@ -6002,10 +6020,6 @@ polaris_gmu_hfi_start(uint32_t step)
 		return false;
 	}
 	polaris_gmu_firmware_started = true;
-	if (!polaris_gmu_boot_rail_request()) {
-		polaris_gmu_hfi_stop_after_failure(step);
-		return false;
-	}
 	probe_write(&gmu, GMU_HFI_CTRL_INIT, 1u);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	for (uint32_t poll = 0; poll < A630_GMU_HFI_QUEUE_START_POLLS; poll++) {
@@ -6015,6 +6029,19 @@ polaris_gmu_hfi_start(uint32_t step)
 		delay(A630_GMU_HFI_POLL_DELAY_US);
 	}
 	if ((probe_read(&gmu, GMU_HFI_CTRL_STATUS) & 1u) == 0) {
+		/*
+		 * The firmware answered 0xbabeface but did not bring the queues up. Dump what the GMU
+		 * says about itself before the stop path resets it: an unchanged FW_INIT_RESULT means
+		 * the firmware stopped, a raised interrupt status means it is trying to report a fault.
+		 */
+		printf("adreno-sdm845: step 12 GMU HFI queue init timed out: init=%#x ctrl_status=%#x hfi_version=%#x "
+		    "qtbl=%#x/%#x sfr=%#x intr_info=%#x counter=%#x",
+		    probe_read(&gmu, GMU_CM3_FW_INIT_RESULT), probe_read(&gmu, GMU_HFI_CTRL_STATUS),
+		    probe_read(&gmu, GMU_HFI_VERSION_INFO), probe_read(&gmu, GMU_HFI_QTBL_ADDR),
+		    probe_read(&gmu, GMU_HFI_QTBL_INFO), probe_read(&gmu, GMU_HFI_SFR_ADDR),
+		    probe_read(&gmu, GMU_GMU2HOST_INTR_INFO), probe_read(&gmu, GMU_ALWAYS_ON_COUNTER_L));
+		delay(1000);
+		printf("/%#x (counter moves: firmware is still running)\n", probe_read(&gmu, GMU_ALWAYS_ON_COUNTER_L));
 		polaris_gmu_hfi_stop_after_failure(step);
 		printf("adreno-sdm845: step 12 GMU HFI queue initialization timed out; CM3 was reset\n");
 		return false;
@@ -6030,6 +6057,14 @@ polaris_gmu_hfi_start(uint32_t step)
 		return false;
 	}
 	polaris_gmu_hfi_ready = true;
+	/*
+	 * The OOB boot request is answered by the firmware through the HFI interrupt registers,
+	 * so it is asked for once the queues are up, not between the reset release and HFI_CTRL_INIT.
+	 */
+	if (!polaris_gmu_boot_rail_request()) {
+		polaris_gmu_hfi_stop_after_failure(step);
+		return false;
+	}
 	printf("adreno-sdm845: step 12 GMU firmware and legacy HFI are ready (HFI=%#x GMU=%#x); GMU SID5/SID4 contexts and initial GX/MX rail vote are active%s, while ZAP, CP, and rendering remain disabled\n",
 	    hfi_version, firmware_version,
 	    polaris_smmu_spaces[POLARIS_SMMU_SPACE_GPU].context_active ? " with the 3D SID0/CB0 context" : "");
