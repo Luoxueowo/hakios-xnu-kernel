@@ -7752,7 +7752,7 @@ polaris_a630_gpu_core_initialize(void)
 	    probe_read(&gpu, GPU_VBIF_GATE_OFF_WRREQ_EN) != 0x9u ||
 	    probe_read(&gpu, GPU_RBBM_VBIF_CLIENT_QOS_CNTL) != 0x3u ||
 	    probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MIN_LO) != A630_GMEM_BASE ||
-	    probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MAX_LO) != A630_GMEM_BASE + A630_GMEM_SIZE - 1u ||
+	    probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MAX_LO) != ((A630_GMEM_BASE + A630_GMEM_SIZE - 1u) & ~0xfffu) ||
 	    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_1) != 0x8040362cu ||
 	    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_2) != 0x010000c0u ||
 	    probe_read(&gpu, GPU_CP_PROTECT_CNTL) != 0x3u ||
@@ -7762,7 +7762,7 @@ polaris_a630_gpu_core_initialize(void)
 		    probe_read(&gpu, GPU_RBBM_CLOCK_CNTL), A630_RBBM_CLOCK_CNTL_ON,
 		    probe_read(&gpu, GPU_VBIF_GATE_OFF_WRREQ_EN), probe_read(&gpu, GPU_RBBM_VBIF_CLIENT_QOS_CNTL),
 		    probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MIN_LO), probe_read(&gpu, GPU_UCHE_GMEM_RANGE_MAX_LO),
-		    A630_GMEM_BASE, A630_GMEM_BASE + A630_GMEM_SIZE - 1u,
+		    A630_GMEM_BASE, (A630_GMEM_BASE + A630_GMEM_SIZE - 1u) & ~0xfffu,
 		    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_1), 0x8040362cu,
 		    probe_read(&gpu, GPU_CP_ROQ_THRESHOLDS_2), 0x010000c0u,
 		    probe_read(&gpu, GPU_CP_PROTECT_CNTL),
