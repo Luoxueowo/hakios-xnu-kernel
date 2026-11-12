@@ -31,9 +31,10 @@ for path in sorted(glob.glob(os.path.join(root, 'Applications', '*.app', 'Info.p
     info[KEY] = True
     binary = data.startswith(b'bplist')
     mode = os.stat(path).st_mode & 0o7777
-    os.unlink(path)                                     # the link goes; the original stays as it was
-    with open(path, 'wb') as f:
+    temporary = path + '.highrate'
+    with open(temporary, 'wb') as f:
         plistlib.dump(info, f, fmt=plistlib.FMT_BINARY if binary else plistlib.FMT_XML)
-    os.chmod(path, mode)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)                         # a new file takes the link's place; the original stays as it was
     changed += 1
 print(f'mkhighrate.py: {KEY} set in {changed} applications ({already} had it already)')
