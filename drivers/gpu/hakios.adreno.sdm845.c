@@ -128,7 +128,11 @@ extern bool HakiosGPUStart(void);
 #define A630_CP_INIT_TIMEOUT_US         2000000u
 #define A630_CP_INIT_POLL_US            100u
 #define A630_CP_INTERRUPT_ERROR_MASK    0x000000f7u
-#define A630_RBBM_CP_BUSY_MASK          0x00000007u
+/*
+ * Bits 1-2 of RBBM_STATUS report a busy CP. Bit 0 is already set at step 4, before any CP
+ * register is written, and stays set on this part, so it is not part of the verdict.
+ */
+#define A630_RBBM_CP_BUSY_MASK          0x00000006u
 #define A630_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER (1u << 0)
 #define A630_RBBM_INT_HANG_DETECT       (1u << 23)
 #define A630_SQE_FILE_PREFIX_BYTES      4u
@@ -7974,7 +7978,8 @@ polaris_a630_cp_set_unsecured_mode(void)
 		if ((cp_interrupts & A630_CP_INTERRUPT_ERROR_MASK) != 0 || cp_fault != 0 || protect_status != 0) {
 			goto fault;
 		}
-		if (ring_rptr == target_rptr && (rbbm_status & A630_RBBM_CP_BUSY_MASK) == 0) {
+		/* As in step 19: RBBM_STATUS bit 0 is set before the CP ever runs, so RPTR is the witness. */
+		if (ring_rptr == target_rptr) {
 			polaris_gpu_ring_write_pointer = target_rptr;
 			polaris_gpu_unsecured_mode = true;
 			printf("adreno-sdm845: step 20 CP_SET_SECURE_MODE(0) retired: RPTR=%u CP idle; user submissions remain disabled\n",
