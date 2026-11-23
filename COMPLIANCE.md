@@ -42,6 +42,10 @@ never committed; they are obtained from their own upstreams under their own lice
 
 These are flagged for review and are **not** asserted to be settled:
 
+- **Polaris Adreno 630 port.** The Dipper GPU driver includes a GPL-2.0-only initialization table, and Dipper marks the
+  combined driver license unresolved. The HakiOS port preserves those notices and does not distribute a merged kernel or boot
+  image containing the table until the issue is resolved. See [the port and license notes](docs/legal/polaris-adreno.md).
+
 - **UEFI driver binaries** under `devices/redwood/uefi/files/Binaries/` are the phone
   vendor's (Qualcomm/Xiaomi), extracted from the device's own `xbl.img`. They are needed only to
   rebuild the UEFI image and can be removed and re-extracted by each user from their own phone

@@ -5,7 +5,9 @@ adreno_fine	k
 adreno_keep	k
 adreno_only	k
 adreno_pause	k
+adreno_perf	k
 adreno_return	k
+adreno_selftest	k
 adreno_skip	k
 adreno_speed	k
 adreno_stream1	k

@@ -1,11 +1,13 @@
-ADRENO	arg	adreno	GPU and display	k	hakios.adreno.c	
+ADRENO	arg	adreno	GPU and display	k	hakios.adreno.c,hakios.adreno.polaris.c	run the GPU bring-up through step N; gpu=1 requests its full backend
 ADRENO_BLIND	arg	adreno_blind	GPU and display	k	hakios.adreno.c	
 ADRENO_DIRTY	arg	adreno_dirty	GPU and display	k	hakios.adreno.c	
 ADRENO_FINE	arg	adreno_fine	GPU and display	k	hakios.adreno.c	the newest step waits like that before every single access
 ADRENO_KEEP	arg	adreno_keep	GPU and display	k	hakios.adreno.c	
 ADRENO_ONLY	arg	adreno_only	GPU and display	k	hakios.adreno.c	step K alone (what steps 6 to 10 need, they check for themselves: within one session of the loader, power and clocks stay as an earlier run left them)
 ADRENO_PAUSE	arg	adreno_pause	GPU and display	k	hakios.adreno.c	how long the newest step waits after announcing a group of accesses (default 2200)
+ADRENO_PERF	arg	adreno_perf	GPU and display	k	hakios.adreno.polaris.c	the maximum HFI performance level requested at startup; zero leaves firmware default
 ADRENO_RETURN	arg	adreno_return	GPU and display	k	hakios.adreno.c	when all is over, go back to the loader instead of starting the system
+ADRENO_SELFTEST	arg	adreno_selftest	GPU and display	k	hakios.adreno.polaris.c	submit a minimal command buffer after startup and report its fence
 ADRENO_SKIP	arg	adreno_skip	GPU and display	k	hakios.adreno.c	leave out the steps whose bits are set (bit 2 = step 2)
 ADRENO_SPEED	arg	adreno_speed	GPU and display	k	hakios.adreno.c	step 17 asks the GMU for the 3D core's Nth speed: 1 315 MHz, 2 450 MHz, 3 550 MHz (the default: the most this phone's GPU is rated for)
 ADRENO_STREAM1	arg	adreno_stream1	GPU and display	k	hakios.adreno.c	step 18 leaves the core's second stream out (0) or gives it an empty context of its own (2): what the SMMU then records shows what the core
@@ -138,7 +140,7 @@ GLYES	arg	glyes	User space	u	inject.c	the renderer is made to answer that it has
 GPU_CACHED	arg	gpu_cached	GPU and display	k	hakios.gpu.cpp	
 GPU_EXACT	arg	gpu_exact	GPU and display	k	hakios.adreno.c	
 GPU_KEEP	arg	gpu_keep	GPU and display	k	hakios.gpu.cpp	
-GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c	
+GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c,hakios.adreno.polaris.c	log GPU command submissions and fences through HakiosGPU
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
 M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	

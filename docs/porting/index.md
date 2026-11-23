@@ -60,7 +60,7 @@ Bring them back in the order each needs the ones before it:
 | 1 | `CPUFREQ`, `THERMAL`, `SOCINFO` | the SoC's: they read what the chip is and how warm, and touch nothing that is the phone's |
 | 2 | `BUTTONS`, then the touch screen (`GOODIX` or one of your own) | input, so that the system can be used |
 | 3 | `UFS` | the phone's storage, read only; the modem needs it |
-| 4 | `ADRENO` | the GPU; needs `fw-gpu/` |
+| 4 | `ADRENO` or a device-specific backend such as `POLARIS_ADRENO` | the GPU; needs that device's firmware from `fw-gpu/` |
 | 5 | `ADSP`, `BATTERY`, `SPEAKER`, `SOUND`, `MIC` | audio and the battery's level come through the audio DSP |
 | 6 | `WIFI` (and `QMI`) | needs `fw-wifi/` |
 | 7 | `HAPTIC`, `CAMERA`, `TORCH`, `MODEM`, `BT` | the rest |

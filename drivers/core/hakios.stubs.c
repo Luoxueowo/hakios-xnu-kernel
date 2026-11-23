@@ -22,6 +22,8 @@
 #include <sys/hakios.net.h>
 #include <sys/hakios.virtio_blk.h>
 
+uint32_t gpu_log; /* shared HakiosGPU log switch; a selected backend reads gpu_log=1 */
+
 /* the ends of a run (loader_return.c, the guards), which have no header of their own */
 void hakios_adsp_stop(void);
 void hakios_adsp_quiesce(void);
@@ -69,11 +71,34 @@ void hakios_cpufreq_init(void) {}
 void hakios_ddr_quiesce(void) {}
 #endif
 
-#ifndef HAKIOS_ADRENO
+#if !defined(HAKIOS_ADRENO) && !defined(HAKIOS_POLARIS_ADRENO)
 void hakios_adreno_init(void) {}
 void hakios_adreno_quiesce(void) {}
 void hakios_adreno_stop(void) {}
 void hakios_adreno_minute(void) {}
+
+/* HakiosGPU is built as a common IOKit service; these are its backend calls when no GPU is selected. */
+bool hakios_gpu_ready(void) { return false; }
+bool hakios_gpu_parameter(__unused uint32_t which, __unused uint64_t *value) { return false; }
+uint64_t hakios_gpu_address(__unused uint64_t size) { return 0; }
+void hakios_gpu_address_free(__unused uint64_t address, __unused uint64_t size) {}
+bool hakios_gpu_map(__unused uint64_t address, __unused uint64_t phys, __unused bool read_only) { return false; }
+void hakios_gpu_mapped(void) {}
+void hakios_gpu_unmap(__unused uint64_t address, __unused uint64_t size) {}
+void hakios_gpu_to_memory(__unused void *start, __unused uint64_t size) {}
+uint32_t hakios_gpu_submit(__unused const uint64_t *addresses, __unused const uint32_t *words, __unused uint32_t count) { return 0; }
+bool hakios_gpu_done(__unused uint32_t fence) { return false; }
+uint32_t hakios_gpu_last(void) { return 0; }
+void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+{
+	*microseconds = 0;
+	*submissions = 0;
+	for (uint32_t i = 0; i < 7; i++) {
+		by[i] = 0;
+	}
+}
+void hakios_gpu_report(__unused const char *why) {}
+void hakios_gpu_stop(void) {}
 #endif
 
 #ifndef HAKIOS_WIFI

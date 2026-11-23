@@ -49,6 +49,7 @@ BUILD_LOADER=${BUILD_LOADER:-1}
 BUILD_USERLAND=${BUILD_USERLAND:-1}
 USERLAND_REST=${USERLAND_REST:-0}
 USERLAND_CRYPTEXES=${USERLAND_CRYPTEXES:-flash}
+USERLAND_GL=${USERLAND_GL:-0}
 
 check_switch() {
 	case "$2" in
@@ -60,6 +61,12 @@ check_switch BUILD_KERNEL "$BUILD_KERNEL"
 check_switch BUILD_LOADER "$BUILD_LOADER"
 check_switch BUILD_USERLAND "$BUILD_USERLAND"
 check_switch USERLAND_REST "$USERLAND_REST"
+check_switch USERLAND_GL "$USERLAND_GL"
+
+USERLAND_ENV=()
+if [[ "$USERLAND_GL" == 1 ]]; then
+	USERLAND_ENV+=(GL=1)
+fi
 
 repo_path() {
 	case "$1" in
@@ -99,9 +106,9 @@ fi
 if [[ "$BUILD_USERLAND" == 1 ]]; then
 	echo "build-boot: build flash-root ramdisks"
 	if [[ "$USERLAND_REST" == 1 ]]; then
-		(cd "$ROOT/userland" && FLASHBOOT=1 REST=1 CRYPTEXES="$USERLAND_CRYPTEXES" ./build.sh)
+		(cd "$ROOT/userland" && env "${USERLAND_ENV[@]}" FLASHBOOT=1 REST=1 CRYPTEXES="$USERLAND_CRYPTEXES" ./build.sh)
 	else
-		(cd "$ROOT/userland" && FLASHBOOT=1 CRYPTEXES="$USERLAND_CRYPTEXES" ./build.sh)
+		(cd "$ROOT/userland" && env "${USERLAND_ENV[@]}" FLASHBOOT=1 CRYPTEXES="$USERLAND_CRYPTEXES" ./build.sh)
 	fi
 fi
 

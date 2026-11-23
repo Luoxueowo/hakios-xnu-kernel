@@ -10,10 +10,11 @@ This supersedes the summary in `NOTICE`, which stays as the short, canonical lis
 
 | Component | Path | Origin | License | Notes |
 |---|---|---|---|---|
-| XNU modifications | `xnu/hakios.patch`, `xnu/files/`, `drivers/` | derivative of Apple XNU | APSL 2.0 (`LICENSE.APSL`) | base tag `xnu-8796.121.2`, fetched by `xnu/apply.sh` |
+| XNU modifications | `xnu/hakios.patch`, `xnu/files/`, applicable drivers | derivative of Apple XNU | APSL 2.0 (`LICENSE.APSL`) | base tag `xnu-8796.121.2`, fetched by `xnu/apply.sh`; the separately listed Polaris Adreno port has unresolved licensing |
 | libdeflate | `xnu/files/bsd/miscfs/apfs/libdeflate/` | Eric Biggers | MIT | see its `COPYING` |
 | libzbitmap | `xnu/files/bsd/miscfs/apfs/libzbitmap/`, `xnu-deps/build/lzbitmap/` | Corellium LLC (port of eafer/libzbitmap) | GPL-2.0+ OR MIT | used under MIT |
 | LinuxKPI / Linux headers | `wifi/lx/include/linux/`, `wifi/lx/include/net/` | Linux / FreeBSD LinuxKPI | GPL-2.0 (Linux) / BSD-2-Clause (FreeBSD) | small compatibility headers; see each file's notice |
+| Dipper Adreno 630 port | `devices/polaris/drivers/gpu/hakios.adreno.polaris.c`, `hakios.adreno.a630_hw_init.inc` | [youzjuzi/dipper-xnu](https://github.com/youzjuzi/dipper-xnu), commit `5fcd75220a6bec12f55e2c8284f4d0854c73c24c`; the init table derives from Linux A6xx code | table: GPL-2.0-only; driver combination: **UNRESOLVED** | preserve source notices; do not distribute a merged kernel or boot image until cleared; [port and license notes](docs/legal/polaris-adreno.md) |
 | Linux DRM shim | `tools/mesa/hakios-drm/`, `xf86drm.h` | Linux / X.Org | MIT | build-time shim for Mesa |
 | Mesa patches | `tools/mesa/*.patch` (`turnip-darwin.patch` among them) | changes to Mesa, HakiOS | MIT (Mesa's terms for the files they change) | patches only; Mesa itself is fetched |
 | AdrenoMetal patch | `tools/m2v/adrenometal-ios16.patch` | changes to UniXNU/AdrenoMetal, HakiOS | MIT, Copyright (c) 2026 NativeMetal contributors | patch only; the source is fetched. `tools/m2v/ios16-compat.h` is our own, MIT |

@@ -1027,14 +1027,43 @@ def cmd_kernel(a):
 
 
 def cmd_external(a):
-    """external-files: "<file in a SoC's or device's repository>\t<path in the kernel tree>" for each file of their drivers, for
-    xnu/apply.sh and xnu/sync-drivers.sh to copy into the tree and xnu/export.sh to leave where it is (it is not this repository's)."""
+    """external-files: driver sources and their local quoted includes for xnu/apply.sh and xnu/sync-drivers.sh to copy into the
+    tree, and xnu/export.sh to leave in their SoC or device repository."""
     if DRIVERS_ERROR:
         raise ConfigError(DRIVERS_ERROR)
+    files = {}
     for d in DRIVERS:
         if d.origin:
             for path, _tags in d.files:
-                print("%s\t%s" % (d.source(path), path))
+                pending = [(d.source(path), path)]
+                while pending:
+                    source, target = pending.pop()
+                    source = os.path.normpath(source)
+                    target = os.path.normpath(target)
+                    previous = files.get(target)
+                    if previous is not None:
+                        if os.path.realpath(previous) != os.path.realpath(source):
+                            raise ConfigError("external driver files collide at %s (%s and %s)" % (target, previous, source))
+                        continue
+                    files[target] = source
+                    if not os.path.isfile(source):
+                        continue  # the normal config check reports a missing driver source
+                    try:
+                        text = open(source, encoding="utf-8", errors="replace").read()
+                    except OSError:
+                        continue
+                    origin = os.path.realpath(d.origin)
+                    for include in re.findall(r'(?m)^\s*#\s*include\s+"([^"]+)"', text):
+                        dependency = os.path.normpath(os.path.join(os.path.dirname(source), include))
+                        if not os.path.isfile(dependency):
+                            continue  # XNU and common-repository headers are supplied by the kernel tree
+                        real_dependency = os.path.realpath(dependency)
+                        if os.path.commonpath((origin, real_dependency)) != origin:
+                            continue
+                        dependency_target = os.path.normpath(os.path.join(os.path.dirname(target), include))
+                        pending.append((dependency, dependency_target))
+    for target, source in sorted(files.items()):
+        print("%s\t%s" % (source, target))
     return 0
 
 

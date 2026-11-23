@@ -1,23 +1,25 @@
 # MIX 2S system image, boot image, and storage updates
 
-This is the current Polaris workflow. It replaces the old instructions based on
-carving Android `userdata`, writing a combined `darwin.img` with fastboot, or
-installing into an inactive A/B slot. The MIX 2S already has a dedicated
-`darwin` GPT partition; these steps do not resize Android `userdata` or change
-the GPT.
+This is the Polaris workflow for the MIX 2S. This device did not expose a
+`darwin` GPT partition, so its first installation carves a 116.002 GiB partition
+from the end of Android `userdata`. The remaining `userdata` is about 116.26 GiB.
+That one-time operation changes the GPT and discards the old data in the carved
+range. Format Android `userdata` before booting Android again; direct HakiOS
+boot uses the separate `darwin` partition and its own Data volume. Later HakiOS
+updates do not change the GPT.
 
 ## The fixed layout
 
 [`configs/polaris-storage.json`](../../configs/polaris-storage.json) is the
-source of truth. The existing `darwin` partition is 137,438,932,992 bytes
-(128 GiB). Offsets use 4096-byte blocks.
+source of truth. The MIX 2S `darwin` partition is 124,556,128,256 bytes
+(116.002 GiB, aligned to the UFS 2 MiB boundary). Offsets use 4096-byte blocks.
 
 | Region | Start | Reserved size | Purpose |
 | --- | ---: | ---: | --- |
 | System | 0 | 10 GiB | Read-only Darwin root |
 | OS Cryptex | 10 GiB (block 2621440) | 4 GiB | Shared cache and OS libraries |
 | App Cryptex | 14 GiB (block 3670016) | 1 GiB | App resources |
-| Data | 15 GiB (block 3932160) | 121,332,805,632 bytes, about 113 GiB | Persistent, journaled HFSX mounted at `/private/var` |
+| Data | 15 GiB (block 3932160) | 108,450,000,896 bytes, 101.002 GiB | Persistent, journaled HFSX mounted at `/private/var` |
 
 The first three sizes are reserved slots; each APFS image remains its actual
 size. Data starts at a fixed 15 GiB boundary. Version 1 refuses changed
@@ -56,68 +58,74 @@ update `darwin`. Set `BUILD_KERNEL=0`, `BUILD_LOADER=0`, or
 outputs. The builder derives the Cryptex and Data offsets from the layout JSON
 and checks that the APFS paths and boot image fit their limits.
 
-## Convert an older contiguous `darwin` layout once
+## First installation on this MIX 2S
 
-Do this only when migrating from the old layout. The current MIX 2S already has
-the fixed layout and initialized Data volume; skip this section for normal
-updates.
+Do this once to create `darwin`. The `--wipe` planner does not shrink or inspect
+the old F2FS filesystem; it reduces the `userdata` GPT entry and adds a 116.002 GiB
+APFS entry named `darwin`. Its old tail data is discarded, and Android's
+shortened `userdata` must be formatted before booting Android again.
 
-1. Build the new images with `make boot`.
-2. Boot the phone into recovery, connect USB, and confirm it appears in
-   `adb devices`. Keep the `darwin` partition unmounted in recovery.
-3. Save the existing APFS containers on the computer. Pick a new snapshot
-   directory; the tool will not overwrite one.
+1. Build the matching kernel, loader, and userland with `make boot`.
+2. In Recovery, unmount `userdata` before changing the GPT. Save the first and
+   last 8 blocks of `/dev/block/sda` in a new local directory. Do not reuse a
+   previous GPT backup.
 
    ```sh
-   python3 tools/polaris-storage.py plan
-   python3 tools/polaris-storage.py snapshot out/storage/before-fixed-layout
+   mkdir -p out/storage/gpt-before-darwin
+   adb exec-out sh -c 'dd if=/dev/block/sda bs=4096 count=8 2>/dev/null' > out/storage/gpt-before-darwin/gpt-head.bin
+   sda_bytes=$(adb shell blockdev --getsize64 /dev/block/sda)
+   sda_tail_block=$((sda_bytes / 4096 - 8))
+   adb exec-out sh -c "dd if=/dev/block/sda bs=4096 skip=$sda_tail_block count=8 2>/dev/null" > out/storage/gpt-before-darwin/gpt-tail.bin
+   ```
+3. Generate and inspect the new GPT. The planner writes files on the computer;
+   it does not write to the phone. Run the `dd` commands it prints in Recovery
+   only after checking that they target `/dev/block/sda` and the expected
+   `darwin` size.
+
+   ```sh
+   python3 tools/userdata-carve.py --wipe out/storage/gpt-before-darwin 116 darwin
    ```
 
-   This backs up System/OS/App, not files from a legacy persistent HFS volume.
-   If the installer detects legacy HFS data, it stops. This tool has no
-   in-place importer or override for that old volume, so conversion with
-   persistent legacy data is not currently supported. Do not bypass the check
-   or erase its header manually; keep the old layout until a dedicated
-   migration procedure is available.
-4. Package the new System with the saved OS and App containers:
+4. Reboot Recovery so it rereads the GPT. Confirm `/dev/block/by-name/darwin`
+   resolves to `/dev/block/sda22` and is 124,556,128,256 bytes. Before any
+   Android boot, format the shortened `userdata` (for example, with
+   `fastboot -w`); this erases Android user data. HakiOS direct boot does not
+   mount Android `userdata`.
+5. Prepare the three APFS containers and the empty Data image:
 
    ```sh
    python3 tools/polaris-storage.py pack \
      --system userland/system.apfs \
-     --os out/storage/before-fixed-layout/os.apfs \
-     --app out/storage/before-fixed-layout/app.apfs \
+     --os out/storage/os.apfs \
+     --app sysimage/cryptex-app.dmg \
      -o out/storage/system-update.json
-   ```
-
-5. Create the empty Data image. On macOS, use Apple's formatter; on Linux,
-   omit the last argument to use `mkfs.hfsplus` from `PATH`.
-
-   ```sh
    python3 tools/mkdatavol.py --layout configs/polaris-storage.json \
      out/storage/data-initial.simg /sbin/newfs_hfs
    ```
 
-6. Still in recovery, write the three APFS images and initialize Data. Do not
-   reboot between these commands.
+6. In fastboot, erase only the new `darwin` partition to remove the carved
+   userdata contents, then reboot Recovery. Apply the fresh containers and
+   initialize HakiOS Data from Recovery:
 
    ```sh
+   fastboot erase darwin
+   fastboot reboot recovery
    python3 tools/polaris-storage.py apply-system \
-     out/storage/system-update.json --first-install
+     out/storage/system-update.json --new-partition --stage-dir /tmp
    python3 tools/polaris-storage.py apply-data \
-     out/storage/data-initial.simg --initialize-data
+     out/storage/data-initial.simg --initialize-data --stage-dir /tmp
    ```
 
 7. Flash the matching boot image directly to `boot` and restart:
 
    ```sh
-   adb reboot bootloader
-   fastboot devices
    fastboot flash boot out/boot/polaris.img
    fastboot reboot
    ```
 
-Do not use `fastboot boot`, `fastboot flash darwin`, `fastboot -w`, or
-`tools/userdata-carve.py` for this Polaris layout.
+Do not use `fastboot boot` or `fastboot flash darwin`; regular updates use the
+bounded writes below. `fastboot -w` is only needed to reset Android `userdata`,
+not to initialize HakiOS Data inside `darwin`.
 
 ## Update System and boot
 
@@ -135,7 +143,7 @@ python3 tools/polaris-storage.py pack \
   --os out/storage/before-update-01/os.apfs \
   --app out/storage/before-update-01/app.apfs \
   -o out/storage/system-update.json
-python3 tools/polaris-storage.py apply-system out/storage/system-update.json
+python3 tools/polaris-storage.py apply-system out/storage/system-update.json --stage-dir /tmp
 adb reboot bootloader
 fastboot flash boot out/boot/polaris.img
 fastboot reboot
@@ -161,8 +169,7 @@ files; an APFS snapshot does not back up Data.
 
 ## Capacity shown in Settings
 
-Data is about 113 GiB, or 121.33 decimal GB. On the MIX 2S, Settings now reports
-about 120–121 GB available. iOS 16.5's About screen asks NSURL for important
+Data is 101 GiB, or 108.45 decimal GB. iOS 16.5's About screen asks NSURL for important
 usage capacity; that query returned zero on this writable HFSX volume even
 though HFS free-space queries were positive. `libhakios.storage.dylib` adapts
 the CFURL and NSURL entry points: only an original zero answer on writable HFS

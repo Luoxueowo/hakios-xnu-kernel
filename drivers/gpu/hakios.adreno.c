@@ -3192,7 +3192,7 @@ static uint64_t gpu_ticks;              /* how long the core has worked on the s
 static uint32_t gpu_timed_count;
 static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
-uint32_t gpu_log;                       /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
+extern uint32_t gpu_log;                /* shared with HakiosGPU and the common stubs */
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 static struct {
 	uint64_t start, size;
@@ -3768,6 +3768,7 @@ hakios_adreno_init(void)
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}
+	/* adreno=N  run the GPU bring-up through step N; gpu=1 requests its full backend */
 	if (!PE_parse_boot_argn("adreno", &last_step, sizeof(last_step))) {
 		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) || !start_by_itself()) {
 			return;
@@ -3819,6 +3820,7 @@ hakios_adreno_init(void)
 			bzero((void *)core_scratch.memory, 4096);
 			to_memory(core_scratch.memory, 4096);
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
+			/* gpu_log=1  log GPU command submissions and fences through HakiosGPU */
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
 			gpu_kept = true;
 			quiet = true;

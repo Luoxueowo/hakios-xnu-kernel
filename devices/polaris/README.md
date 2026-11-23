@@ -26,9 +26,18 @@ This loader profile is integrated, and XNU has now booted to the system on the M
 as specified by the old Polaris loader profile and the device's timer description.
 
 UEFI boots successfully on the MIX 2S. Display output through the UEFI framebuffer is partially working. XNU has confirmed working
-touch input, power and volume buttons, eight active CPUs, persistent storage, and battery-level and charging-status reporting. The
-boot configuration uses `touchscreen=1`, `bootcpu=7 cpus=8 cpufreq=1`, and `battery=1`. CPU clocks remain at the boot loader's
-setting: the SDM845 uses OSM, which the current CPU-frequency driver does not control.
+touch input, power and volume buttons, eight active CPUs, and battery-level and charging-status reporting. On 2026-11-24, a new
+116.002 GiB `darwin` partition was carved from the end of `userdata`; System, OS, App, and initial HFSX Data images were written and
+read back successfully. `userdata` was not formatted. The latest boot reached the HakiOS desktop with Mesa/Adreno accelerated rendering selected.
+CPU clocks remain at the boot loader's setting: the SDM845 uses OSM, which the current CPU-frequency driver does not control.
+
+The Polaris build includes an Adreno 630 backend adapted from the GPU path in `youzju/dipper-xnu` (commit
+`5fcd75220a6bec12f55e2c8284f4d0854c73c24c`). It uses the shared `HakiosGPU` service and the MIX 2S firmware from `fw-gpu/`.
+The standard boot arguments request `gpu=1 adreno_keep=1 gpu_log=1`, and `USERLAND_GL=1` packages Mesa's OpenGL ES renderer. The
+2026-11-24 log confirms CoreAnimation's accelerated renderer, OpenGL ES 3.2 Mesa 25.0.7 with renderer `FD630`, and two rendered
+frames submitted through HakiosGPU (fences 1 and 2); no panic was recorded. This confirms the Adreno 630 rendering path. The
+framebuffer presentation path remains incomplete: Dipper's DPU/display driver is not yet integrated, and page flipping and the
+second scanout-buffer address still need to be brought up and verified.
 
 With `battery=1`, the loader reads the resident Qualcomm ChargerEx/QcomCharger protocols and shares a read-only status cache with
 XNU. The Polaris profile does not reinitialize QcomCharger, matching the old Polaris loader setting. XNU publishes the readings as
@@ -73,9 +82,9 @@ says where its numbers came from; that is the map of what to rewrite.
 - [x] **Buttons**: `drivers/input/hakios.buttons.polaris.c` handles the MIX 2S PM8998 power and volume keys; both are confirmed working.
 - [x] **Touch**: `drivers/input/hakios.synaptics.c` handles the MIX 2S Synaptics S3330 RMI4 touchscreen; touch input is confirmed working.
 - [x] **Multi-core CPU**: XNU runs with eight active CPUs (`bootcpu=7 cpus=8`). CPU clock control is still pending; the SDM845 OSM is not driven by the current CPU-frequency driver.
-- [x] **Storage**: UFS-backed persistent HFSX Data is mounted for user data; Settings reports about 120–121 GB available.
+- [x] **Storage**: the `darwin` APFS containers and HFSX Data are installed; the latest boot mounted Data at `/private/var`. `userdata` remains unformatted for Android.
 - [ ] **CPU clocks**: the SDM845 OSM path is not implemented; the existing EPSS path in `hakios.cpufreq.c` is for the SM7325.
-- [ ] **GPU**: the MIX 2S has an Adreno 630; the current `hakios.adreno.c` driver targets the POCO X5 Pro's Adreno 642L and is disabled for Polaris.
+- [x] **GPU rendering**: Mesa Freedreno reports `FD630`; CoreAnimation selects its accelerated renderer and the log records two completed GPU submissions. DPU scanout/page flipping is separate and remains to be integrated. See [the GPU port and license notes](../../docs/legal/polaris-adreno.md).
 - [ ] **Wi-Fi**: hakios.wifi.c, hakios.lx.c and wifi/lx/ (the WCN6750 radio of the reference phone)
 - [ ] **Audio**: hakios.adsp.c, hakios.audio.c, hakios.sound.c, hakios.speaker.c, hakios.mic.c
 - [x] **Battery status**: `battery=1` enables the Qualcomm UEFI status cache and `HakiosBattery`; battery level and charging status are confirmed visible.
@@ -95,10 +104,10 @@ The kernel's settings are layered the way an Android kernel's are: the common ke
 Then `make polaris_defconfig`. Turn on only what this phone has been shown to do; `tools/hakios-config.py check` says what the
 choice needs.
 
-The drivers are part of the configuration too (`docs/drivers-config.md`): every one is built unless a configuration leaves it out,
-and the addresses, pins and rails in each are the reference phone's. Leave out in `configs/polaris.config` what has not been
-ported to this phone yet (`# CONFIG_HAKIOS_GOODIX is not set`, ...; `configs/qemu_defconfig` leaves out all of them), and put
-each one back when it has been made to work here. `tools/hakios-config.py show` lists what is built in.
+The drivers are part of the configuration too (`docs/drivers-config.md`). Polaris enables `CONFIG_HAKIOS_POLARIS_ADRENO` to build
+the new backend. `configs/polaris-boot.conf` requests `gpu=1 adreno_keep=1 gpu_log=1` and builds Mesa's renderer with
+`USERLAND_GL=1`; `adreno_keep=1` exposes the running core through `HakiosGPU` after the hardware checks pass.
+`tools/hakios-config.py show` lists what is built in.
 
 ## Build a boot image
 

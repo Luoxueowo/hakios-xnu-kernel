@@ -127,7 +127,7 @@ def pack(c, args):
     print(out)
 
 
-def write_image(c, path, offset, limit, expected=None):
+def write_image(c, path, offset, limit, expected=None, stage_dir=Path('/data/local/tmp')):
     size = path.stat().st_size
     if size == 0 or size % 4096 or offset % 4096 or size > limit:
         raise ValueError('image is empty, unaligned, or exceeds its reserved region')
@@ -140,7 +140,7 @@ def write_image(c, path, offset, limit, expected=None):
         if current.split()[0] == sha:
             print(f'already verified {path.name}: unchanged at byte {offset}', flush=True)
             return
-    target = '/data/local/tmp/polaris-storage-stage.img'
+    target = str(stage_dir / 'polaris-storage-stage.img')
     subprocess.run(['adb', 'push', str(path), target], check=True)
     if adb(f'sha256sum {target}').split()[0] != sha:
         raise ValueError('staged checksum mismatch; no partition write performed')
@@ -157,7 +157,7 @@ def write_image(c, path, offset, limit, expected=None):
     print(f'verified {path.name}: bytes {offset}..{offset+size-1}', flush=True)
 
 
-def apply_system(c, manifest, first_install):
+def apply_system(c, manifest, first_install, new_partition, stage_dir):
     m = json.loads(manifest.read_text())
     if m['layout'] != c or len(m['images']) != 3:
         raise ValueError('manifest layout differs from the selected layout')
@@ -171,8 +171,16 @@ def apply_system(c, manifest, first_install):
         if size != p.stat().st_size or size != e['image_bytes'] or size > r['size'] or digest(p) != e['sha256']:
             raise ValueError('invalid or changed image')
     identity(c)
+    if first_install and new_partition:
+        raise ValueError('choose either --first-install or --new-partition')
     fixed = remote_read(c['regions'][1]['offset'], 4096)[32:36] == b'NXSB'
-    if not fixed:
+    if new_partition:
+        if fixed:
+            raise ValueError('new-partition target already contains the fixed APFS layout')
+        probes = [r['offset'] for r in c['regions']] + [c['data_offset']]
+        if any(remote_read(offset, 4096) != bytes(4096) for offset in probes):
+            raise ValueError('new-partition target is not blank; erase only the new darwin partition first')
+    elif not fixed:
         if not first_install:
             raise ValueError('legacy layout: take a snapshot and use --first-install for migration')
         end = 0
@@ -182,10 +190,10 @@ def apply_system(c, manifest, first_install):
             if offset+4096 <= c['partition_bytes'] and remote_read(offset, 4096)[1024:1026] in (b'H+', b'HX'):
                 raise ValueError('legacy persistent Data detected; back up and migrate user files before repartitioning')
     for e in m['images']:
-        write_image(c, Path(e['image']), e['offset'], e['size'], e['sha256'])
+        write_image(c, Path(e['image']), e['offset'], e['size'], e['sha256'], stage_dir)
 
 
-def apply_data(c, image, initialize):
+def apply_data(c, image, initialize, stage_dir):
     if not initialize:
         raise ValueError('first installation requires --initialize-data; never use it for an update')
     identity(c)
@@ -234,7 +242,7 @@ def apply_data(c, image, initialize):
                         raise ValueError('short sparse payload')
                     out.write(b); left -= n
                 out.flush()
-                write_image(c, Path(out.name), offset, size)
+                write_image(c, Path(out.name), offset, size, stage_dir=stage_dir)
     print('Initialized Data. Omit this step for every subsequent system update.')
 
 
@@ -248,7 +256,10 @@ def main():
     for name in ('system', 'os', 'app'): s.add_argument('--'+name, required=True)
     s.add_argument('-o', '--output', default='out/storage/system-update.json')
     s = sub.add_parser('apply-system'); s.add_argument('manifest', type=Path); s.add_argument('--first-install', action='store_true')
+    s.add_argument('--new-partition', action='store_true', help='install into a freshly carved and erased darwin partition')
+    s.add_argument('--stage-dir', type=Path, default=Path('/data/local/tmp'), help='temporary on-device staging directory')
     s = sub.add_parser('apply-data'); s.add_argument('image', type=Path); s.add_argument('--initialize-data', action='store_true')
+    s.add_argument('--stage-dir', type=Path, default=Path('/data/local/tmp'), help='temporary on-device staging directory')
     a = p.parse_args(); c = layout(a.layout)
     if a.cmd == 'plan':
         print(json.dumps(c, indent=2)); print('Data bytes:', c['partition_bytes']-c['data_offset'])
@@ -256,8 +267,8 @@ def main():
         print(f'cryptex_os_block={c["regions"][1]["offset"]//4096} cryptex_app_block={c["regions"][2]["offset"]//4096} darwin_data={c["data_offset"]//4096} var_hfs=ufs_darwin_data data_required=1')
     elif a.cmd == 'snapshot': snapshot(c, a.directory)
     elif a.cmd == 'pack': pack(c, a)
-    elif a.cmd == 'apply-system': apply_system(c, a.manifest, a.first_install)
-    elif a.cmd == 'apply-data': apply_data(c, a.image, a.initialize_data)
+    elif a.cmd == 'apply-system': apply_system(c, a.manifest, a.first_install, a.new_partition, a.stage_dir)
+    elif a.cmd == 'apply-data': apply_data(c, a.image, a.initialize_data, a.stage_dir)
 
 
 if __name__ == '__main__':

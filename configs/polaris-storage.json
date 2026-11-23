@@ -2,7 +2,7 @@
   "version": 1,
   "device": "polaris",
   "partition": "darwin",
-  "partition_bytes": 137438932992,
+  "partition_bytes": 124556128256,
   "block_size": 4096,
   "regions": [
     {"name": "system", "gib": 10},

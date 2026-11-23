@@ -1,0 +1,4 @@
+driver POLARIS_ADRENO
+	file    bsd/dev/hakios.adreno.polaris.c
+	default n
+	help    the MIX 2S Adreno 630 backend adapted from dipper-xnu for SDM845; starts only with gpu=1 or adreno=N and needs A630 firmware from the device

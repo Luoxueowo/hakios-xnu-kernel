@@ -19,7 +19,8 @@
 | touch | works | Synaptics S3330 RMI4 touch input works on the MIX 2S (`touchscreen=1`) |
 | buttons | works | MIX 2S PM8998 power and volume keys work (`touchscreen=1`) |
 | cpu | works | all eight cores (`bootcpu=7 cpus=8 cpufreq=1`); the clock is the boot loader's, SDM845's OSM is not driven |
-| storage | works | persistent HFSX Data volume; Settings reports about 120–121 GB available |
+| storage | partly | the `darwin` APFS containers and HFSX Data are installed; the latest boot mounted Data at `/private/var`; `userdata` remains unformatted for Android |
 | battery | works | battery level and charging status are reported through HakiosBattery (`battery=1`) |
+| gpu | partly | Mesa Freedreno reports FD630; CoreAnimation selects its accelerated renderer and the log records two GPU submissions; DPU scanout/page flipping remains to be integrated |
 
 The state is what has been seen on this device, written down in `devices/polaris/device.conf`; a part the table does not name has not been looked at.
