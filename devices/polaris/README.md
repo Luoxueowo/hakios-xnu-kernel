@@ -33,11 +33,12 @@ CPU clocks remain at the boot loader's setting: the SDM845 uses OSM, which the c
 
 The Polaris build includes an Adreno 630 backend adapted from the GPU path in `youzju/dipper-xnu` (commit
 `5fcd75220a6bec12f55e2c8284f4d0854c73c24c`). It uses the shared `HakiosGPU` service and the MIX 2S firmware from `fw-gpu/`.
-The standard boot arguments request `gpu=1 adreno_keep=1 gpu_log=1`, and `USERLAND_GL=1` packages Mesa's OpenGL ES renderer. The
+The standard boot arguments request `gpu=1 adreno_keep=1 gpu_log=1 fb_flip=1`, and `USERLAND_GL=1` packages Mesa's OpenGL ES renderer. The
 2026-11-24 log confirms CoreAnimation's accelerated renderer, OpenGL ES 3.2 Mesa 25.0.7 with renderer `FD630`, and two rendered
 frames submitted through HakiosGPU (fences 1 and 2); no panic was recorded. This confirms the Adreno 630 rendering path. The
-framebuffer presentation path remains incomplete: Dipper's DPU/display driver is not yet integrated, and page flipping and the
-second scanout-buffer address still need to be brought up and verified.
+SDM845 DPU 4.0 page flipping is now integrated behind `fb_flip=1`: it validates the DPU and panel geometry, uses the Polaris
+36 MiB reserved display region for the second scanout buffer, and restores the firmware framebuffer on timeout or return to the
+loader. Device verification of the new flip path is pending; failed hardware checks retain the legacy framebuffer path.
 
 With `battery=1`, the loader reads the resident Qualcomm ChargerEx/QcomCharger protocols and shares a read-only status cache with
 XNU. The Polaris profile does not reinitialize QcomCharger, matching the old Polaris loader setting. XNU publishes the readings as
@@ -78,13 +79,13 @@ come from its tree and its Android. What is written for one phone is the list be
 says where its numbers came from; that is the map of what to rewrite.
 
 - [x] **UEFI boot**: UEFI starts the loader and boots HakiOS on the MIX 2S.
-- [ ] **Display (partial)**: UEFI framebuffer output works partially; display support still needs further device-specific work.
+- [ ] **Display (partial)**: UEFI framebuffer output works partially. The SDM845 DPU page-flip path is integrated and enabled with `fb_flip=1`; on-device verification is pending.
 - [x] **Buttons**: `drivers/input/hakios.buttons.polaris.c` handles the MIX 2S PM8998 power and volume keys; both are confirmed working.
 - [x] **Touch**: `drivers/input/hakios.synaptics.c` handles the MIX 2S Synaptics S3330 RMI4 touchscreen; touch input is confirmed working.
 - [x] **Multi-core CPU**: XNU runs with eight active CPUs (`bootcpu=7 cpus=8`). CPU clock control is still pending; the SDM845 OSM is not driven by the current CPU-frequency driver.
 - [x] **Storage**: the `darwin` APFS containers and HFSX Data are installed; the latest boot mounted Data at `/private/var`. `userdata` remains unformatted for Android.
 - [ ] **CPU clocks**: the SDM845 OSM path is not implemented; the existing EPSS path in `hakios.cpufreq.c` is for the SM7325.
-- [x] **GPU rendering**: Mesa Freedreno reports `FD630`; CoreAnimation selects its accelerated renderer and the log records two completed GPU submissions. DPU scanout/page flipping is separate and remains to be integrated. See [the GPU port and license notes](../../docs/legal/polaris-adreno.md).
+- [x] **GPU rendering**: Mesa Freedreno reports `FD630`; CoreAnimation selects its accelerated renderer and the log records two completed GPU submissions. DPU page flipping is integrated but awaits a device log confirming scanout. See [the GPU and DPU port notes](../../docs/legal/polaris-adreno.md).
 - [ ] **Wi-Fi**: hakios.wifi.c, hakios.lx.c and wifi/lx/ (the WCN6750 radio of the reference phone)
 - [ ] **Audio**: hakios.adsp.c, hakios.audio.c, hakios.sound.c, hakios.speaker.c, hakios.mic.c
 - [x] **Battery status**: `battery=1` enables the Qualcomm UEFI status cache and `HakiosBattery`; battery level and charging status are confirmed visible.

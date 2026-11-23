@@ -63,6 +63,7 @@ extern void hakios_camera_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* drivers/storage/hakios.ufs.c: the data volume into the flash */
+extern void MiniIOFlipQuiesce(void);            /* iokit/Kernel/MiniIOMobileFramebuffer.cpp */
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -376,6 +377,7 @@ loader_return(void)
 	 */
 	psci_smp_stop_others();
 #endif
+	MiniIOFlipQuiesce();          /* restore UEFI's scanout address before it reuses this kernel's memory */
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */

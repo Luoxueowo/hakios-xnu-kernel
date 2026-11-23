@@ -98,6 +98,7 @@ fb_beat	k
 fb_ca_hz	k
 fb_diff	k
 fb_filter	k
+fb_flip	k
 fb_hz	k
 fb_intf	k
 fb_measure	k

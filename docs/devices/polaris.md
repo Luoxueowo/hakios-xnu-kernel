@@ -21,6 +21,6 @@
 | cpu | works | all eight cores (`bootcpu=7 cpus=8 cpufreq=1`); the clock is the boot loader's, SDM845's OSM is not driven |
 | storage | partly | the `darwin` APFS containers and HFSX Data are installed; the latest boot mounted Data at `/private/var`; `userdata` remains unformatted for Android |
 | battery | works | battery level and charging status are reported through HakiosBattery (`battery=1`) |
-| gpu | partly | Mesa Freedreno reports FD630; CoreAnimation selects its accelerated renderer and the log records two GPU submissions; DPU scanout/page flipping remains to be integrated |
+| gpu | partly | Mesa Freedreno reports FD630 and CoreAnimation selects its accelerated renderer; the SDM845 DPU page-flip path is integrated behind fb_flip=1 and awaits device verification |
 
 The state is what has been seen on this device, written down in `devices/polaris/device.conf`; a part the table does not name has not been looked at.

@@ -10,9 +10,12 @@ service and firmware loader, with Polaris device configuration and lifecycle ent
 
 The port carries the SDM845 Adreno 630 GPUCC/GCC power-up, GMU and HFI startup, GPU SMMUv2 setup, firmware loading, ZAP
 authentication, command processor initialization, IOVA allocation/mapping, command submission, fences, and shutdown paths.
-The Dipper DPU, panel/backlight, CPU-frequency, DDR governor, and thermal governor code is excluded. Polaris framebuffer/DPU
-scanout and page flipping remain a separate, incomplete display task; this backend does not address a zero physical address
-for a second scanout buffer.
+The Polaris framebuffer now has a separate SDM845 DPU 4.0 page-flip path adapted from Dipper's
+`MiniIOMobileFramebuffer.cpp` work in commit `5fcd75220a6bec12f55e2c8284f4d0854c73c24c`. It checks the DPU version and active
+plane geometry, recovers `SRC0_ADDR=0` to the firmware framebuffer, maps a second scanout buffer from the Polaris 36 MiB
+reserved display region, and submits flips through `CTL0.FLUSH`. It keeps the existing CPU composition/scaling path; Dipper's
+native-resolution scaler and zero-copy IOSurface pool are not part of this first port. Panel/backlight, CPU-frequency, DDR
+governor, and thermal governor code remain excluded. The flip path is enabled by `fb_flip=1` and awaits on-device verification.
 
 The backend is compiled into the Polaris defconfig. `gpu=1` requests the full initialization sequence, and `adreno_keep=1` keeps
 the initialized 3D core running and starts the shared `HakiosGPU` service after the hardware checks pass. The standard Polaris boot
@@ -23,8 +26,8 @@ renderer `FD630`. Two desktop frames were submitted through HakiosGPU with fence
 
 The 116.002 GiB `darwin` partition now exists, and System, OS, App, and initial HFSX Data images were written and read back. The
 latest boot mounted HFSX Data at `/private/var`; `userdata` remains unformatted for Android. Hardware rendering now works through
-Mesa Freedreno. DPU scanout and page flipping remain a separate, incomplete display task: GPU rendering can run while the
-framebuffer presentation path still needs its own bring-up.
+Mesa Freedreno. DPU page flipping is integrated, but the 2026-11-24 log predates this change and does not validate the new scanout
+path.
 
 Firmware is read from `fw/` in the image, populated by `userland/build.sh` from files the user places in `fw-gpu/`:
 `a630_gmu.bin`, `a630_sqe.fw`, `a630_zap.mdt`, and `a630_zap.b02`. Vendor firmware is not included in this repository.

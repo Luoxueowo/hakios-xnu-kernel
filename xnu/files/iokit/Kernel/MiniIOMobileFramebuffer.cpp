@@ -3,8 +3,8 @@
  * IOMobileFramebuffer.framework (and through it by CoreAnimation's window server).
  *
  * The display is the framebuffer the boot loader left us (the one the kernel's text console
- * draws on). There is no hardware behind it that we drive: a "swap" copies the pixels of the
- * surfaces of its layers into that memory, and "vsync" is a timer.
+ * draws on). On Polaris, an optional SDM845 DPU path presents completed frames from reserved
+ * scanout buffers; otherwise swaps are copied into the boot framebuffer and "vsync" is a timer.
  *
  * The protocol (selectors and the layout of the swap request) was worked out from the
  * user-space side of Darwin userland 16.5. Everything not implemented is logged once.
@@ -35,6 +35,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 }
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOMapTypes.h>
 
 #include "MiniIOSurface.h"
 
@@ -270,6 +271,59 @@ static inline uint32_t refreshHz(void);
  */
 static TUNABLE(uint64_t, gIntfPhysical, "fb_intf", 0);
 
+/* DPU register offsets and the FLUSH scanout sequence follow Dipper's SDM845 bring-up (commit 5fcd752). */
+/* fb_flip=1: enable two-buffer scanout with the Polaris SDM845 DPU. */
+static TUNABLE(uint32_t, gFBFlip, "fb_flip", 0);
+#define POLARIS_DPU_MDSS       0x0ae00000ull
+#define POLARIS_DPU_VERSION    0x40000001u
+#define POLARIS_DPU_SSPP0      0x5000
+#define POLARIS_DPU_CTL0       0x2000
+#define POLARIS_DPU_SRC_SIZE   0x00
+#define POLARIS_DPU_SRC_ADDR   0x14
+#define POLARIS_DPU_YSTRIDE    0x24
+#define POLARIS_DPU_FLUSH      0x18
+#define POLARIS_DISPLAY_BASE   0x9d400000ull
+#define POLARIS_DISPLAY_BYTES  0x02400000ull
+#define DPU_FLUSH_TIMEOUT_NS   (40 * NSEC_PER_MSEC)
+
+extern "C" uint64_t kvtophys(vm_offset_t va);
+extern "C" void loader_log_putc(char c);
+static volatile uint32_t * gFlipPipe, * gFlipCtl;
+static uint32_t gFlipBoot;
+
+static bool
+dpuWaitFlush(volatile uint32_t * ctl)
+{
+	uint64_t began = mach_absolute_time(), ns = 0;
+
+	while ((ctl[POLARIS_DPU_FLUSH / 4] & 1) != 0) {
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		if (ns >= DPU_FLUSH_TIMEOUT_NS) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Called after the other CPUs have stopped and before the loader reuses kernel memory. */
+extern "C" void
+MiniIOFlipQuiesce(void)
+{
+	if (gFlipPipe == NULL || gFlipCtl == NULL || gFlipBoot == 0) {
+		return;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = gFlipBoot;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	(void) dpuWaitFlush(gFlipCtl);
+	static const char line[] = "MiniIOMobileFramebuffer: DPU returned to the boot framebuffer\n";
+	for (const char * p = line; *p != '\0'; p++) {
+		loader_log_putc(*p);
+	}
+}
+
 static vm_offset_t
 panelInterface(void)
 {
@@ -347,6 +401,13 @@ class IOMobileFramebuffer : public IOService
 public:
 	IOLock *        fLock;
 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+	bool            fFlipOn;                /* Polaris fb_flip: fBase is the backbuffer; the DPU scans fFlipFront */
+	uint8_t *       fFlipBuffer[2];
+	uint32_t        fFlipPhysical[2];
+	IOMemoryDescriptor * fFlipDescriptor;
+	IOMemoryMap *   fFlipMap;
+	unsigned        fFlipFront;
+	uint32_t        fFlipCount;
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
@@ -425,6 +486,9 @@ public:
 	uint32_t        fRecCosted;             /* ... of how many frames: a line every 120 */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	void flipSetup(void);
+	void flipPresent(void);
+	void flipDisable(void);
 	void publishModes(void);
 	void publishRefresh(void);
 	MiniIOSurface * defaultSurface(void);
@@ -561,6 +625,155 @@ IOMobileFramebuffer::publishModes(void)
 	OSSafeReleaseNULL(color);
 }
 
+void
+IOMobileFramebuffer::flipSetup(void)
+{
+	vm_offset_t mdss;
+	volatile uint32_t * top, * pipe, * ctl;
+	uint64_t physical, bytes, slotSize, slotPhysical;
+	uint32_t source, expectedSize;
+
+	if (gFBFlip == 0) {
+		return;
+	}
+	if (gFBFlip != 1) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip=%u is unsupported; using the boot framebuffer\n", gFBFlip);
+		return;
+	}
+	mdss = ml_io_map((vm_offset_t) POLARIS_DPU_MDSS, 0x10000);
+	if (mdss == 0) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: cannot map SDM845 MDSS; using the boot framebuffer\n");
+		return;
+	}
+	top = (volatile uint32_t *) mdss;
+	if (top[0] != POLARIS_DPU_VERSION) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: MDSS version %#x is not DPU 4.0; using the boot framebuffer\n", top[0]);
+		return;
+	}
+	pipe = (volatile uint32_t *) (mdss + POLARIS_DPU_SSPP0);
+	ctl = (volatile uint32_t *) (mdss + POLARIS_DPU_CTL0);
+	expectedSize = (fPanelHeight << 16) | fPanelWidth;
+	if (pipe[POLARIS_DPU_SRC_SIZE / 4] != expectedSize || pipe[POLARIS_DPU_YSTRIDE / 4] != fRowBytes) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: SSPP0 size %#x stride %#x do not match %ux%u stride %u; using the boot framebuffer\n",
+		    pipe[POLARIS_DPU_SRC_SIZE / 4], pipe[POLARIS_DPU_YSTRIDE / 4], fPanelWidth, fPanelHeight, fRowBytes);
+		return;
+	}
+	physical = kvtophys((vm_offset_t) fBase);
+	bytes = (uint64_t) fRowBytes * fPanelHeight;
+	if (physical != POLARIS_DISPLAY_BASE || bytes == 0 || bytes > POLARIS_DISPLAY_BYTES || physical > UINT32_MAX) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: framebuffer %#llx (%ux%u, %llu bytes) is outside the Polaris reserved scanout region\n",
+		    (unsigned long long) physical, fPanelWidth, fPanelHeight, (unsigned long long) bytes);
+		return;
+	}
+	slotSize = round_page(bytes);
+	slotPhysical = physical + slotSize;
+	if (slotSize == 0 || slotPhysical + slotSize > POLARIS_DISPLAY_BASE + POLARIS_DISPLAY_BYTES ||
+	    slotPhysical > UINT32_MAX) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: two %llu-byte scanout slots do not fit the 36 MiB reserved region\n",
+		    (unsigned long long) slotSize);
+		return;
+	}
+	if (!dpuWaitFlush(ctl)) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: DPU flush stayed busy for 40 ms; using the boot framebuffer\n");
+		return;
+	}
+	source = pipe[POLARIS_DPU_SRC_ADDR / 4];
+	if (source != (uint32_t) physical) {
+		/* Recover from a zero or stale SRC0_ADDR left by a previous failed scanout attempt. */
+		IOLog("MiniIOMobileFramebuffer: fb_flip: restoring SSPP0 source %#x to firmware framebuffer %#llx\n", source,
+		    (unsigned long long) physical);
+		pipe[POLARIS_DPU_SRC_ADDR / 4] = (uint32_t) physical;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		ctl[POLARIS_DPU_FLUSH / 4] = 1;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		if (!dpuWaitFlush(ctl)) {
+			IOLog("MiniIOMobileFramebuffer: fb_flip: DPU did not latch firmware framebuffer; not enabling flips\n");
+			return;
+		}
+	}
+	fFlipDescriptor = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) slotPhysical,
+	    (IOByteCount) slotSize, kIODirectionInOut);
+	fFlipMap = fFlipDescriptor != NULL ? fFlipDescriptor->map(kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
+	if (fFlipMap == NULL) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: cannot map reserved scanout buffer at %#llx; using the boot framebuffer\n",
+		    (unsigned long long) slotPhysical);
+		OSSafeReleaseNULL(fFlipMap);
+		OSSafeReleaseNULL(fFlipDescriptor);
+		return;
+	}
+	fFlipPhysical[0] = (uint32_t) physical;
+	fFlipPhysical[1] = (uint32_t) slotPhysical;
+	fFlipBuffer[0] = fBase;
+	fFlipBuffer[1] = (uint8_t *) fFlipMap->getVirtualAddress();
+	memcpy(fFlipBuffer[1], fFlipBuffer[0], (size_t) bytes);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	fFlipFront = 0;
+	fFlipOn = true;
+	fBase = fFlipBuffer[1];
+	gFlipPipe = pipe;
+	gFlipCtl = ctl;
+	gFlipBoot = (uint32_t) physical;
+	IOLog("MiniIOMobileFramebuffer: fb_flip=1: SDM845 DPU 4.0; scanout buffers %#x and %#x, %ux%u stride %u (%llu bytes each)\n",
+	    fFlipPhysical[0], fFlipPhysical[1], fPanelWidth, fPanelHeight, fRowBytes, (unsigned long long) bytes);
+}
+
+void
+IOMobileFramebuffer::flipDisable(void)
+{
+	uint64_t bytes = (uint64_t) fRowBytes * fPanelHeight;
+	bool restored;
+
+	if (!fFlipOn) {
+		return;
+	}
+	if (fBase != fFlipBuffer[0]) {
+		memcpy(fFlipBuffer[0], fBase, (size_t) bytes);
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = gFlipBoot;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	restored = dpuWaitFlush(gFlipCtl);
+	fFlipOn = false;
+	fFlipFront = 0;
+	fBase = fFlipBuffer[0];
+	IOLog("MiniIOMobileFramebuffer: fb_flip: disabled after a DPU timeout; firmware framebuffer %s restored\n",
+	    restored ? "is" : "may not be");
+}
+
+void
+IOMobileFramebuffer::flipPresent(void)
+{
+	unsigned next;
+
+	if (!fFlipOn) {
+		return;
+	}
+	if (!dpuWaitFlush(gFlipCtl)) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: previous DPU flush did not complete\n");
+		flipDisable();
+		return;
+	}
+	next = 1 - fFlipFront;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = fFlipPhysical[next];
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!dpuWaitFlush(gFlipCtl)) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: DPU did not latch buffer %#x within 40 ms\n", fFlipPhysical[next]);
+		flipDisable();
+		return;
+	}
+	fFlipFront = next;
+	fBase = fFlipBuffer[1 - fFlipFront];
+	if (++fFlipCount <= 4 || fFlipCount % 300 == 0) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: latched buffer %u at %#x (flip %u)\n", fFlipFront,
+		    fFlipPhysical[fFlipFront], fFlipCount);
+	}
+}
+
 bool
 IOMobileFramebuffer::start(IOService * provider)
 {
@@ -600,6 +813,12 @@ IOMobileFramebuffer::start(IOService * provider)
 		thread_deallocate(thread);
 	}
 	fBase = (uint8_t *) vinfo.v_baseaddr;
+	fFlipOn = false;
+	fFlipBuffer[0] = fFlipBuffer[1] = NULL;
+	fFlipPhysical[0] = fFlipPhysical[1] = 0;
+	fFlipDescriptor = NULL;
+	fFlipMap = NULL;
+	fFlipFront = fFlipCount = 0;
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
@@ -637,6 +856,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	fDiffLeft = fDiffTop = ~0u;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
+	flipSetup();
 
 	if (gRecSeconds != 0) {
 		/* one piece of physical memory: the loader will send it over USB as it lies */
@@ -1409,6 +1629,11 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 		return;
 	}
 	fSettling = true;
+	if (fFlipOn) {
+		unsigned draw = 1 - fFlipFront;
+		memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
+		fBase = fFlipBuffer[draw];
+	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		MiniIOSurface * s = surfaces[layer];
 
@@ -1420,6 +1645,7 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 		drawLayer(s, src, dst);
 	}
 	fSettling = false;
+	flipPresent();
 	fStatSettled++;
 }
 
@@ -1477,6 +1703,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
 	IOLockLock(fLock);
+	if (fFlipOn) {
+		unsigned draw = 1 - fFlipFront;
+		memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
+		fBase = fFlipBuffer[draw];
+	}
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
 		nanos /= NSEC_PER_MSEC;
@@ -1543,6 +1774,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	flipPresent();
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
