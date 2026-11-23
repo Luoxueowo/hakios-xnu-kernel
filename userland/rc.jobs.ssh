@@ -1,5 +1,5 @@
 # Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
-# A way in over the network (RC_JOBS=rc.jobs.ssh, with wifi=1 among XL_CMDLINE and a long XL_SECS):
+# A way in over the network (RC_JOBS=rc.jobs.ssh, with wifi=1 among XL_CMDLINE):
 # the phone's radio joins the network named in fw-wifi/network, configd gives en0 an address, and
 # OpenSSH from the package manager's prefix lets us log in as root with the key in
 # ssh/authorized_keys, which build.sh puts on the data volume. That spares a rebuilt image and a

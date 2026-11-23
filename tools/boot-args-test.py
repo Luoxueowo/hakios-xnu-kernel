@@ -87,9 +87,9 @@ try:
     check("the groups: the GPU file's argument is under GPU and display", "## GPU and display" in run(d, "--markdown").stdout)
     check("the page says which layers read ku_both", "| `ku_both` | KLU |" in run(d, "--markdown").stdout, run(d, "--markdown").stdout[-400:])
 
-    # the symbols: one for each argument, its meaning where the source documents it, none for what the tools set
+    # the symbols: one for each argument, its meaning where the source documents it
     symbols = {l.split("\t")[2]: l.split("\t") for l in run(d, "--symbols").stdout.splitlines()}
-    check("a symbol for each argument (and none for loader_return_after-style ones set by the tools)", "k_direct" in symbols and "u_helper" in symbols, sorted(symbols))
+    check("a symbol for each argument", "k_direct" in symbols and "u_helper" in symbols, sorted(symbols))
     check("the symbol's name is the argument's, upper case", symbols["k_tunable"][0] == "K_TUNABLE", symbols.get("k_tunable"))
     check("an argument read as text still gets a symbol", "k_string" in symbols, sorted(symbols))
     check("without a documentation line the meaning is who reads it", "read by hakios.adreno.c" in symbols["k_direct"][6] or symbols["k_direct"][6] == "", symbols["k_direct"])

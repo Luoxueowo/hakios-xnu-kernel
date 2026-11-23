@@ -11,7 +11,7 @@
 #   make qemu            a 20-minute session in QEMU (needs the Darwin images)
 #   make qemu-open       boot the open kernel in QEMU with NO Apple software
 #                        (kernel + the hello RAM disk + a placeholder loader)
-#   make phone           a session on the phone, then back to Android (tools/modem-cycle.sh)
+#   make phone           a phone run; end it with ./xl stop (tools/modem-cycle.sh)
 #   make prebuilt        refresh prebuilt/ from what was built (tools/update-prebuilt.sh)
 #   make clean           build output of the kernel, loader and images
 #   make doctor          check this machine and a phone on adb for what HakiOS needs (tools/doctor.sh)
@@ -34,7 +34,7 @@
 #
 #   DEVICE=redwood   the device directory under devices/ (default redwood)
 #   ARGS="..."           kernel arguments for make phone (default: the .config's, else everything the phone has)
-#   SECS=600             the session's length for make phone / make qemu
+#   SECS=600             the QEMU session length for make qemu / make qemu-open
 #   JOBS=8               parallel jobs for the kernel build
 
 DEVICE ?= redwood
@@ -130,7 +130,7 @@ qemu-u-boot: kernel loader-open hello
 
 phone:
 	[ ! -f .config ] || tools/hakios-config.py check
-	XL_SB_DELAY=8 $(RUNNER_BASE) tools/modem-cycle.sh "$(ARGS)" $(SECS)
+	XL_SB_DELAY=8 $(RUNNER_BASE) tools/modem-cycle.sh "$(ARGS)"
 
 # The loader and a payload (make qemu-open makes qemu/payload.bin; xnuloader/mkpayload.py makes any other) as the files an
 # EFI system partition holds, which the loader reads itself: UEFI-native boot. The default tree is made again each time.

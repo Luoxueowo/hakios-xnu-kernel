@@ -23,7 +23,7 @@
 # ufs_shared_pa= before reaching for reload. Then
 # `./xl ramdisk userland/flashboot.apfs`, then
 #   XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 \
-#               adsp=1 wifi=1" XL_SECS=260 ./xl run
+#               adsp=1 wifi=1" ./xl run  # stop manually after the check
 # built with CRYPTEXES=flash FLASHBOOT=1 PREBUILT=1 REST=1 RC_JOBS=rc.jobs.fairplay OSLOG=com.apple.fairplayd.H2
 /polaris/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 wait 10
 /bin/ps -A

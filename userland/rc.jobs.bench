@@ -1,5 +1,5 @@
 # Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
-# The frame-rate benchmark (RC_JOBS=rc.jobs.bench, touch_lat=1, SECS=180; tools/frames.py): unlock, a minute for the
+# The frame-rate benchmark (RC_JOBS=rc.jobs.bench, touch_lat=1; tools/frames.py): unlock, a minute for the
 # start-up work to be over (src/cputop.c beside it says whether it was; the home screen's layout is the same in every
 # boot once the widgets are up), then four times the same round -- Settings opened from its icon, its list scrolled,
 # the home button, a page swipe there and back -- so that each kind of motion is measured four times in the same state

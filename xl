@@ -16,7 +16,7 @@
 #                       pictures of them (P-0.png, ...; default prefix logs/camera)
 #   xl selftest         exercise only the kernel->loader return path
 #   xl log              fetch the loader's current log; during a run, the kernel's log so far as well
-#   xl stop             end the run in progress now (the kernel returns as when its time is up)
+#   xl stop             end the run in progress now
 #   xl hang             watchdog test: make the loader hang on purpose
 #   xl reboot           cold-reset the phone (back to Android)
 #   xl reload           restart the phone into a freshly built loader (after changing xnuloader/)
@@ -26,7 +26,6 @@
 # Logs land in logs/. Environment for `run`:
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
 #               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
-#   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
 #   XL_FOLLOW=N fetch the kernel's log every N seconds during a run (default 10; XL_FOLLOW= for never), so that a kernel
 #               that hangs leaves what it said in logs/<time>-run.log.live; after a hang `run` brings the phone back to
 #               Android itself, or says what to press if it is stuck on the logo
@@ -183,13 +182,17 @@ run() { # run <oem command> <label>
 		echo "xl: warning: a kernel has already run in this session of the loader, and a second one has died at once every time it was tried"
 	fi
 	enter || return 1
+	local live=; live_loader && live=1
+	if [ "$1" != "oem selftest" ] && [ -z "$live" ]; then
+		echo "xl: this loader cannot monitor or stop a running kernel; use ./xl reload to load the current loader first" >&2
+		return 1
+	fi
 	exec 8> $PHONE.run
 	flock -n 8 || { echo "xl: a run is in progress, started from $(cat $PHONE.who 2>/dev/null) (xl stop ends it)"; return 1; }
 	pwd > $PHONE.who
 	local stamp log result
 	stamp=$(date +%H%M%S); log="logs/$stamp-$2.log"
 	if [ "$1" != "oem selftest" ]; then
-		# The kernel hands control back after XL_SECS seconds even if it is just waiting.
 		local rd=${XL_RAMDISK:-userland/root.apfs}
 		case "$rd" in
 		none|resident) rd= ;;
@@ -220,21 +223,20 @@ run() { # run <oem command> <label>
 		case " $args " in
 		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac
-		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
+		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
-	local live=; live_loader && live=1
 	fb $1 >/dev/null
 	if [ -n "$live" ] && [ "$1" != "oem selftest" ]; then
 		# the loader goes on answering: ask every two seconds until the result is no longer "running".
 		# XL_FOLLOW=N: fetch the log as it stands every N seconds as well, so that a phone that
 		# resets without a word leaves all it said up to then ($log.live)
 		local XL_FOLLOW=${XL_FOLLOW-10}      # (a run that hangs leaves $log.live: what the kernel said up to a few seconds before)
-		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s)
+		local followed=$(date +%s)
 		while :; do
 			result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
 			case "$result" in ""|*running*) ;; *) break ;; esac
-			[ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
+			if [ -z "$result" ] && [ "$(state)" != loader ]; then result=; break; fi
 			if [ -n "$XL_FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$XL_FOLLOW" ]; then
 				followed=$(date +%s)
 				# (XL_FOLLOW_KEEP=1: every one kept, $log.live.1, .2, ...: a long run's middle, which the log
@@ -245,7 +247,7 @@ run() { # run <oem command> <label>
 			sleep 2
 		done
 	else
-		result=$(FB_TIMEOUT=$(( ${XL_SECS:-8} + 100 )) fb getvar result | grep '^result:')
+		result=$(FB_TIMEOUT=60 fb getvar result | grep '^result:')
 	fi
 	if [ -z "$result" ]; then
 		echo "xl: no answer — the kernel hung; waiting for the watchdog to reset the phone"

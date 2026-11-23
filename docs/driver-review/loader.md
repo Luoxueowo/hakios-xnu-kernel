@@ -263,7 +263,7 @@ Payload parsing
   before it is read (`p + 24 <= pend`).
 - str_eq against literals never reads beyond the literal's length + 1, so a name without a NUL in 16 bytes is not over-read by matching.
 - The cmdline scans in run_kernel (2854-2873, 2899-2906, 2937-2939, 2959-2960, 2975-2977) test `c[-1]` only for `c > pi.cmdline` (via `c == pi.cmdline ||`), and never read past a NUL.
-  `loader_return_after=` digit loop stops at NUL; `kernel_budget` can wrap with 20+ digits (only effect: stops petting the watchdog sooner).
+  the loader no longer parses a run-duration boot argument; while it watches a kernel on another core, it keeps feeding the watchdog and detects a stalled heartbeat.
 - mkpayload.py NUL-terminates every text entry inside the entry's size and pads to 16; its header size covers the 24-byte terminator; mkesp.py's PAYLOAD_LIMIT equals the loader's
   `PAYLOAD_MAX_SIZE - 0x100000`.
 

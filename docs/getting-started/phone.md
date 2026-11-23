@@ -8,7 +8,7 @@ Other phones need a port first: [Port a device](../porting/index.md).
 ## What happens in a Redwood RAM session
 
 Nothing is installed by this session workflow. The loader goes into RAM with `fastboot boot`, the system image is sent into RAM, a
-session runs for as long as you say, and a reboot brings the phone back to its own Android. The one thing written by default is the
+session stays active until you end it with `./xl stop`, and a reboot brings the phone back to its own Android. The one thing written by default is the
 loader's own log, a few KB, to the phone's `logdump` partition. This description applies to these Redwood commands; it is not the
 MIX 2S install or update procedure. [What is written, exactly](../concepts/architecture.md#what-is-written-to-the-phone).
 
@@ -29,7 +29,7 @@ tools/hakios-device.py sync         # hakios-sm7325 (with its SoC layer) into de
 devices/redwood/pull-firmware.sh    # Android running, on adb: GPU, Wi-Fi, audio, haptics, modem, cameras -> fw-*/
 make redwood_defconfig              # the phone's configuration: the common kernel, the SC7280's, the phone's own
 make config                         # what it is: the drivers built in, the kernel's arguments, the firmware it wants
-make phone SECS=600                 # a 10-minute session with the .config's arguments
+make phone                          # run with the .config's arguments; finish with ./xl stop
 ```
 
 `make phone` checks the `.config` and runs `tools/modem-cycle.sh`: it waits for the phone, enters the loader, uploads the system
@@ -41,7 +41,8 @@ The same by hand, one step at a time:
 ```sh
 ./xl enter                          # Android -> fastboot -> our loader in RAM
 ./xl ramdisk userland/system.apfs   # the system image into the phone's RAM (about 80 s), once per loader session
-XL_SECS=600 XL_CMDLINE="$(tools/hakios-config.py args)" ./xl run     # a session; the log goes to logs/
+XL_CMDLINE="$(tools/hakios-config.py args)" ./xl run     # the run stays active until stopped
+./xl stop                           # after the checks are done
 ./xl reboot                         # back to Android
 ```
 
@@ -67,7 +68,7 @@ A configuration sets them for you (`CONFIG_GPU=y` is `gpu=1`); [every argument](
 
 | You see | Do |
 |---|---|
-| a session that does not end | `./xl` leaves its log in `logs/` and brings the phone back from the boot loader, or tells you which keys to press |
+| you want to end a session | run `./xl stop` from another terminal; `./xl run` then saves its log in `logs/` |
 | the phone getting hot | with `thermal=1` (the SC7280's fragment sets it) the run is handed back to the loader at 105 °C; `thermal_stop=N` changes the limit. Seen on the phone, 27 October 2026: `thermal: ... stop at 105 C` |
 | a run left alone on battery | `battery_stop=<percent>` ends it before the battery is flat |
 | a problem in `make config` | it names the symbol and why: a driver left out that an argument needs, firmware the open profile does not load |

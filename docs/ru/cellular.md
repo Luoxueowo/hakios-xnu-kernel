@@ -72,7 +72,8 @@ TrustZone пускает модем вызовом `SCM MP ASSIGN` (HLOS + MSS_M
 
 ```sh
 ./xl enter && ./xl ramdisk userland/system.apfs    # образ с MODEM=1 SYSTEM=1 (один раз после входа в загрузчик)
-XL_CMDLINE="debug=0x8 rd=md0 hv_wdt_pet=1 bootcpu=7 cpus=8 cpufreq=1 sb_delay=600 ufs=2 modem_step=11 modem_return=1 modem_new=12 modem_nas_wait=60" XL_SECS=300 XL_FOLLOW=3 ./xl run
+XL_CMDLINE="debug=0x8 rd=md0 hv_wdt_pet=1 bootcpu=7 cpus=8 cpufreq=1 sb_delay=600 ufs=2 modem_step=11 modem_return=1 modem_new=12 modem_nas_wait=60" XL_FOLLOW=3 ./xl run
+# Когда проверка завершится, остановить сеанс: ./xl stop (из другого терминала).
 ```
 
 `modem=1` в обычной загрузке делает всё то же на своём потоке и оставляет модем включённым,
@@ -290,8 +291,8 @@ Register = `UIM_UNINITIALIZED`: SIM ще ініціалізується післ
   USIM у стані 1 «detected» — не READY, і первинний GW-додаток «немає». Наш код прив'язував
   provisioning-сесію лише до READY-карти, тож нічого не робив. Виправлено: «detected» USIM теж
   робиться первинним GW-додатком (UIM 0x38), після чого модем має її ініціалізувати.
-- «Absent» наприкінці кожного прогону — не крах: лоадер годує watchdog гіпервізора лише
-  `loader_return_after` + 60 с, далі телефон скидається і за 2–3 хвилини сам завантажує Android.
+- «Absent» наприкінці старих запусків не означав збій: тодішній сценарій завершував сеанс за таймером, після чого
+  watchdog перезапускав телефон, а Android завантажувався за 2–3 хвилини. Тепер сеанс завершується командою `./xl stop`.
 
 ### 2.0: канал даних IPA і en1 (25 жовтня)
 

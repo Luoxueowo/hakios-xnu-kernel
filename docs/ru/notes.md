@@ -254,8 +254,9 @@ adb pull /vendor/firmware/aw8697_haptic.bin fw-haptic/                          
 ```sh
 ./xl enter            # Android → fastboot → наш загрузчик в ОЗУ (fastboot boot), он поднимает свой USB-канал
 ./xl ramdisk          # залить образ системы в ОЗУ телефона (2,5 ГБ, ~80 с) — один раз на сеанс загрузчика
-XL_SECS=900 XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8" ./xl run     # 15 минут Darwin
-./xl screenshot shot.png      # что осталось на экране после возврата
+XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8" ./xl run     # Darwin работает до ./xl stop
+./xl stop                     # закончить сеанс из другого терминала
+./xl screenshot shot.png      # экран после возврата в загрузчик
 ./xl reboot                   # обратно в Android
 ```
 
@@ -294,12 +295,12 @@ XL_SECS=900 XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8" ./xl run     #
 один раз** и в целом не стоит вовсе. Четыре прогона одного и того же набора на 225 модулей, все
 собранные с `QUIET=1`:
 
-| окно | размер журнала | маркеров | модулей в журнале |
+| прежнее окно сеанса | размер журнала | маркеров | модулей в журнале |
 | --- | --- | --- | --- |
-| `XL_SECS=300` | 1 466 579 | 1 | 2 |
-| `XL_SECS=120` | 1 466 582 | 1 | 28 |
-| `XL_SECS=30` | 1 185 596 | 0 | **225** |
-| `XL_SECS=30` | 1 166 253 | 0 | **225** |
+| 300 с | 1 466 579 | 1 | 2 |
+| 120 с | 1 466 582 | 1 | 28 |
+| 30 с | 1 185 596 | 0 | **225** |
+| 30 с | 1 166 253 | 0 | **225** |
 
 **Грепать надо точный текст маркера, а не `was dropped`:** в ядре есть своя строка
 `buttons: reading the PMK8350's power-on block: the transfer was dropped`, и свободный греп считает
@@ -307,7 +308,7 @@ XL_SECS=900 XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8" ./xl run     #
 (и мы с другой сессией заключили), будто число маркеров ничего не значит. Оно значит: ноль или один.
 
 Укладываться в предел помогают два рычага, и ни одного из них по отдельности не достаточно: короткое
-окно (`XL_SECS`) и `QUIET=1` при сборке, который отправляет в никуда собственный поток launchd — те самые
+окно запуска и `QUIET=1` при сборке, который отправляет в никуда собственный поток launchd — те самые
 тысячи строк `com.apple.xpc.launchd|…`, — оставляя демонам их вывод в консоли. С `QUIET=1`, но окном
 120 с вывод всё равно теряется (таблица выше); без `QUIET=1` он теряется и на 40 с, потому что поток
 определяется числом служб (`REST=1` — это ~350 служб), а не длительностью. Нужно и то и другое.
@@ -375,7 +376,6 @@ XL_SECS=900 XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8" ./xl run     #
 | `privs=0` | привилегии ядра (`priv_check_cred`) процессам не от root — только `PRIV_WORK_INTERVAL`, как раньше. По умолчанию заглушка песочницы (`bsd/kern/kern_minimac.c`) даёт привилегию процессу, у которого в подписи есть право, что к ней относится, — так делает и песочница Darwin; имена прав — те, что носят программы самой Darwin: dasd — «vm-pressure-level», symptomsd и aggregated — `com.apple.private.network.statistics`, mediaserverd и mDNSResponder — `com.apple.private.network.socket-delegate` (без него NECP писал «does not hold the necessary entitlement to delegate network traffic»), и так далее, сорок привилегий. Права читаются у текущего процесса, поэтому только когда спрашивают о его собственных полномочиях: проверки, которые NECP делает за trustd и сетевой процесс WebKit в потоке ядра, по-прежнему получают отказ. Отказ, как и раньше, пишется в журнал один раз на привилегию |
 | `xpcproxy_idversion=1` | процесс, которым становится xpcproxy (так launchd запускает службы XPC), при exec получает новую версию идентичности, как в XNU. По умолчанию он сохраняет версию xpcproxy, как если бы launchd запустил службу сам — это и значит «elide xpcproxy», о чём launchd пишет, но здесь всё равно запускает xpcproxy (`bsd/kern/kern_exec.c`). RunningBoard держит маркер аудита такого процесса из времени до exec и нового не берёт: каждая его проверка прав для такого процесса кончалась ошибкой (SecTaskLoadEntitlements error 3 — тысяча раз в минуту при открытом Safari), а веб-процессы Safari не получали утверждений («target is not running or doesn't have entitlement com.apple.runningboard.assertions.webkit»). С версией xpcproxy — ни одной такой ошибки |
 | `wfi=0 wfe_mode=0` | простаивающее ядро процессора не засыпает, а крутится в цикле, как всегда было с одним ядром (с `cpus=N` простой — это WFI; на случай, если под гипервизором телефона он поведёт себя плохо) |
-| `return_cpu=N`, `return_panic=1` | для проверки возврата в загрузчик с несколькими ядрами: вернуться по таймеру с процессора N (по номеру в ядре: 0 — загрузочный) и/или через панику |
 | `gpu=1` | рисовать графическим процессором телефона (образ с `GL=1`, прошивки в `fw-gpu/`; см. раздел «GPU»). Без него, без прошивок и в QEMU всё рисует программный рендер CoreAnimation |
 | `virtio_net=1` | (QEMU; `QEMU_NET=1` добавляет его сам) сетевой интерфейс `en0` на сетевой карте virtio. `net_names=1` — писать в журнал каждое имя, которое система спрашивает у DNS, и каждое начатое TCP-соединение; `net_trace=N` — строка о каждом из первых N кадров |
 | `adreno=N` | опыт с GPU телефона: первые N шагов его пробуждения (питание, такты, первые регистры), каждый шаг пишет в журнал, что собирается тронуть и что прочёл; шаги и остальные параметры описаны в начале `drivers/gpu/hakios.adreno.c` |
@@ -770,7 +770,8 @@ CRYPTEXES=flash FLASHBOOT=1 GL=1 REST=1 QUIET=1 RC_JOBS=rc.jobs.jb \
     '/polaris/lib/libhakios.sb.dylib SpringBoard' '/polaris/lib/libhakios.media.dylib mediaserverd' \
     '/polaris/lib/libhakios.app.dylib Sileo')" userland/build.sh
 ./xl ramdisk userland/flashboot.apfs
-XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1" XL_SECS=1800 ./xl run
+XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1" ./xl run
+# После проверки закончить сеанс: ./xl stop
 ```
 
 Проверено на телефоне с корнем на флеше: Sileo появляется на домашнем экране и открывается, обновляет
@@ -809,7 +810,7 @@ mobilesubstrate` (а это почти все твики, и `preferenceloader` 
 
 Проверки: `RC_JOBS=rc.jobs.sileo` — подготовка, `apt-get update`, затем весь путь человека в Sileo до установки
 `tree` и что о нём говорит dpkg; `rc.jobs.jbreg` с `EXTRA=<пакет с приложением>.deb` — `dpkg -i` и регистрация
-его приложения; `rc.jobs.jb` — ничего по сценарию, телефон ваш на `XL_SECS`. Поставленное не переживает
+его приложения; `rc.jobs.jb` — ничего по сценарию, телефон остаётся вашим до `./xl stop`. Поставленное не переживает
 перезагрузку (как и всё в `/private/var`).
 
 ## Накопитель телефона (UFS)
@@ -915,7 +916,8 @@ apfs_mnt=/lib`; теперь — `apfs_mnt=/System/Volumes/Darwin`, катало
 ```sh
 SYSTEM=1 REST=1 RC_JOBS=rc.jobs.darwin userland/build.sh
 ./xl ramdisk userland/system.apfs
-XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 ufs=2 apfs_volume=ufs_darwin" XL_SECS=180 ./xl run
+XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 ufs=2 apfs_volume=ufs_darwin" ./xl run
+# После проверки закончить сеанс: ./xl stop
 ```
 
 Darwin доходит до домашнего экрана как обычно, а `rc.jobs.darwin` показывает из пространства пользователя:
@@ -937,7 +939,8 @@ Darwin доходит до домашнего экрана как обычно, 
 ```sh
 CRYPTEXES=flash FLASHBOOT=1 GL=1 REST=1 RC_JOBS=rc.jobs.flashcheck userland/build.sh
 ./xl ramdisk userland/flashboot.apfs
-XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1" XL_SECS=180 ./xl run
+XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1" ./xl run
+# После проверки закончить сеанс: ./xl stop
 ```
 
 Darwin доходит до того же домашнего экрана, что и с образа в памяти (SpringBoard готов через 6,1–6,3 с против
@@ -1061,7 +1064,7 @@ CACHE, WRITE BUFFER, SECURITY PROTOCOL, MODE SELECT, QUERY, задачи упр�
   блоков и 32 невыровненных куска `darwin`: 377 кусков, 1 176 564 110 байт, различий 0, ошибок 0, до 31 запроса
   в полёте, 61 переключение и 61 доказательство;
 - плохие концовки посреди чтения тома: `xl stop` (в момент входа в `loader_return` в полёте был один запрос — он
-  дождан) и паника нарочно (`return_panic=1`): список UEFI на месте, журнал в `logdump`; после паники обычный
+  дождан) и намеренная паника: список UEFI на месте, журнал в `logdump`; после паники обычный
   прогон через почтовый ящик (`ufs_bench=1`) — как всегда;
 - весь том с `/dev/ufs_darwin` (`apfs_check=6`; `apfs_walkers=N` — N потоков обхода с общим стеком каталогов,
   суммы построчных хешей складываются, так что итог тот же): 318 098 записей, 8 285 771 220 байт, сумма
@@ -1168,7 +1171,8 @@ CACHE, WRITE BUFFER, SECURITY PROTOCOL, MODE SELECT, QUERY, задачи упр�
 ```sh
 FLASHBOOT=1 GL=1 REST=1 RC_JOBS=rc.jobs.flashlock userland/build.sh
 ./xl ramdisk userland/flashboot.apfs
-XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1" XL_SECS=120 ./xl run
+XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1" ./xl run
+# После проверки закончить сеанс: ./xl stop
 ```
 
 Числа этого раздела и следующего сняты ещё с образами packfs, с `battery=1` и без `gpu=1` (программный рендер):
@@ -1476,20 +1480,20 @@ inode встретился впервые. Не сохраняются соке�
   записи, читает через загрузчик, собранный после неё, и наоборот.
 
 **Сохраняется само, просить не надо.** Задание `com.hakios.varstore` (`var_store watch`) остаётся на весь
-прогон и объявляется ядру (`kern.hakios.var_save`). Когда прогон кончается по-хорошему — вышло время
-`loader_return_after` или хозяин сказал `./xl stop`, — ядро в том самом потоке, который сейчас вернёт управление
+прогон и объявляется ядру (`kern.hakios.var_save`). Когда прогон кончается по-хорошему — хозяин сказал
+`./xl stop`, — ядро в том самом потоке, который сейчас вернёт управление
 загрузчику, просит том и ждёт ответа (`drivers/storage/hakios.ufs.c`, `hakios_var_save_on_return`), и только потом
 отдаёт GPU, процессоры звука и Wi-Fi и уходит. Чего при этом не должно случиться и как это не случается:
 
 - **Ждать некого.** Если никто не объявился, ядро не просит и не ждёт ни миллисекунды: прогон без хранителя
-  возвращается точно как раньше. Измерено: прогон без `var_store=1` (`logs/185052-run.log`) — в журнале
-  `var_store: not asked to keep the data volume: nothing to watch`, строки «the run is ending» нет вовсе, и
-  `./xl run` занял 204,90 с при `XL_SECS=200`, то есть ровно столько же, сколько занимал всегда; с хранителем
-  (`logs/203020-run.log` и далее) те же 200 с плюс 8,5–9,0 с на сам том. Паника этим путём не идёт вовсе —
+  завершается без ожидания. Измерено: прогон без `var_store=1` (`logs/185052-run.log`) — в журнале
+  `var_store: not asked to keep the data volume: nothing to watch`, строки «the run is ending» нет вовсе. В старом
+  измерении `./xl run` занял 204,90 с, включая около 200 с работы; с хранителем (`logs/203020-run.log` и далее)
+  к этому добавлялось 8,5–9,0 с на сам том. Паника этим путём не идёт вовсе —
   спрашивать уже некого, — и хранилище остаётся с тем, что в нём было.
-- **Ждать слишком долго.** Не дольше 20 с (`var_save_ms=N`), и в журнале сказано, сколько ждали. Загрузчик кормит
-  сторожевой таймер ещё минуту после срока прогона, а хозяин ждёт ответа сто секунд после него, так что эти
-  секунды с запасом внутри обоих. Упаковка и запись 120–160 МБ занимают 6–7 с.
+- **Ждать слишком долго.** Не дольше 20 с (`var_save_ms=N`), и в журнале сказано, сколько ждали. Загрузчик
+  продолжает наблюдать за ядром, пока оно работает, а `xl run` ждёт ответ о завершении. Упаковка и запись
+  120–160 МБ занимают 6–7 с.
 - **Два сохранения разом.** Запись в хранилище отказывается (`EPERM`), если пишущий не держит заявку
   (`kern.hakios.var_busy`), а заявку держит один процесс; заявку, оставленную умершим процессом, следующий
   забирает себе. Да и столкнувшись, двое испортили бы только тот слот, в который пишут, — а это никогда не тот, в
@@ -1507,7 +1511,6 @@ inode встретился впервые. Не сохраняются соке�
 
 | как кончился прогон | сохраняется |
 |---|---|
-| вышло время `loader_return_after` | да, проверено (`logs/204450-run.log` и далее) |
 | хозяин сказал `./xl stop` | да, проверено (`logs/220747-run.log`: «the host asked for the end of the run», затем «the run is ending» и сохранение) |
 | ядро повисло так, что не идут даже `thread_call`, или паника | **нет** |
 
@@ -1555,7 +1558,8 @@ inode встретился впервые. Не сохраняются соке�
 ```sh
 CRYPTEXES=flash FLASHBOOT=1 GL=1 REST=1 RC_JOBS=rc.jobs.persist userland/build.sh
 ./xl ramdisk userland/flashboot.apfs
-XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 ufs_write=1 var_store=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1" XL_SECS=200 ./xl run
+XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 ufs_write=1 var_store=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1" ./xl run
+# После проверки закончить сеанс: ./xl stop
 ```
 
 **Что показал телефон.** Три прогона, между каждыми двумя — настоящий холодный сброс: `./xl reboot` в Android,
@@ -2742,7 +2746,8 @@ python3 tools/apfs/verify.py sum /куда/rootfs.apfs      # с чем срав
 
 ```sh
 ./xl ramdisk /куда/ramdisk.apfs
-XL_CMDLINE="apfs_check=4" XL_SECS=120 ./xl run
+XL_CMDLINE="apfs_check=4" ./xl run
+# После проверки закончить сеанс: ./xl stop
 python3 tools/apfs/verify.py sum /куда/ramdisk.apfs      # с чем сравнивать
 ```
 

@@ -97,7 +97,7 @@ SoC, then the phone, then the fragments you named.
 
 ## `CONFIG_BOOTARGS`: Linux's `CONFIG_CMDLINE`
 
-For an argument that has no symbol of its own, or a value the symbols cannot say: `CONFIG_BOOTARGS="fb_beat=2 loader_return_after=5"`. It is not an
+For an argument that has no symbol of its own, or a value the symbols cannot say: `CONFIG_BOOTARGS="fb_beat=2 touch_lat=1"`. It is not an
 escape from the checks. Every name must be one the source reads ([boot-args.md](boot-args.md)), so `fb_beet=2` is an error with a
 suggestion rather than a silent no-op; an argument that a symbol already sets (`cpus=8`) is refused with the name of the symbol; a
 word is `name=value` with no space, quote or backslash in it; and the words count towards the 607 characters.

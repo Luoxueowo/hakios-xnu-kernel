@@ -3,7 +3,7 @@
 # the frame-rate bench driving it, and what came of it in one summary. Git Bash on Windows, macOS and Linux alike.
 #
 #   tools/metal-run.sh                  the run (the phone may be in Android, in its bootloader or in the loader)
-#   SECS=180 tools/metal-run.sh         its length in seconds (default 180: the bench's four rounds; see rc.jobs.bench)
+#   SECS=180 tools/metal-run.sh         screenshot/observation window (default 180: the bench's four rounds; see rc.jobs.bench)
 #   MORE="metal_gmem=1" tools/...       boot-args beside the ones below; one of the same name takes a default's place
 #   PERSIST=0 tools/metal-run.sh        without var_store: /private/var starts empty and nothing is written to darwin
 #   UPLOAD=0 tools/metal-run.sh         keep the system image already in the phone's RAM (default: upload this copy's)
@@ -104,15 +104,16 @@ if [ "$SHOTS" -gt 0 ] 2>/dev/null; then
 	( sleep 30; i=0; while [ $i -lt $(( SECS / SHOTS )) ]; do ./xl screenshot logs/$stamp-shots/$i.png >/dev/null 2>&1; i=$((i + 1)); sleep "$SHOTS"; done ) &
 	shots_pid=$!
 fi
-echo "metal-run: $SECS s with: $ARGS"
-XL_CMDLINE="$ARGS" XL_SECS=$SECS XL_FOLLOW=${XL_FOLLOW:-10} XL_FOLLOW_KEEP=1 ./xl run
+echo "metal-run: observing for about $SECS s with: $ARGS"
+echo "metal-run: the run stays active; after the benchmark, use ./xl stop from another terminal"
+XL_CMDLINE="$ARGS" XL_FOLLOW=${XL_FOLLOW:-10} XL_FOLLOW_KEEP=1 ./xl run
 status=$?
 [ -n "$shots_pid" ] && kill "$shots_pid" 2>/dev/null
 log=logs/$(readlink logs/last.log 2>/dev/null || ls -t logs/*-run.log 2>/dev/null | head -1 | xargs -n1 basename)
 [ -f "$log" ] || { echo "metal-run: no run log (xl run said $status)"; exit 1; }
 
 {
-	echo "metal-run $stamp: $log, $SECS s, xl run $status"
+	echo "metal-run $stamp: $log, observation target $SECS s, xl run $status"
 	echo "boot-args: $ARGS"
 	echo
 	echo "== frames per gesture (tools/frames.py)"

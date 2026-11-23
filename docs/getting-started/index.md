@@ -26,7 +26,7 @@ A session on the phone, once [On the phone](phone.md) has been followed:
 ```sh
 make redwood_defconfig   # the phone's configuration: the common kernel + the SC7280's + the phone's own
 make kernel              # the kernel with the drivers that configuration builds
-make phone SECS=600      # a 10-minute session on the phone, in RAM
+make phone               # phone run in RAM; finish with ./xl stop
 ```
 
 The SoC, device and UEFI repositories, at the revisions `devices/manifest.conf` names:

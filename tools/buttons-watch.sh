@@ -6,12 +6,8 @@
 # also shows what Darwin made of them (a volume key: the volume indicator; the side button: the
 # screen off, or back on).
 #
-# usage: XL_SECS=N tools/buttons-watch.sh [DIR]   (N as for the run; pictures go to DIR, default
-#                                                  logs/buttons-HHMMSS)
+# usage: tools/buttons-watch.sh [DIR]   (pictures go to DIR, default logs/buttons-HHMMSS)
 # Start the run first (./xl run in another terminal, or in the background); this ends with it.
-# In the last seconds of the run it leaves the phone alone: what "xl log" and "xl screenshot" ask
-# the loader for travels the same way as the run's own log, and must not be in its place when
-# the run fetches that.
 cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 out=${1:-logs/buttons-$(date +%H%M%S)}
@@ -30,9 +26,7 @@ for ((i = 0; i < 20; i++)); do          # wait for the run to start
 	sleep 0.5
 done
 [ -n "$started" ] || { echo "buttons-watch.sh: no run in progress"; exit 1; }
-quiet=$((started + ${XL_SECS:-8} - 4))
 while running; do
-	if [ "$(date +%s)" -ge "$quiet" ]; then sleep 1; continue; fi
 	./xl log > "$out/log.now" 2>/dev/null || { sleep 1; continue; }
 	# what is new: the lines after the last one already shown (the log is a ring: lines do not keep their numbers)
 	new=$(grep -a -E "$pattern" "$out/log.now" | awk -v last="$last" '

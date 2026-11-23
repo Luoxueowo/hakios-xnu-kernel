@@ -2706,12 +2706,10 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
  * been and gone (the caller goes on as after loader_return_stub), a negative number if the
  * firmware refused to start the core, OTHER_CPU_NOT_STARTED, or OTHER_CPU_HUNG: then the kernel
  * is still sitting on that core, but what it logged is there to be read (loader_ctx, as after a
- * return). `live` is where the kernel shows its signs of life, if it has such a place;
- * `budget` is how many seconds it has said it will run.
+ * return). `live` is where the kernel shows its signs of life, if it has such a place.
  */
 static int64_t
-run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const struct kernel_live *live, uint64_t slide,
-    uint64_t budget)
+run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const struct kernel_live *live, uint64_t slide)
 {
 	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
 	int64_t status;
@@ -2784,12 +2782,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				status = OTHER_CPU_NOT_STARTED;
 			}
 		}
-		/*
-		 * The watchdog is this core's to feed for as long as the kernel is expected to run:
-		 * the kernel does it too, but whether that counts from another core is not known.
-		 * After that a kernel that neither returns nor hangs visibly meets the watchdog.
-		 */
-		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + 60) {
+		/* The other core may not count as petting the hypervisor watchdog, so keep feeding it here. */
+		if (wdt_armed && seconds_since(last_pet) >= 5) {
 			wdt_pet();
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 		}
@@ -3470,24 +3464,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		kernel_mpidr = this_mpidr;
 	}
 
-	/* where the kernel will show its signs of life, and how long it has said it will run */
+	/* where the kernel will show its signs of life */
 	const struct kernel_live *kernel_live = NULL;
-	uint64_t kernel_budget = 0;
 	for (uint64_t *q = (uint64_t *)kern_lo; q < (uint64_t *)kern_hi; q++) {
 		if (*q == KERNEL_LIVE_MAGIC) {
 			kernel_live = (const struct kernel_live *)q;
 			break;
 		}
 	}
-	for (const char *c = pi.cmdline; *c; c++) {
-		if (starts_with(c, "loader_return_after=")) {
-			for (c += 20; *c >= '0' && *c <= '9'; c++) {
-				kernel_budget = kernel_budget * 10 + (uint64_t)(*c - '0');
-			}
-			break;
-		}
-	}
-
 	/* Give the kernel the address of our return stub and the checkpoint to stop at. */
 	for (uint64_t *q = (uint64_t *)kern_lo; q < (uint64_t *)kern_hi; q++) {
 		if (*q == 0x545352444C554E58ULL /* "XNULDRST" */) {
@@ -3958,7 +3942,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			jump_to_kernel((uint64_t)(uintptr_t)&loader_return_stub, 0);
 		}
 		if (kernel_mpidr != this_mpidr) {
-			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
+			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide);
 
 			screen_quiet = screen_quiet_before_run;
 			wdt_set_ms(WDT_BITE_MS);

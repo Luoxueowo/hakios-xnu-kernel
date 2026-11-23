@@ -123,9 +123,8 @@ Set IP Family → Start Network Interface, with registration gating the start (c
 the failures are QMI error codes and timing, visible only at runtime:
 
 ```sh
-XL_SB_DELAY=8 XL_SECS=600 \
-XL_CMDLINE="... modem=1 modem_ipa_data_trace=1 net_trace=20 net_names=1" \
-./xl run
+XL_SB_DELAY=8 XL_CMDLINE="... modem=1 modem_ipa_data_trace=1 net_trace=20 net_names=1" ./xl run
+# Use ./xl stop from another terminal when the capture is complete.
 ```
 
 Send `logs/` from such a run and the cellular path can be debugged against the actual QMI exchange.

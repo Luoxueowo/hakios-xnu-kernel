@@ -85,7 +85,6 @@ SET_BY = {
     "hakios_kver": "the loader (from the payload's kernel.ver)",
     "hv_wdt_pet": "the loader, when it has armed the watchdog (the runner also passes it)",
     "epoch": "xl (the host's clock)",
-    "loader_return_after": "xl (XL_SECS)",
     "sb_delay": "xl (XL_SB_DELAY)",
     # wifi=1 is "all of it, by itself": hakios_wifi_option() answers these as if they were given (wifi_lx=2 wifi_smmu=2
     # wifi_station=1 wifi_keep=1 wifi_irq=1 wifi_ba=1 wifi_wide=1) unless they are given otherwise

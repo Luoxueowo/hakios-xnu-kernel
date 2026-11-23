@@ -3,7 +3,7 @@
 # on (boot-arg buttons=1), in which everything the driver sees and everything Darwin makes of it is
 # collected, and a summary at the end.
 #
-#   tools/buttons-session.sh [SECONDS]        (default 120)
+#   tools/buttons-session.sh [RECORD_SECONDS] (default 120; screen recording duration)
 #
 # What it does: gets the phone into the loader (uploads the system image if it had to come from
 # Android), starts the run, says when to start pressing, follows the log (tools/buttons-watch.sh:
@@ -34,12 +34,12 @@ fi
 
 record="rec_start=30 rec_secs=$((secs - 45)) rec_mb=640"
 [ "$RECORD" = 0 ] && record=
-export XL_SECS=$secs
 XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=4 buttons=1 $record $XL_CMDLINE_MORE" ./xl run > "$out/run.out" 2>&1 &
 echo
-echo "=== $(date +%T): the run has started; it lasts $secs seconds."
+echo "=== $(date +%T): the run has started; it stays active until you stop it."
 echo "=== In about 20 s the lock screen appears, at about 35 s it is swiped away by a script."
 echo "=== FROM THE MOMENT THE HOME SCREEN (the icons) IS THERE the keys can be pressed."
+echo "=== When finished, run ./xl stop from another terminal."
 echo
 sleep 2
 tools/buttons-watch.sh "$out" | grep --line-buffered -v -E '^buttons: (step [1-4]|next:|channel|PMIC arbiter|the PMK8350|GPIO6 of)'

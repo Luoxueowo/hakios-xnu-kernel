@@ -1,14 +1,14 @@
 #!/bin/bash
-# tools/modem-cycle.sh "KERNEL ARGS" [SECS] [LOG]: wait for the phone (up to 6 h), enter the loader, upload the
-# system image, run the kernel with those args, summarize the modem's log, and leave the phone in the loader
-# (or fastboot) for the next run (XL_END=android: back to Android).
+# tools/modem-cycle.sh "KERNEL ARGS": wait for the phone (up to 6 h), enter the loader, upload the
+# system image, run the kernel with those args until `./xl stop`, summarize the modem's log, and leave
+# the phone in the loader (or fastboot) for the next run (XL_END=android: back to Android).
 # The phone is never flashed: the kernel is booted with "fastboot boot"-like upload through xl.
 # Windows (Git Bash) variant: identical to modem-cycle.sh except its PATH lines. The macOS shims in
 # tools/macos-bin (flock: a python script on fcntl; stat, timeout: exec /opt/local/bin/gstat, gtimeout)
 # would shadow Git Bash's own GNU stat and timeout and the flock shim in tools/win-bin, and fail.
 cd "$(dirname "$0")/.." || exit 1
 PATH=$PWD/tools/win-bin:/c/platform-tools:$PATH
-ARGS=$1; SECS=${2:-300}
+ARGS=$1
 # BASE_ARGS: the arguments the runner puts first (default: the reference phone's cores, clock and storage).
 # Empty, as `make phone` sets it when there is a .config, they come from the configuration instead and are not doubled.
 # A port's SoC addresses (devices/<name>/soc.args, made by devices/<name>/pull-soc.sh): added to the
@@ -22,12 +22,13 @@ for i in $(seq 1 2160); do s=$(./xl state); [ "$s" != absent ] && break; sleep 1
 echo "$(date +%T) phone: $s"; [ "$s" = absent ] && { echo "NO PHONE"; exit 1; }
 ./xl enter 2>&1 | tail -1
 ./xl ramdisk userland/system.apfs 2>&1 | tail -1
-XL_SB_DELAY=${XL_SB_DELAY:-600} XL_CMDLINE="debug=0x8 rd=md0 hv_wdt_pet=1 ${BASE_ARGS-bootcpu=7 cpus=8 cpufreq=1 ufs=2} $ARGS $SOC" XL_SECS=$SECS XL_FOLLOW=1 XL_FOLLOW_KEEP=1 ./xl run 2>&1 | tail -2
+echo "$(date +%T) kernel is running; use ./xl stop from another terminal when finished"
+XL_SB_DELAY=${XL_SB_DELAY:-600} XL_CMDLINE="debug=0x8 rd=md0 hv_wdt_pet=1 ${BASE_ARGS-bootcpu=7 cpus=8 cpufreq=1 ufs=2} $ARGS $SOC" XL_FOLLOW=1 XL_FOLLOW_KEEP=1 ./xl run
 echo "$(date +%T) state after run: $(./xl state)"
 L=$(ls -t logs/*-run.log.live | head -1); F=${L%.live}; echo "LOG=$F"
 cat $L $F 2>/dev/null | grep -a "mpss: \(7: \(THE\|the watch\)\|11\|rmtfs\|tftp\|servreg\|dms\|nas\|ipa: \(THE\|from node\|the modem\|a probe\)\|link: \(THE\|tftp\)\|LAST WORDS\|step 1[01]\)\|serving system\|panic(\|ipa: \|cell: \|net: en1\|wda: \|wds: \(THE\|the client\|about\)" | grep -v "about to ask\|about to tell" | sed 's/^\[ *[0-9.]*\]: //' | awk '!seen[$0]++' | cut -c1-230 | head -80
-# Where the phone is left (XL_END): "loader" (default) -- the kernel hands control back to our loader
-# at the end of the run (loader_return_after: the modem, the DSPs and the GPU stopped first), and the
+# Where the phone is left (XL_END): "loader" (default) -- after `./xl stop`, the kernel hands control back
+# to our loader (the modem, the DSPs and the GPU stop first), and the
 # phone stays there, in the loader's fastboot-protocol channel, ready for the next run with no reboot
 # at all; if the return failed and the watchdog reset the phone into Android, it is sent back to
 # fastboot, so a phone left alone always sits where it can be recovered. "android": the old way,

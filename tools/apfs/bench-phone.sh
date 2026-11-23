@@ -23,11 +23,13 @@ K=hakios-kernel
 
 printf "%-7s %9s %8s %12s %12s %10s %8s %4s %s\n" readers wall_ms MB/s lock_wait_ms lock_held_ms inflate_ms hash_ms bad sums
 for n in $COUNTS; do
-	out=$(XL_CMDLINE="cpus=$CPUS cpufreq=$FREQ apfs_check=5 apfs_threads=$n $EXTRA" XL_SECS=300 \
-		timeout 500 ./xl run 2>&1)
-	log=$(echo "$out" | grep -o 'logs/[0-9]*-run.log' | tail -1)
-	if [ -z "$log" ] || ! grep -aq "readers done in" "$log" 2>/dev/null; then
-		printf "%-7s run did not come back: %s\n" "$n" "$(echo "$out" | tail -1)"
+	echo "readers=$n: watch the kernel log; after 'readers done', run ./xl stop in another terminal"
+	XL_CMDLINE="cpus=$CPUS cpufreq=$FREQ apfs_check=5 apfs_threads=$n $EXTRA" XL_FOLLOW=1 ./xl run
+	last=$(readlink logs/last.log 2>/dev/null)
+	[ -n "$last" ] || { printf "%-7s run left no log\n" "$n"; break; }
+	log="logs/$last"
+	if ! grep -aq "readers done in" "$log" 2>/dev/null; then
+		printf "%-7s run did not finish the reader check\n" "$n"
 		break
 	fi
 	wall=$(grep -ao "$n readers done in [0-9]*" "$log" | head -1 | awk '{print $5}')
