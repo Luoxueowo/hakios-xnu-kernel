@@ -10,7 +10,9 @@
  *
  *   usage: cputop [SECONDS [LOOKS]]     every SECONDS (default 5), LOOKS times (default: until the run ends)
  */
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/thread_info.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +45,21 @@ struct proc_taskinfo {
 int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
 int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 int proc_name(int pid, void *buffer, uint32_t buffersize);
+#define PROC_PIDTHREADINFO      5
+#define PROC_PIDLISTTHREADS     6
+struct proc_threadinfo {
+	uint64_t        pth_user_time;          /* run time, nanoseconds */
+	uint64_t        pth_system_time;
+	int32_t         pth_cpu_usage;
+	int32_t         pth_policy;
+	int32_t         pth_run_state;
+	int32_t         pth_flags;
+	int32_t         pth_sleep_time;
+	int32_t         pth_curpri;
+	int32_t         pth_priority;
+	int32_t         pth_maxpriority;
+	char            pth_name[64];
+};
 
 #define MAX_PROCS       2048
 #define SHOWN           10
@@ -79,6 +96,111 @@ time_before(int pid, int *found)
 	}
 	*found = 0;
 	return 0;
+}
+
+/*
+ * The threads of one process, by the processor time each was given since the look before -- for a process whose
+ * share is spread over several cores, which threads they are (CoreAnimation renders in more than one).
+ */
+#define MAX_THREADS     256
+struct thread_share {
+	uint64_t tid;
+	uint64_t time;                  /* microseconds, user + system */
+};
+static struct thread_share thread_last[MAX_THREADS], thread_now[MAX_THREADS];
+static uint64_t thread_delta[MAX_THREADS];      /* (the difference, kept apart: thread_last holds the totals) */
+static int thread_last_count;
+static int thread_last_pid;
+
+static int
+threads_of(int pid, struct thread_share *out, int max)
+{
+	uint64_t tids[MAX_THREADS];
+	int bytes, n = 0;
+
+	/* (libproc's, not a task port: the daemon this runs as is not allowed one) */
+	bytes = proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, tids, sizeof(tids));
+	if (bytes <= 0) {
+		return 0;
+	}
+	for (int i = 0; i < bytes / (int) sizeof(uint64_t) && n < max; i++) {
+		struct proc_threadinfo info;
+
+		if (proc_pidinfo(pid, PROC_PIDTHREADINFO, tids[i], &info, sizeof(info)) != sizeof(info)) {
+			continue;
+		}
+		out[n].tid = tids[i];
+		out[n].time = info.pth_user_time + info.pth_system_time;       /* nanoseconds */
+		n++;
+	}
+	return n;
+}
+
+static void
+say_threads(int pid, const char * name, double span, mach_timebase_info_data_t timebase)
+{
+	int n = threads_of(pid, thread_now, MAX_THREADS), shown = 0;
+	uint64_t busiest = 0;
+
+	if (thread_last_pid != pid) {
+		thread_last_count = 0;
+		thread_last_pid = pid;
+	}
+	if (n == 0) {
+		thread_last_count = 0;
+		printf("threads: %s[%d]: no task port (not root?)\n", name, pid);
+		return;
+	}
+	/* (sorted by the time since the look before, one pass per thread is enough for a dozen) */
+	for (int k = 0; k < n; k++) {
+		uint64_t then = thread_now[k].time;
+
+		for (int i = 0; i < thread_last_count; i++) {
+			if (thread_last[i].tid == thread_now[k].tid) {
+				then = thread_last[i].time;
+				break;
+			}
+		}
+		thread_delta[k] = thread_now[k].time > then ? thread_now[k].time - then : 0;
+		if (thread_delta[k] > busiest) {
+			busiest = thread_delta[k];
+		}
+	}
+	printf("threads: %s[%d]:", name, pid);
+	for (int round = 0; round < 8 && shown < 8; round++) {
+		int pick = -1;
+
+		for (int k = 0; k < n; k++) {
+			if (thread_delta[k] == 0) {
+				continue;
+			}
+			if (pick < 0 || thread_delta[k] > thread_delta[pick]) {
+				pick = k;
+			}
+		}
+		if (pick < 0) {
+			break;
+		}
+		double percent = span > 0 ? 100.0 * (double) thread_delta[pick] /
+		    ((double) span * (double) timebase.numer / (double) timebase.denom) : 0;
+		if (percent < 1) {
+			break;
+		}
+		{
+			struct proc_threadinfo info;
+			char tname[33] = "";
+
+			if (proc_pidinfo(pid, PROC_PIDTHREADINFO, thread_now[pick].tid, &info, sizeof(info)) == sizeof(info)) {
+				memcpy(tname, info.pth_name, sizeof(tname) - 1);
+			}
+			printf(" %s%.0f%%", tname[0] ? tname : "?", percent);
+		}
+		thread_delta[pick] = 0;
+		shown++;
+	}
+	printf("\n");
+	memcpy(thread_last, thread_now, sizeof(thread_now[0]) * (size_t) n);
+	thread_last_count = n;
 }
 
 int
@@ -140,6 +262,14 @@ main(int argc, char **argv)
 				shown++;
 			}
 			printf("\n");
+			if (n > 0 && all != 0 && shares[0].time * 4 > all) {
+				char name[64] = "?";
+
+				proc_name(shares[0].pid, name, sizeof(name));
+				say_threads(shares[0].pid, name, span, timebase);
+			} else {
+				thread_last_count = 0;
+			}
 		}
 		memcpy(last, now, sizeof(now[0]) * (size_t)count);
 		last_count = count;

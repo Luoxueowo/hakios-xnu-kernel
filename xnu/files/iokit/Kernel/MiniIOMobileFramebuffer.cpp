@@ -280,6 +280,14 @@ static TUNABLE(uint64_t, gIntfPhysical, "fb_intf", 0);
 /* fb_flip=1: enable two-buffer scanout with the Polaris SDM845 DPU. */
 static TUNABLE(uint32_t, gFBFlip, "fb_flip", 0);
 /*
+ * fb_pace=1: a swap is handed back only once the panel has taken the frame (the DPU's flush bit cleared), which is
+ * the frame boundary. It is the back pressure the window server needs: without it CoreAnimation draws again as
+ * soon as the GPU is done -- 227% of a processor at rest, 24 November, frames still 33 to 54 a second because
+ * nothing limited them. raphael's SwapWait is the same thing over the TE latch. fb_pace=0 leaves it out, for
+ * comparing.
+ */
+static TUNABLE(uint32_t, gFBPace, "fb_pace", 0);   /* (measured 25 November: waiting here only moved the delay, the frames kept coming -- fb_pace=1 to try it again) */
+/*
  * fb_native=2: a frame that is one full-panel surface is not copied into a scanout buffer at all --
  * the DPU is pointed at the surface's own pixels (the Mi 8's fb_native=2, without its pool: here the
  * surface must already be one physically contiguous run, see MiniIOSurfacePhysical()).
@@ -327,6 +335,26 @@ dpuWaitFlush(volatile uint32_t * ctl)
 		if (ns >= DPU_FLUSH_TIMEOUT_NS) {
 			return false;
 		}
+	}
+	return true;
+}
+
+/*
+ * The same, from a thread that may be put to sleep: the window server's swap waits here for the panel, and a busy
+ * loop over the flush bit spends the processor it is supposed to be saving (24 November: SpringBoard at 400% while
+ * the driver's own time went from 0.7 to 11 ms a frame -- the wait was spinning).
+ */
+static bool
+dpuWaitFlushSleeping(volatile uint32_t * ctl)
+{
+	uint64_t began = mach_absolute_time(), ns = 0;
+
+	while ((ctl[POLARIS_DPU_FLUSH / 4] & 1) != 0) {
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		if (ns >= DPU_FLUSH_TIMEOUT_NS) {
+			return false;
+		}
+		IOSleep(1);
 	}
 	return true;
 }
@@ -872,7 +900,7 @@ IOMobileFramebuffer::flipDisable(void)
 	__asm__ volatile ("dsb sy" ::: "memory");
 	gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
 	__asm__ volatile ("dsb sy" ::: "memory");
-	restored = dpuWaitFlush(gFlipCtl);
+	restored = dpuWaitFlushSleeping(gFlipCtl);
 	fFlipOn = false;
 	fFlipFront = 0;
 	fDirect = false;
@@ -891,7 +919,7 @@ IOMobileFramebuffer::flipPresent(void)
 	if (!fFlipOn) {
 		return;
 	}
-	if (!dpuWaitFlush(gFlipCtl)) {
+	if (!dpuWaitFlushSleeping(gFlipCtl)) {
 		IOLog("MiniIOMobileFramebuffer: fb_flip: previous DPU flush did not complete\n");
 		flipDisable();
 		return;
@@ -1965,7 +1993,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	IOLockLock(fLock);
 	bool presented = false;
 
-	/* (the surfaces the panel has left by now: their memory is free for this frame's) */
+	/* SSPP address and stride belong to the pending flush until the DPU takes it. */
+	if (fFlipOn && !dpuWaitFlushSleeping(gFlipCtl)) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: the DPU did not take the frame before within 40 ms\n");
+		flipDisable();
+	}
+
+	/* Release old scanout surfaces after the pending flush has had a chance to latch. */
 	nativeRelease();
 
 	if (fFlipOn && gFBNative == 2 && swapFillsPanel(swap, surfaces, fPanelWidth, fPanelHeight)) {
@@ -1991,7 +2025,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			__asm__ volatile ("dsb sy" ::: "memory");
 			gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
 			__asm__ volatile ("dsb sy" ::: "memory");
-			/* (the flush is taken at the panel's next frame boundary: it is not waited for here, see flipPresent()) */
+			/*
+			 * The flush is taken at the panel's next frame boundary. Waited for here (fb_pace=1), the swap is
+			 * handed back one panel frame after the one before it was: the window server cannot get ahead of
+			 * the panel, and stops drawing the same frame again and again (see gFBPace).
+			 */
+			if (gFBPace != 0) {
+				(void) dpuWaitFlushSleeping(gFlipCtl);
+			}
 			presented = true;
 			recorded = s;
 			layers = 1;
@@ -2005,15 +2046,6 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				    (unsigned long long) nativeBytes);
 			}
 		}
-	}
-	/*
-	 * The buffer this frame is drawn into must have been left by the panel first: the flush of the frame before is
-	 * checked here, before anything is written, and not after this frame is latched (which would be a wait for a
-	 * boundary that has nothing to do with it -- see flipPresent()).
-	 */
-	if (fFlipOn && !presented && !dpuWaitFlush(gFlipCtl)) {
-		IOLog("MiniIOMobileFramebuffer: fb_flip: the DPU did not take the frame before within 40 ms\n");
-		flipDisable();
 	}
 	if (fFlipOn && !presented) {
 		unsigned draw = 1 - fFlipFront;

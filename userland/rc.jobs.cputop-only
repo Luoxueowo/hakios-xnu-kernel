@@ -1,0 +1,3 @@
+# Only the process ranks (src/cputop.c): which processes take the processors, every 5 s in the log.
+# (rc.jobs.cputop does the same beside the touch and frame tests; this one touches nothing.)
+/polaris/bin/cputop 5 &

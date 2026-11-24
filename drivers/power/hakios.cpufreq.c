@@ -777,23 +777,20 @@ cpu_temperature_mc(void)
 }
 
 static bool		govOn;
-static uint32_t		govTarget = 85, govLittle = 93;	/* (the temperature ceilings, degrees: the top of what a row may be) */
-static uint32_t		govMs = 100;			/* how often the load is looked at (cpufreq_gov_ms) */
+static uint32_t		govMs = 100;			/* how often the load is sampled (cpufreq_gov_ms) */
+static uint32_t		govRateSamples = 2;		/* at most one row movement every this many samples (rate_limit) */
+static uint32_t		govTempCap = 85;		/* the temperature the ceiling is brought down at (cpufreq_gov) */
 static uint32_t		govFloor = 1600000;		/* the big cores never go below this for load alone */
-static uint64_t		govIdleAt, govIdleMs = 10000;	/* (a quiet spell this long lets even them go to the bottom) */
-static uint32_t		govCap, govLow;			/* the temperature ceiling in rows (big), and the lowest row it goes to */
-static uint32_t		govCapLittle;			/* the same for the little cores */
-static unsigned		govHot, govCool, govInvalid;	/* (the big cores' temperature strikes, and unreadable samples) */
-static unsigned		govLittleHot, govLittleCool;
-static unsigned		govIdleBig, govIdleLittle;	/* (samples the load has been below the row it is at) */
-static unsigned		govUtilBig, govUtilLittle;	/* (percent, for the log) */
-static unsigned		govCoreUtil[8];	/* (percent each core was busy, by core number: for the log) */
-static unsigned		govPrevBig, govPrevLittle;	/* (the sample before: a jump is what boost is for) */
-static uint32_t		govBoost = 1, govBoostStep = 25;
-static uint64_t		govSamples, govDown, govUp;
-static uint64_t		govLastAt, govLastIdle[MAX_CPUS];
+static uint32_t		govCap[2];			/* the temperature ceiling in rows, per domain */
+static uint32_t		govLow;				/* the lowest row the big domain goes to */
+static uint64_t		govSamples, govMoves;
+static uint64_t		govLastAt, govLastIdle[MAX_CPUS], govLastMove;
+static unsigned		govLoad[2];			/* percent, per domain, for the log */
+static unsigned		govSmooth[2];		/* (PELT's place: a quarter of each new sample, so one spike does not move a row) */
+static unsigned		govHotStrikes, govCoolStrikes;
+static bool		govNeedUpdate;		/* (a ceiling moved: the next sample is acted on without waiting for the rate) */
 static thread_call_t	govCall;
-static int		cpu_gov_row_value = -1;	/* (the row it allows, for kern.hakios.cpu_gov_row) */
+static int		cpu_gov_row_value = -1;	/* (the row the big cores were given, for kern.hakios.cpu_gov_row) */
 
 static void govTick(thread_call_param_t p0, thread_call_param_t p1);
 
@@ -809,266 +806,180 @@ osm_floor_row(struct osm_domain * d, uint32_t khz)
 	return d->rows - 1;
 }
 
-static void
-govApplyBig(uint32_t row, const char *reason)
-{
-	if (!osm[1].open || row > osm[1].top || row == osm[1].row) {
-		return;
-	}
-	cpu_gov_row_value = (int) row;
-	tell("cpufreq: gov: big %u -> %u (%u MHz), load %u%%, reason %s\n", osm[1].row, row, osm[1].khz[row] / 1000,
-	    govUtilBig, reason);
-	osm_set(&osm[1], row);
-}
-
-static void
-govApplyLittle(uint32_t row, const char *reason)
-{
-	if (!osm[0].open || row > osm[0].top || row == osm[0].row) {
-		return;
-	}
-	tell("cpufreq: gov: little %u -> %u (%u MHz), load %u%%, reason %s\n", osm[0].row, row,
-	    osm[0].khz[row] / 1000, govUtilLittle, reason);
-	osm_set(&osm[0], row);
-}
-
 /*
- * The load of the two clusters, in percent, from the time the cores were not idle since the sample before (the
- * same idle accounting schedutil uses, ml_cpu_idle_time(): the cpus are numbered as the topology has them, and the
- * low byte of phys_id is the core number of the SoC -- 0 to 3 the little cores on SDM845, 4 to 7 the big ones).
+ * The governor, after cpufreq_schedutil (AOSP android17-6.18, kernel/sched/cpufreq_schedutil.c):
+ *
+ *   per core:    util = the time it was not idle over the time since the sample before. There is no PELT here,
+ *                but idle time is idle time: an RT thread that runs keeps the core out of idle exactly as a CFS
+ *                one does, so one number covers fair and real-time together (sugov_get_util() with CFS plus RT).
+ *   per domain:  the largest util of its cores -- sugov_next_freq_shared() takes the max, not the mean, or one
+ *                loaded core among idle ones reads as half loaded.
+ *   next freq:   1.25 * max * util / 100, map_util_freq()'s headroom (C = 1.25: the top row is reached at 80%).
+ *   the row:     the lowest one whose frequency is at least that -- cpufreq_driver_resolve_freq(), which rounds
+ *                up rather than down.
+ *   rate:        at most one row movement every govRateSamples samples, up or down alike: schedutil's
+ *                rate_limit_us (the phone's load is spiky, and an asymmetric governor is what made the top rows
+ *                go 2803 <-> 2784 every half second).
+ *
+ * The temperature is only the ceiling: at govTempCap the highest row a domain may be in comes down one (after
+ * five samples), and goes back up two samples after it has fallen four degrees.
+ *
+ *   cpufreq_gov=<C>          the temperature the ceiling comes down at (55 to 110; 85)
+ *   cpufreq_gov_ms=<ms>      how often the load is sampled (20 to 2000; 100)
+ *   cpufreq_gov_rate=<n>     at most one row movement every n samples (1 to 20; 2)
+ *   cpufreq_gov_floor=<MHz>  the lowest row the big cores go to for load alone (1600)
  */
 static void
-govUtil(unsigned * big, unsigned * little)
+govUtil(void)
 {
-	uint64_t now = mach_absolute_time();
-	uint64_t ns = now - govLastAt;                  /* (ml_cpu_idle_time() counts in the same units) */
-	uint64_t busyBig = 0, busyLittle = 0;
-	unsigned nBig = 0, nLittle = 0;
 	const ml_topology_info_t * topology = ml_get_topology_info();
+	uint64_t now = mach_absolute_time();
+	uint64_t delta = now - govLastAt;
 
 	govLastAt = now;
-	if (ns == 0 || topology == NULL) {
-		*big = *little = 0;
+	if (delta == 0 || topology == NULL) {
+		govLoad[0] = govSmooth[0];
+		govLoad[1] = govSmooth[1];
 		return;
 	}
+	govLoad[0] = govLoad[1] = 0;
 	for (unsigned i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
 		uint64_t idle = 0, waited;
+		unsigned core = (unsigned) ((topology->cpus[i].phys_id >> 8) & 0xff);
+		unsigned dom = core < 4 ? 0 : 1;
+		unsigned busy;
 
 		if (!ml_cpu_idle_time((int) i, &idle)) {
 			continue;
 		}
 		waited = idle - govLastIdle[i];
 		govLastIdle[i] = idle;
-		if (waited > ns) {
-			waited = ns;
+		if (waited > delta) {
+			waited = delta;
 		}
-		{
-			unsigned core = (unsigned) ((topology->cpus[i].phys_id >> 8) & 0xff);
-
-			if (core < sizeof(govCoreUtil) / sizeof(govCoreUtil[0])) {
-				govCoreUtil[core] = (unsigned) (((ns - waited) * 100) / ns);
-			}
-		}
-		if (((topology->cpus[i].phys_id >> 8) & 0xff) < 4) {
-			busyLittle += ns - waited;
-			nLittle++;
-		} else {
-			busyBig += ns - waited;
-			nBig++;
+		busy = (unsigned) (((delta - waited) * 100) / delta);
+		if (busy > govLoad[dom]) {
+			govLoad[dom] = busy;
 		}
 	}
-	*big = nBig != 0 ? (unsigned) (busyBig * 100 / ((uint64_t) nBig * ns)) : 0;
-	*little = nLittle != 0 ? (unsigned) (busyLittle * 100 / ((uint64_t) nLittle * ns)) : 0;
+	/*
+	 * PELT's place: the load is read once every sample here, not on every scheduler tick, so a quarter of the new
+	 * reading goes into what the row is picked from. Without it a window that happens to catch the end of a frame
+	 * (92%) and one that catches the gap (70%) are two different rows, and the little cores move 15 <-> 17 every
+	 * 200 ms (370 movements in one run, 24 November).
+	 */
+	for (unsigned d = 0; d < 2; d++) {
+		govSmooth[d] = (govSmooth[d] * 3 + govLoad[d]) / 4;
+		govLoad[d] = govSmooth[d];
+	}
 }
 
-/*
- * The row a load asks for: the load, with a quarter of headroom (schedutil's 1.25), over the table's own range.
- * The top row is what the boot asked for; the floor of the big cores is applied by the caller.
- */
+/* The row a load asks for: 1.25 * the top of the domain * util / 100, rounded up to a row of the table. */
 static uint32_t
-govRowForUtil(struct osm_domain * d, unsigned util)
+govRowFor(struct osm_domain * d, unsigned util)
 {
 	uint64_t want;
 
 	if (util > 100) {
 		util = 100;
 	}
-	want = (uint64_t) util * 125 / 100;
-	if (want > 100) {
-		want = 100;
+	want = (uint64_t) d->khz[d->top] * util * 125 / 100 / 100;
+	for (uint32_t row = 0; row < d->rows; row++) {
+		if (d->khz[row] >= want) {
+			return row;
+		}
 	}
-	want = want * d->top / 100;
-	if (want > d->top) {
-		want = d->top;
-	}
-	return (uint32_t) want;
+	return d->rows - 1;
 }
 
-/*
- * The governor: the load decides the row, the temperature decides the highest row it may be. (The request: the
- * clocks follow what is running, as schedutil's do, and the temperature is the ceiling rather than the thing that
- * is chased -- 60 C as a target held the big cores at their lowest row while the phone was still at 70 C.)
- *
- *   cpufreq_gov=<C>          the big cores' temperature ceiling (85)
- *   cpufreq_gov_little=<C>   the little cores' (93: they are the last to be held back)
- *   cpufreq_gov_ms=<ms>      how often the load is looked at (100)
- *   cpufreq_gov_floor=<MHz>  the lowest the big cores are taken for load alone (1600)
- *
- * Up goes at once (a load that appears is served now); down takes GOV_DOWN_STRIKES samples of the load under the
- * row it is at, a row at a time, so a burst does not cost a frequency step. The temperature ceiling comes down
- * five samples after it is reached and goes back two samples after it has fallen four degrees, a row at a time.
- */
-#define GOV_DOWN_STRIKES	5
-#define GOV_UP_STRIKES		2
+/* One domain to the row its own load asks for, under its ceiling, with no more than one movement a rate. */
+static void
+govDomain(struct osm_domain * d, int which, const char * name)
+{
+	uint32_t row = govRowFor(d, govLoad[which]);
+
+	if (which == 1 && row < govLow) {
+		row = govLow;
+	}
+	if (row > govCap[which]) {
+		row = govCap[which];
+	}
+	if (row > d->top) {
+		row = d->top;
+	}
+	if (row == d->row) {
+		return;
+	}
+	/*
+	 * sugov_should_update_freq(): a change of the policy limits is acted on at once, out of the rate limit's
+	 * order -- here that is the temperature ceiling having moved a row.
+	 */
+	if (!govNeedUpdate && govLastMove != 0 && govSamples - govLastMove < govRateSamples) {
+		return;
+	}
+	govLastMove = govSamples;
+	govMoves++;
+	if (which == 1) {
+		cpu_gov_row_value = (int) row;
+	}
+	tell("cpufreq: gov: %s %u -> %u (%u MHz), load %u%%, reason load\n", name, d->row, row, d->khz[row] / 1000,
+	    govLoad[which]);
+	osm_set(d, row);
+}
 
 static void
 govSample(void)
 {
-	unsigned big = 0, little = 0;
-	uint32_t wantBig, wantLittle;
-	int mc;
+	int mc = cpu_temperature_mc();
 
 	govSamples++;
-	govUtil(&big, &little);
-	govUtilBig = big;
-	govUtilLittle = little;
+	govUtil();
 
-	/* The temperature: a ceiling, never the thing that is chased. */
-	mc = cpu_temperature_mc();
 	if (mc > -273000 + 1) {
-		govInvalid = 0;
-		if (mc >= (int) (govTarget * 1000)) {
-			govCool = 0;
-			if (govCap > govLow && ++govHot >= GOV_DOWN_STRIKES) {
-				govHot = 0;
-				govCap--;
-			}
-		} else if (mc <= (int) ((govTarget - 4) * 1000)) {
-			govHot = 0;
-			if (govCap < osm[1].top && ++govCool >= GOV_UP_STRIKES) {
-				govCool = 0;
-				govCap++;
-			}
-		} else {
-			govHot = govCool = 0;
-		}
-		if (osm[0].open) {
-			if (mc >= (int) (govLittle * 1000)) {
-				govLittleCool = 0;
-				if (govCapLittle > 0 && ++govLittleHot >= GOV_DOWN_STRIKES) {
-					govLittleHot = 0;
-					govCapLittle--;
+		/* the temperature: a ceiling on the rows, never the thing that is chased */
+		if (mc >= (int) (govTempCap * 1000)) {
+			govCoolStrikes = 0;
+			if (++govHotStrikes >= 5) {
+				govHotStrikes = 0;
+				if (govCap[1] > govLow) {
+					govCap[1]--;
+					govNeedUpdate = true;
 				}
-			} else if (mc <= (int) ((govLittle - 4) * 1000)) {
-				govLittleHot = 0;
-				if (govCapLittle < osm[0].top && ++govLittleCool >= GOV_UP_STRIKES) {
-					govLittleCool = 0;
-					govCapLittle++;
+				if (osm[0].open && govCap[0] > 0) {
+					govCap[0]--;
+					govNeedUpdate = true;
 				}
-			} else {
-				govLittleHot = govLittleCool = 0;
 			}
-		}
-	} else if (++govInvalid >= 10) {
-		/* (no sensor reading for ten samples: no ceiling, the load alone) */
-		govInvalid = 0;
-		govCap = osm[1].open ? osm[1].top : 0;
-		govCapLittle = osm[0].open ? osm[0].top : 0;
-	}
-
-	/*
-	 * The big cores: the load's row, under the temperature's ceiling and over the floor -- except after a long
-	 * quiet spell (cpufreq_gov_idle_ms, ten seconds), when even they are let down to the bottom of their table.
-	 * The floor is back the sample the load returns.
-	 */
-	if (osm[1].open) {
-		uint32_t floorRow = govLow;
-
-		/*
-		 * A jump in the load (a quarter of the cores at once, cpufreq_gov_boost_step): the top row now, without
-		 * waiting for the row the load maps to or for the temperature ceiling to be consulted -- AOSP's boost is
-		 * the same idea. cpufreq_gov_boost=0 turns it off.
-		 */
-		if (govBoost && big >= 25 && big >= govPrevBig + govBoostStep) {
-			govPrevBig = big;
-			govIdleBig = 0;
-			govIdleAt = 0;
-			govUp++;
-			govApplyBig(osm[1].top, "boost");
-			goto little_cores;
-		}
-		govPrevBig = big;
-		if (big <= 10) {
-			uint64_t now = mach_absolute_time(), quiet = 0;
-
-			if (govIdleAt == 0) {
-				govIdleAt = now;
-			}
-			absolutetime_to_nanoseconds(now - govIdleAt, &quiet);
-			if (quiet >= govIdleMs * NSEC_PER_MSEC) {
-				floorRow = 0;
+		} else if (mc <= (int) ((govTempCap - 4) * 1000)) {
+			govHotStrikes = 0;
+			if (++govCoolStrikes >= 2) {
+				govCoolStrikes = 0;
+				if (govCap[1] < osm[1].top) {
+					govCap[1]++;
+					govNeedUpdate = true;
+				}
+				if (osm[0].open && govCap[0] < osm[0].top) {
+					govCap[0]++;
+					govNeedUpdate = true;
+				}
 			}
 		} else {
-			govIdleAt = 0;
-		}
-		wantBig = govRowForUtil(&osm[1], big);
-		if (wantBig < floorRow) {
-			wantBig = floorRow;
-		}
-		if (wantBig > govCap) {
-			wantBig = govCap;
-		}
-		if (wantBig > osm[1].row) {
-			govIdleBig = 0;
-			govUp++;
-			govApplyBig(wantBig, "load up");
-		} else if (wantBig < osm[1].row) {
-			if (++govIdleBig >= GOV_DOWN_STRIKES) {
-				govIdleBig = 0;
-				govDown++;
-				govApplyBig(osm[1].row - 1, "load down");
-			}
-		} else {
-			govIdleBig = 0;
+			govHotStrikes = govCoolStrikes = 0;
 		}
 	}
 
-little_cores:
-	/* The little cores: the same, no floor of their own, and their own ceiling. */
+	govDomain(&osm[1], 1, "big");
 	if (osm[0].open) {
-		if (govBoost && little >= 25 && little >= govPrevLittle + govBoostStep) {
-			govPrevLittle = little;
-			govIdleLittle = 0;
-			govApplyLittle(osm[0].top, "boost");
-			goto gov_done;
-		}
-		govPrevLittle = little;
-		wantLittle = govRowForUtil(&osm[0], little);
-		if (wantLittle > govCapLittle) {
-			wantLittle = govCapLittle;
-		}
-		if (wantLittle > osm[0].row) {
-			govIdleLittle = 0;
-			govApplyLittle(wantLittle, "load up");
-		} else if (wantLittle < osm[0].row) {
-			if (++govIdleLittle >= GOV_DOWN_STRIKES) {
-				govIdleLittle = 0;
-				govApplyLittle(osm[0].row - 1, "load down");
-			}
-		} else {
-			govIdleLittle = 0;
-		}
+		govDomain(&osm[0], 0, "little");
 	}
+	govNeedUpdate = false;
 
-gov_done:
-	/* Every thirty samples, where it stands (about three seconds at the default interval). */
+	/* Every thirty samples, where it stands (three seconds at the default interval). */
 	if (govSamples % 30 == 0) {
-		tell("cpufreq: gov: load big %u%%, little %u%%; rows %u/%u (%u/%u MHz), ceiling %u/%u, %d mC\n", big,
-		    little, osm[1].row, osm[0].row, osm[1].open ? osm[1].khz[osm[1].row] / 1000 : 0,
-		    osm[0].open ? osm[0].khz[osm[0].row] / 1000 : 0, govCap, govCapLittle, mc);
-		tell("cpufreq: cores %u %u %u %u %u %u %u %u (busy %%, core 0 to 7)\n", govCoreUtil[0],
-		    govCoreUtil[1], govCoreUtil[2], govCoreUtil[3], govCoreUtil[4], govCoreUtil[5], govCoreUtil[6],
-		    govCoreUtil[7]);
+		tell("cpufreq: gov: load big %u%% (busiest core), little %u%%; rows %u/%u (%u/%u MHz), ceiling %u/%u, "
+		    "%d mC, %llu movements\n", govLoad[1], govLoad[0], osm[1].row, osm[0].row,
+		    osm[1].open ? osm[1].khz[osm[1].row] / 1000 : 0, osm[0].open ? osm[0].khz[osm[0].row] / 1000 : 0,
+		    govCap[1], govCap[0], mc, govMoves);
 	}
 }
 
@@ -1085,86 +996,67 @@ govTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	thread_call_enter_delayed(govCall, deadline);
 }
 
-/* Boot-args cpufreq_gov=<C> and cpufreq_gov_ms=<ms>: the big domain held near that temperature. */
+/*
+ * Boot-args: cpufreq_gov=<C> (the ceiling, 85 by default), cpufreq_gov_ms=<ms>, cpufreq_gov_rate=<n> and
+ * cpufreq_gov_floor=<MHz>. The governor always runs when the big domain opened: the load picks the row and the
+ * temperature only caps it.
+ */
 static void
 govStart(void)
 {
-	uint32_t target = 0, ms = 0;
+	const ml_topology_info_t * topology;
+	uint32_t v = 0;
 	uint64_t deadline;
 	int mc;
 
-	if (!PE_parse_boot_argn("cpufreq_gov", &target, sizeof(target)) || target == 0) {
-		return;
-	}
-	if (target < 55 || target > 110) {
-		tell("cpufreq: gov: %u degrees is outside 55 to 110; not started\n", target);
-		return;
-	}
 	if (!osm[1].open || osm[1].rows < 3) {
 		tell("cpufreq: gov: the big domain was not opened; not started\n");
 		return;
 	}
 	tsens_tm = ml_io_map((vm_offset_t) TSENS_TM0_PHYS, TSENS_TM_SIZE);
 	if (tsens_tm == 0) {
-		tell("cpufreq: gov: the CPU sensors at %#lx cannot be mapped; not started\n", (unsigned long) TSENS_TM0_PHYS);
-		return;
+		tell("cpufreq: gov: the CPU sensors at %#lx cannot be mapped; the temperature ceiling is off\n",
+		    (unsigned long) TSENS_TM0_PHYS);
 	}
-	if (PE_parse_boot_argn("cpufreq_gov_ms", &ms, sizeof(ms)) && ms >= 20 && ms <= 2000) {
-		govMs = ms;
+	if (PE_parse_boot_argn("cpufreq_gov", &v, sizeof(v)) && v >= 55 && v <= 110) {
+		govTempCap = v;
 	}
-	if (PE_parse_boot_argn("cpufreq_gov_floor", &ms, sizeof(ms)) && ms >= 300 && ms <= 2800) {
-		govFloor = ms * 1000;
+	if (PE_parse_boot_argn("cpufreq_gov_ms", &v, sizeof(v)) && v >= 20 && v <= 2000) {
+		govMs = v;
 	}
-	if (PE_parse_boot_argn("cpufreq_gov_idle_ms", &ms, sizeof(ms)) && ms >= 1000 && ms <= 120000) {
-		govIdleMs = ms;
+	if (PE_parse_boot_argn("cpufreq_gov_rate", &v, sizeof(v)) && v >= 1 && v <= 20) {
+		govRateSamples = v;
 	}
-	if (PE_parse_boot_argn("cpufreq_gov_boost", &ms, sizeof(ms)) && ms <= 1) {
-		govBoost = ms;
-	}
-	if (PE_parse_boot_argn("cpufreq_gov_boost_step", &ms, sizeof(ms)) && ms >= 5 && ms <= 100) {
-		govBoostStep = ms;
-	}
-	govTarget = target;
-	/*
-	 * The little cores are the last to give: cpufreq_gov_little=<C>, eight degrees above the big ones' target
-	 * without it (and never above 110). They go down to the bottom of their own table, a row at a time.
-	 */
-	govLittle = target + 8;
-	if (PE_parse_boot_argn("cpufreq_gov_little", &ms, sizeof(ms)) && ms > target && ms <= 110) {
-		govLittle = ms;
-	}
-	if (govLittle > 110) {
-		govLittle = 110;
+	if (PE_parse_boot_argn("cpufreq_gov_floor", &v, sizeof(v)) && v >= 300 && v <= 2800) {
+		govFloor = v * 1000;
 	}
 	govLow = osm_floor_row(&osm[1], govFloor);
 	if (govLow >= osm[1].top) {
 		govLow = osm[1].top >= 2 ? osm[1].top - 2 : 0;   /* (no row at or above the floor: two below the top) */
 	}
-	govCap = osm[1].top;
-	govCapLittle = osm[0].open ? osm[0].top : 0;
-	cpu_gov_row_value = (int) govCap;
-	/* (the load is a difference: one reading of each counter now is the baseline) */
+	govCap[0] = osm[0].open ? osm[0].top : 0;
+	govCap[1] = osm[1].top;
+	cpu_gov_row_value = (int) govCap[1];
+	topology = ml_get_topology_info();
 	govLastAt = mach_absolute_time();
-	{
-		const ml_topology_info_t * topology = ml_get_topology_info();
-
-		for (unsigned i = 0; topology != NULL && i < topology->num_cpus && i < MAX_CPUS; i++) {
-			(void) ml_cpu_idle_time((int) i, &govLastIdle[i]);
-		}
+	for (unsigned i = 0; topology != NULL && i < topology->num_cpus && i < MAX_CPUS; i++) {
+		(void) ml_cpu_idle_time((int) i, &govLastIdle[i]);
 	}
 	govCall = thread_call_allocate(govTick, NULL);
 	if (govCall == NULL) {
 		tell("cpufreq: gov: no thread call; not started\n");
 		return;
 	}
-	govOn = true;
+	govSamples = 0;
+	govLastMove = 0;
 	mc = cpu_temperature_mc();
+	govOn = true;
 	clock_interval_to_deadline(govMs, NSEC_PER_MSEC, &deadline);
 	thread_call_enter_delayed(govCall, deadline);
-	tell("cpufreq: gov: the load picks the row (big %u to %u MHz, little %u to %u MHz); the temperature is the "
-	    "ceiling (%u C big, %u C little), looked at every %u ms, down five samples of load and up at once; %s\n",
-	    osm[1].khz[govLow] / 1000, osm[1].khz[osm[1].top] / 1000, osm[0].open ? osm[0].khz[0] / 1000 : 0,
-	    osm[0].open ? osm[0].khz[osm[0].top] / 1000 : 0, govTarget, govLittle, govMs,
+	tell("cpufreq: gov: schedutil: each domain's busiest core, 25%% headroom, one row every %u samples, looked at "
+	    "every %u ms; the temperature is the ceiling (%u C, big rows %u to %u = %u to %u MHz, little rows 0 to %u); "
+	    "%s\n", govRateSamples, govMs, govTempCap, govLow, osm[1].top, osm[1].khz[govLow] / 1000,
+	    osm[1].khz[osm[1].top] / 1000, osm[0].open ? osm[0].top : 0,
 	    mc > -273000 + 1 ? "the CPU sensors are being read" : "no CPU sensor has a reading yet");
 }
 
