@@ -787,6 +787,7 @@ static unsigned		govHot, govCool, govInvalid;	/* (the big cores' temperature str
 static unsigned		govLittleHot, govLittleCool;
 static unsigned		govIdleBig, govIdleLittle;	/* (samples the load has been below the row it is at) */
 static unsigned		govUtilBig, govUtilLittle;	/* (percent, for the log) */
+static unsigned		govCoreUtil[8];	/* (percent each core was busy, by core number: for the log) */
 static unsigned		govPrevBig, govPrevLittle;	/* (the sample before: a jump is what boost is for) */
 static uint32_t		govBoost = 1, govBoostStep = 25;
 static uint64_t		govSamples, govDown, govUp;
@@ -839,14 +840,14 @@ govApplyLittle(uint32_t row, const char *reason)
 static void
 govUtil(unsigned * big, unsigned * little)
 {
-	uint64_t now = mach_absolute_time(), ns = 0;
+	uint64_t now = mach_absolute_time();
+	uint64_t ns = now - govLastAt;                  /* (ml_cpu_idle_time() counts in the same units) */
 	uint64_t busyBig = 0, busyLittle = 0;
 	unsigned nBig = 0, nLittle = 0;
 	const ml_topology_info_t * topology = ml_get_topology_info();
 
-	absolutetime_to_nanoseconds(now - govLastAt, &ns);
 	govLastAt = now;
-	if (ns == 0) {
+	if (ns == 0 || topology == NULL) {
 		*big = *little = 0;
 		return;
 	}
@@ -860,6 +861,13 @@ govUtil(unsigned * big, unsigned * little)
 		govLastIdle[i] = idle;
 		if (waited > ns) {
 			waited = ns;
+		}
+		{
+			unsigned core = (unsigned) ((topology->cpus[i].phys_id >> 8) & 0xff);
+
+			if (core < sizeof(govCoreUtil) / sizeof(govCoreUtil[0])) {
+				govCoreUtil[core] = (unsigned) (((ns - waited) * 100) / ns);
+			}
 		}
 		if (((topology->cpus[i].phys_id >> 8) & 0xff) < 4) {
 			busyLittle += ns - waited;
@@ -1058,6 +1066,9 @@ gov_done:
 		tell("cpufreq: gov: load big %u%%, little %u%%; rows %u/%u (%u/%u MHz), ceiling %u/%u, %d mC\n", big,
 		    little, osm[1].row, osm[0].row, osm[1].open ? osm[1].khz[osm[1].row] / 1000 : 0,
 		    osm[0].open ? osm[0].khz[osm[0].row] / 1000 : 0, govCap, govCapLittle, mc);
+		tell("cpufreq: cores %u %u %u %u %u %u %u %u (busy %%, core 0 to 7)\n", govCoreUtil[0],
+		    govCoreUtil[1], govCoreUtil[2], govCoreUtil[3], govCoreUtil[4], govCoreUtil[5], govCoreUtil[6],
+		    govCoreUtil[7]);
 	}
 }
 
