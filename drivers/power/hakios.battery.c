@@ -54,6 +54,20 @@ hakios_battery_temperature(void)
 	return battery_temperature_c;
 }
 
+/*
+ * For the guard that stops a run left on its own (drivers/power/hakios.battguard.c): the last reading, and whether
+ * it is one to act on -- a charge between 0 and 100 with a battery present. (Through this function rather than the
+ * sysctls: the guard runs early and the sysctl tree is not what it reads.)
+ */
+bool
+hakios_battery_guard(int * soc, int * present, int * charger)
+{
+	*soc = battery_soc_percent;
+	*present = battery_present;
+	*charger = battery_charger_present;
+	return battery_soc_percent >= 0 && battery_soc_percent <= 100 && battery_present;
+}
+
 SYSCTL_DECL(_kern_hakios);              /* the node is drivers/core/hakios.platform.c's: every driver hangs its sysctls there */
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_soc, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_soc_percent, 0, "battery state of charge, 0..100 percent, or -1 if unknown");

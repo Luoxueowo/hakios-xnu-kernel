@@ -35,7 +35,8 @@ extern void hakios_var_save_on_return(void);
 extern void hakios_adreno_stop(void);
 extern void hakios_wifi_stop(void);
 extern void hakios_adsp_stop(void);
-extern int kernel_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+/* (drivers/power/hakios.battery.c: the last reading, and whether it is one to act on) */
+extern bool hakios_battery_guard(int * soc, int * present, int * charger);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -58,21 +59,12 @@ static thread_call_t call;
 static uint32_t stop_percent, poll_seconds = 20, looks, strikes, last_said_minute = ~0u;
 static bool stopping;
 
-static bool
-read_int(const char *name, int *value)
-{
-	size_t size = sizeof(*value);
-
-	return kernel_sysctlbyname(name, value, &size, NULL, 0) == 0 && size == sizeof(*value);
-}
-
 static void
 tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	int soc = -1, present = 0, charger = 0;
 	uint64_t deadline;
-	bool known = read_int("kern.hakios.battery_soc", &soc) && read_int("kern.hakios.battery_present", &present) &&
-	    read_int("kern.hakios.battery_charger_present", &charger) && soc >= 0 && soc <= 100 && present && !charger;
+	bool known = hakios_battery_guard(&soc, &present, &charger) && !charger;
 	uint32_t minute = (uint32_t)(++looks * poll_seconds / 300);       /* a line every five minutes, and the first */
 
 	if (minute != last_said_minute || looks == 1) {
