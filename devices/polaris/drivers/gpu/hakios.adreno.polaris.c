@@ -2830,6 +2830,7 @@ hakios_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *ho
 }
 
 static uint64_t keep_blocks;           /* (2 MB blocks written instead of 512 pages: for the log) */
+static int keep_block_on = -1;         /* (gpu_block=0: pages only, for a run that wants the old mapping) */
 
 void
 hakios_gpu_blocks(uint64_t *blocks)
@@ -2903,8 +2904,14 @@ hakios_gpu_map_range(uint64_t address, uint64_t phys, uint64_t size, bool read_o
 		}
 	}
 
+	if (keep_block_on < 0) {
+		uint32_t on = 1;
+
+		/* (gpu_block=0: pages only, for a run that wants the mapping the way it was) */
+		keep_block_on = !PE_parse_boot_argn("gpu_block", &on, sizeof(on)) || on != 0;
+	}
 	/* The body: 2 MB blocks while both sides allow them and nothing is mapped there yet. */
-	while (size >= 0x200000ull && (address & 0x1fffffull) == 0 && (phys & 0x1fffffull) == 0) {
+	while (keep_block_on && size >= 0x200000ull && (address & 0x1fffffull) == 0 && (phys & 0x1fffffull) == 0) {
 		uint64_t *l2 = keep_l2_get(address, true);
 		uint32_t i2 = (uint32_t) ((address >> 21) & 0x1ff);
 

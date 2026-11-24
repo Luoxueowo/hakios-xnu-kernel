@@ -52,6 +52,7 @@ bool hakios_gpu_parameter(uint32_t which, uint64_t * value);
 uint64_t hakios_gpu_address(uint64_t size);
 void hakios_gpu_address_free(uint64_t address, uint64_t size);
 bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+bool hakios_gpu_map_range(uint64_t address, uint64_t phys, uint64_t size, bool read_only);
 void hakios_gpu_mapped(void);
 void hakios_gpu_unmap(uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void * start, uint64_t size);
@@ -667,11 +668,28 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 		IOLog("HakiosGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
 		return NULL;
 	}
-	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
+	/*
+	 * A run of physical memory at a time, not a page at a time: the map goes in with whatever the run allows,
+	 * 2 MB blocks included (hakios_gpu_map_range()). A page at a time (what this used to be) never gave it more
+	 * than 4 KB to work with, which is why a 9.4 MB surface took 2300 entries and 2.5 to 2.9 ms.
+	 */
+	for (uint64_t offset = 0; offset < size && mapped;) {
 		IOByteCount length = 0;
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
+		uint64_t run;
 
-		mapped = phys != 0 && hakios_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
+		if (phys == 0 || (phys & 0xfffull) != 0) {
+			mapped = false;
+			break;
+		}
+		run = length < size - offset ? (uint64_t) length : size - offset;
+		run &= ~0xfffull;
+		if (run == 0) {
+			mapped = false;
+			break;
+		}
+		mapped = hakios_gpu_map_range(b->address + offset, phys, run, flags & MSM_BO_GPU_READONLY);
+		offset += run;
 	}
 	hakios_gpu_mapped();
 	if (!mapped) {
