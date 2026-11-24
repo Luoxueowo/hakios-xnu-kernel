@@ -123,6 +123,7 @@ public:
 	OSDictionary *                  values;
 	uint32_t                        useCount[2];
 	uint32_t                        purgeable;
+	uint32_t                        poolSlot;       /* 1 + the display-memory slot its pixels are in; 0: ordinary memory */
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
 
 	virtual bool
@@ -176,6 +177,11 @@ MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint3
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
+/*
+ * A range of display memory below 4 GiB, cut into slots of `slot` bytes, that a full-panel surface may
+ * put its pixels in: the display can then read the picture where it is (fb_native=2). Zero disables it.
+ */
+void            MiniIOSurfaceSetScanoutPool(uint64_t physical, uint64_t bytes, uint64_t slot);
 
 
 #endif /* _IOKIT_MINIIOSURFACE_H */

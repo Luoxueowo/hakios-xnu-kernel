@@ -810,19 +810,26 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 {
 	MiniIOSurface * s = MiniIOSurfaceCopy(request->surface);
 	struct gpu_buffer * b = NULL;
-	IOMemoryDescriptor * memory;
-	uint64_t size, began = mach_absolute_time();
+	IOMemoryDescriptor * memory, * pixels;
+	uint64_t size, from, began = mach_absolute_time();
 
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
-	if (s->client != NULL) {
+	size = round_page_64(s->info.allocSize);
+	if (s->poolSlot != 0) {
+		/* the pixels are a slot of the display's reserved memory, below 4 GiB: drawn in where they are scanned */
+		pixels = s->client;
+		from = 0;
+	} else if (s->client != NULL) {
 		/* (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes) */
 		MiniIOSurfaceDrop(s);
 		return kIOReturnUnsupported;
+	} else {
+		pixels = s->memory;
+		from = PAGE_SIZE;
 	}
-	size = round_page_64(s->info.allocSize);
-	memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
+	memory = IOSubMemoryDescriptor::withSubRange(pixels, from, size, kIODirectionInOut);
 	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
 		OSSafeReleaseNULL(memory);
 		MiniIOSurfaceDrop(s);
@@ -853,9 +860,9 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 	if (b != NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
-	} else if ((b = newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
+	} else if ((b = newBuffer(pixels, from, size, 0, &request->handle)) != NULL) {
 		b->memory = memory;
-		b->kernel = s->kbase + PAGE_SIZE;
+		b->kernel = s->kpixels;
 		b->surface = s;
 		gGPUStat.surfaces++;
 	}

@@ -36,6 +36,9 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMapTypes.h>
+/* (a cached mapping of the display's reserved memory: ml_io_map_unmappable() with VM_WIMG_DEFAULT) */
+#include <vm/memory_types.h>
+#include <arm/memory_types.h>
 
 #include "MiniIOSurface.h"
 
@@ -262,6 +265,8 @@ static TUNABLE(uint32_t, gMeasure, "fb_measure", 0);
  */
 static TUNABLE(uint32_t, gBeam, "fb_beam", 1);
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+/* (osfmk/arm/machine_routines.h keeps this behind PEXPERT_KERNEL_PRIVATE) */
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
 static inline uint32_t refreshHz(void);
 
 /*
@@ -281,6 +286,7 @@ static TUNABLE(uint32_t, gFBFlip, "fb_flip", 0);
  */
 static TUNABLE(uint32_t, gFBNative, "fb_native", 0);
 static uint32_t gFBNativeFrames;
+static uint32_t gFBNativeMisses;
 
 /* The pixels the GPU wrote are read by the display, which is not in their cache: drop the lines the processor may still hold. */
 static void
@@ -290,7 +296,7 @@ nativeInvalidate(uint8_t * start, size_t bytes)
 	uintptr_t end = (uintptr_t) start + bytes;
 
 	for (; line < end; line += 64) {
-		__asm__ volatile ("dc ivac, %0" : : "r" (line) : "memory");
+		__asm__ volatile ("dc cvac, %0" : : "r" (line) : "memory");
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
@@ -428,6 +434,28 @@ public:
 	IOMemoryMap *   fFlipMap;
 	IOBufferMemoryDescriptor * fShadowBuffer; /* fb_flip: the picture is drawn here, cached, then written to the scanout buffer */
 	uint8_t *       fShadow;
+	/*
+	 * A frame of one surface that fills the panel leaves nothing of the buffer behind it, so it is
+	 * drawn straight into the scanout buffer that is not being read (fDirect): the copy of it into
+	 * that buffer is left out, which is 9 MB less read and 9 MB less written for every frame. The
+	 * shadow is then a frame behind, and is cleared before a frame that needs what is under it
+	 * (fShadowValid). A frame that is scaled is drawn again, filtered, once it stands still
+	 * (fb_filter=2): that one needs the shadow, and is not drawn so (see settle()).
+	 */
+	bool            fDirect;
+	bool            fShadowValid;
+	bool            fScaledFrame;
+	/*
+	 * fb_native=2: the surfaces the DPU has been pointed at. Each is held until the panel has moved off it -- two
+	 * latches and two of the interface's frames later -- or its memory is handed to the next surface the window
+	 * server makes while the panel still reads it, and half of that frame goes on the screen (24 November).
+	 */
+	MiniIOSurface * fNativeHeld[3];
+	uint32_t        fNativeHeldFrame[3];    /* the interface's frame count when it was latched */
+	uint32_t        fNativeHeldLatches[3];  /* how many latches the driver had done by then */
+	unsigned        fNativeHeldCount;
+	uint32_t        fNativeLatched;
+	volatile uint32_t * fIntf;              /* the DSI interface's counters (INTF0..3), when one of them is the live one */
 	unsigned        fFlipFront;
 	uint32_t        fFlipCount;
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
@@ -481,12 +509,14 @@ public:
 	uint64_t        fStatBeatWait;
 	uint32_t        fStatSurfaces[8];       /* the first different surfaces the bottom layer was given */
 	uint32_t        fStatHeld, fStatLost;   /* swaps that waited for the one before; that gave up waiting */
+	uint32_t        fStatShadowRebuilt;     /* frames whose layers do not cover the panel: their shadow was cleared first */
 	uint64_t        fSwapTime;              /* when the last swap was handed over */
 	uint32_t        fStatSwapsLate;         /* swaps that came more than a refresh and a quarter after the one before (and no pause) */
 	uint64_t        fStatWaiting;           /* how long frames waited for the GPU here */
 	/* how the display is doing: frames and time spent drawing them here since fStatSince */
 	uint32_t        fStatFrames;
 	uint64_t        fStatSince, fStatDrawing;
+	uint64_t        fStatDraw, fStatFlip;   /* ... of which: drawing the layers, and putting the frame in the scanout buffer */
 	/* ... and how evenly: the time from each frame to the next, counted by the millisecond (the last count: longer) */
 	uint64_t        fLastFrame;
 	uint32_t        fFrameTimes[FRAME_TIMES + 1], fFramePauses, fFrameLongest;
@@ -510,6 +540,9 @@ public:
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void flipSetup(void);
 	void flipPresent(void);
+	void nativeHold(uint32_t sid);
+	void nativeRelease(void);
+	void nativeReleaseAll(void);
 	void flipDisable(void);
 	void publishModes(void);
 	void publishRefresh(void);
@@ -650,10 +683,11 @@ IOMobileFramebuffer::publishModes(void)
 void
 IOMobileFramebuffer::flipSetup(void)
 {
-	vm_offset_t mdss;
+	vm_offset_t mdss, scanout;
 	volatile uint32_t * top, * pipe, * ctl;
 	uint64_t physical, bytes, slotSize, slotPhysical;
 	uint32_t source, expectedSize;
+	bool native;
 
 	if (gFBFlip == 0) {
 		return;
@@ -674,6 +708,36 @@ IOMobileFramebuffer::flipSetup(void)
 	}
 	pipe = (volatile uint32_t *) (mdss + POLARIS_DPU_SSPP0);
 	ctl = (volatile uint32_t *) (mdss + POLARIS_DPU_CTL0);
+	/*
+	 * fb_native=2: the interface's own frame counter, for knowing when the panel has moved off a surface. The four
+	 * interfaces follow the DPU's control blocks (SDM845: 0xae94000, one every 0x1000); the one whose timing engine
+	 * is on and whose frame count moves is the panel's.
+	 */
+	if (gFBNative == 2) {
+		vm_offset_t intfs = ml_io_map((vm_offset_t) (POLARIS_DPU_MDSS + 0x94000), 0x4000);
+
+		for (unsigned i = 0; intfs != 0 && i < 4; i++) {
+			volatile uint32_t * p = (volatile uint32_t *) (intfs + i * 0x1000);
+			uint32_t first;
+
+			if ((p[INTF_TIMING_ENGINE_EN / 4] & 1) == 0) {
+				continue;
+			}
+			first = p[INTF_FRAME_COUNT / 4];
+			for (unsigned look = 0; look < 20 && p[INTF_FRAME_COUNT / 4] == first; look++) {
+				IOSleep(1);
+			}
+			if (p[INTF_FRAME_COUNT / 4] != first) {
+				fIntf = p;
+				IOLog("MiniIOMobileFramebuffer: fb_native=2: interface %u counts frames (%u in 20 ms); a surface is let go of when the panel has moved on\n",
+				    i, p[INTF_FRAME_COUNT / 4] - first);
+				break;
+			}
+		}
+		if (fIntf == NULL) {
+			IOLog("MiniIOMobileFramebuffer: fb_native=2: no interface counts frames; a surface is let go of two latches later\n");
+		}
+	}
 	expectedSize = (fPanelHeight << 16) | fPanelWidth;
 	if (pipe[POLARIS_DPU_SRC_SIZE / 4] != expectedSize || pipe[POLARIS_DPU_YSTRIDE / 4] != fRowBytes) {
 		IOLog("MiniIOMobileFramebuffer: fb_flip: SSPP0 size %#x stride %#x do not match %ux%u stride %u; using the boot framebuffer\n",
@@ -713,36 +777,75 @@ IOMobileFramebuffer::flipSetup(void)
 			return;
 		}
 	}
-	fFlipDescriptor = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) slotPhysical,
-	    (IOByteCount) slotSize, kIODirectionInOut);
-	fFlipMap = fFlipDescriptor != NULL ? fFlipDescriptor->map(kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
-	if (fFlipMap == NULL) {
-		IOLog("MiniIOMobileFramebuffer: fb_flip: cannot map reserved scanout buffer at %#llx; using the boot framebuffer\n",
-		    (unsigned long long) slotPhysical);
-		OSSafeReleaseNULL(fFlipMap);
-		OSSafeReleaseNULL(fFlipDescriptor);
-		return;
-	}
-	fFlipPhysical[0] = (uint32_t) physical;
-	fFlipPhysical[1] = (uint32_t) slotPhysical;
-	fFlipBuffer[0] = fBase;
-	fFlipBuffer[1] = (uint8_t *) fFlipMap->getVirtualAddress();
 	/*
-	 * The picture is drawn into a cached buffer and written to the scanout buffer once a frame.
-	 * Drawing straight into the write-combined buffer means reading it back as soon as a frame is
-	 * not one opaque surface over the whole panel, and a read of 9 MB of it costs about 200 ms.
+	 * fb_native=2: one scanout buffer -- the loader's, which the panel starts on -- and three slots after it for the
+	 * pixels of full-panel surfaces, each held until the panel has moved off it (nativeHold()). Three, because one
+	 * is on the panel, one is the frame that was just latched and read by the scan after this one, and the window
+	 * server is drawing the next into a third.
+	 */
+	native = false;
+	if (gFBNative == 2) {
+		uint64_t slot = round_page((uint64_t) PAGE_SIZE + (uint64_t) 4352 * 2160);
+
+		if (physical + slotSize + slot * 3 <= POLARIS_DISPLAY_BASE + POLARIS_DISPLAY_BYTES) {
+			fFlipPhysical[0] = fFlipPhysical[1] = (uint32_t) physical;
+			fFlipBuffer[0] = fFlipBuffer[1] = fBase;
+			native = true;
+		} else {
+			IOLog("MiniIOMobileFramebuffer: fb_native=2: three %llu-byte slots after the framebuffer do not fit the 36 MiB region; copying\n",
+			    (unsigned long long) slot);
+		}
+	}
+	if (!native) {
+		/*
+		 * The two scanout buffers after the one the loader left: mapped cached, not write-combined. A frame written
+		 * into a write-combined (uncached) mapping costs about 10 ms of the driver's time on this phone, against
+		 * about 2 in memory the processor caches -- the difference between 40 and 60 frames a second (24 November:
+		 * 12 ms a frame with every frame written there, 44 to 53 a second). The panel reads memory, not caches, so
+		 * what is written is cleaned to the point of coherency before the DPU is pointed at it (flipPresent()).
+		 */
+		scanout = ml_io_map_unmappable((vm_offset_t) slotPhysical, (vm_size_t) (slotSize * 2), VM_WIMG_DEFAULT);
+		if (scanout == 0) {
+			IOLog("MiniIOMobileFramebuffer: fb_flip: cannot map the scanout buffers at %#llx in cached memory; using the boot framebuffer\n",
+			    (unsigned long long) slotPhysical);
+			return;
+		}
+		fFlipPhysical[0] = (uint32_t) slotPhysical;
+		fFlipPhysical[1] = (uint32_t) (slotPhysical + slotSize);
+		fFlipBuffer[0] = (uint8_t *) scanout;
+		fFlipBuffer[1] = (uint8_t *) scanout + slotSize;
+	}
+	/*
+	 * The picture is drawn into a cached buffer and written to the scanout buffer once a frame: a frame that is not
+	 * one opaque surface over the whole panel has to be drawn over what was under it.
 	 */
 	fShadowBuffer = IOBufferMemoryDescriptor::withCapacity((vm_size_t) bytes, kIODirectionInOut);
 	fShadow = fShadowBuffer != NULL ? (uint8_t *) fShadowBuffer->getBytesNoCopy() : NULL;
 	if (fShadow != NULL) {
-		memcpy(fShadow, fFlipBuffer[0], (size_t) bytes);
-	} else {
-		memcpy(fFlipBuffer[1], fFlipBuffer[0], (size_t) bytes);
+		memcpy(fShadow, fBase, (size_t) bytes);         /* (the loader's picture, on the panel until the first frame) */
+	} else if (fFlipBuffer[0] != fBase) {
+		memcpy(fFlipBuffer[0], fBase, (size_t) bytes);
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	fFlipFront = 0;
 	fFlipOn = true;
+	fDirect = false;
+	fShadowValid = fShadow != NULL;
 	fBase = fShadow != NULL ? fShadow : fFlipBuffer[1];
+	if (native) {
+		/*
+		 * What is left of the reserved scanout region, for the pixels of full-panel surfaces: the DPU reads them
+		 * where they are, which needs them below 4 GiB, and this region is the memory we know to be there. A slot
+		 * holds a state page and a 1080x2160 picture with the row the window server asks for (1088 pixels, 4352
+		 * bytes).
+		 */
+		uint64_t slot = round_page((uint64_t) PAGE_SIZE + (uint64_t) 4352 * 2160);
+		uint64_t poolBase = physical + slotSize;
+
+		IOLog("MiniIOMobileFramebuffer: fb_native=2: three scanout slots at %#llx, %llu bytes each; the framebuffer at %#llx is the scanout buffer\n",
+		    (unsigned long long) poolBase, (unsigned long long) slot, (unsigned long long) physical);
+		MiniIOSurfaceSetScanoutPool(poolBase, slot * 3, slot);
+	}
 	gFlipPipe = pipe;
 	gFlipCtl = ctl;
 	gFlipBoot = (uint32_t) physical;
@@ -759,24 +862,25 @@ IOMobileFramebuffer::flipDisable(void)
 	if (!fFlipOn) {
 		return;
 	}
-	if (fShadow != NULL) {
+	if (fShadow != NULL && fShadowValid) {
 		memcpy(fFlipBuffer[0], fShadow, (size_t) bytes);
-		__asm__ volatile ("dsb sy" ::: "memory");
-	}
-	else if (fBase != fFlipBuffer[0]) {
+	} else if (fBase != fFlipBuffer[0] && fBase != NULL) {
 		memcpy(fFlipBuffer[0], fBase, (size_t) bytes);
-		__asm__ volatile ("dsb sy" ::: "memory");
 	}
-	gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = gFlipBoot;
+	nativeInvalidate(fFlipBuffer[0], (size_t) bytes);
+	gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = fFlipPhysical[0];
 	__asm__ volatile ("dsb sy" ::: "memory");
 	gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	restored = dpuWaitFlush(gFlipCtl);
 	fFlipOn = false;
 	fFlipFront = 0;
+	fDirect = false;
+	fShadowValid = true;
 	fBase = fFlipBuffer[0];
-	IOLog("MiniIOMobileFramebuffer: fb_flip: disabled after a DPU timeout; firmware framebuffer %s restored\n",
-	    restored ? "is" : "may not be");
+	nativeReleaseAll();                     /* (the DPU reads none of them now) */
+	IOLog("MiniIOMobileFramebuffer: fb_flip: disabled after a DPU timeout; the last frame stays on the panel (buffer %#x, %s)\n",
+	    fFlipPhysical[0], restored ? "latched" : "may not be");
 }
 
 void
@@ -793,24 +897,93 @@ IOMobileFramebuffer::flipPresent(void)
 		return;
 	}
 	next = 1 - fFlipFront;
-	if (fShadow != NULL) {
+	if (fShadow != NULL && !fDirect) {
 		memcpy(fFlipBuffer[next], fShadow, (size_t) fRowBytes * fPanelHeight);
 	}
+	fDirect = false;
+	/* the frame is in memory the processor caches: out of the cache, or the DPU reads what was there before */
+	nativeInvalidate(fFlipBuffer[next], (size_t) fRowBytes * fPanelHeight);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = fFlipPhysical[next];
 	__asm__ volatile ("dsb sy" ::: "memory");
 	gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
 	__asm__ volatile ("dsb sy" ::: "memory");
-	if (!dpuWaitFlush(gFlipCtl)) {
-		IOLog("MiniIOMobileFramebuffer: fb_flip: DPU did not latch buffer %#x within 40 ms\n", fFlipPhysical[next]);
-		flipDisable();
-		return;
-	}
+	/*
+	 * The flush is taken at the panel's next frame boundary, so waiting for its bit to clear here waits for that
+	 * boundary -- half a refresh of the driver's time, every frame, with the next frame's drawing behind it (24
+	 * November: 10 to 15 ms a frame either way, whether the frame is copied into the buffer or drawn there). The
+	 * wait that matters is the one at the top, for the flush before this one: that buffer is about to be written.
+	 */
 	fFlipFront = next;
 	fBase = fShadow != NULL ? fShadow : fFlipBuffer[1 - fFlipFront];
 	if (++fFlipCount <= 4 || fFlipCount % 300 == 0) {
 		IOLog("MiniIOMobileFramebuffer: fb_flip: latched buffer %u at %#x (flip %u)\n", fFlipFront,
 		    fFlipPhysical[fFlipFront], fFlipCount);
+	}
+}
+
+/*
+ * fb_native=2: a surface the DPU reads is held until the panel has moved off it. The panel switches at a frame
+ * boundary, so the surface latched now is read during the next frame; it is let go of two latches (and two of the
+ * interface's frames, when its counter can be read) later.
+ */
+void
+IOMobileFramebuffer::nativeHold(uint32_t sid)
+{
+	MiniIOSurface * s;
+	uint32_t frame = fIntf != NULL ? fIntf[INTF_FRAME_COUNT / 4] : 0;
+
+	s = MiniIOSurfaceCopy(sid);
+	if (s == NULL) {
+		return;
+	}
+	if (fNativeHeldCount >= sizeof(fNativeHeld) / sizeof(fNativeHeld[0])) {
+		/* three held already: the panel has not been seen to move off the oldest, and a fourth would be worse */
+		MiniIOSurfaceDrop(fNativeHeld[0]);
+		for (unsigned i = 0; i + 1 < fNativeHeldCount; i++) {
+			fNativeHeld[i] = fNativeHeld[i + 1];
+			fNativeHeldFrame[i] = fNativeHeldFrame[i + 1];
+			fNativeHeldLatches[i] = fNativeHeldLatches[i + 1];
+		}
+		fNativeHeldCount--;
+	}
+	fNativeHeld[fNativeHeldCount] = s;
+	fNativeHeldFrame[fNativeHeldCount] = frame;
+	fNativeHeldLatches[fNativeHeldCount] = ++fNativeLatched;
+	fNativeHeldCount++;
+}
+
+/* Let go of the surfaces the panel has left -- and of the oldest one when three are held and it has not. */
+void
+IOMobileFramebuffer::nativeRelease(void)
+{
+	uint32_t frame = fIntf != NULL ? fIntf[INTF_FRAME_COUNT / 4] : 0;
+	unsigned kept = 0;
+
+	for (unsigned i = 0; i < fNativeHeldCount; i++) {
+		bool gone = fNativeLatched - fNativeHeldLatches[i] >= 2 &&
+		    (fIntf == NULL || (int32_t) (frame - fNativeHeldFrame[i]) >= 2);
+		bool oldest = fNativeHeldCount - i >= 3;
+
+		if (gone || oldest) {
+			MiniIOSurfaceDrop(fNativeHeld[i]);
+			continue;
+		}
+		fNativeHeld[kept] = fNativeHeld[i];
+		fNativeHeldFrame[kept] = fNativeHeldFrame[i];
+		fNativeHeldLatches[kept] = fNativeHeldLatches[i];
+		kept++;
+	}
+	fNativeHeldCount = kept;
+}
+
+void
+IOMobileFramebuffer::nativeReleaseAll(void)
+{
+	while (fNativeHeldCount != 0) {
+		fNativeHeldCount--;
+		MiniIOSurfaceDrop(fNativeHeld[fNativeHeldCount]);
+		fNativeHeld[fNativeHeldCount] = NULL;
 	}
 }
 
@@ -1444,6 +1617,9 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.ry1 = py1 > (int32_t) fPanelHeight ? (int32_t) fPanelHeight : py1;
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
+	if (!job.unscaled) {
+		fScaledFrame = true;            /* (drawn again, filtered, once it stands still: see settle()) */
+	}
 	job.scan = fSettling ? 0 : fBeamScan;
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, job.ry0, job.ry1, fBlendRow);
@@ -1668,12 +1844,21 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (!fGraphics) {
 		return;
 	}
+	/*
+	 * A frame drawn 1:1 would come out the same again: it is only waited for the filtering when the panel is given a
+	 * picture of another size. And a frame that was drawn straight into the scanout buffer has nothing under its
+	 * layers in the shadow to draw again over (see show()).
+	 */
+	if (!fScaledFrame || (fShadow != NULL && !fShadowValid)) {
+		return;
+	}
 	fSettling = true;
 	if (fFlipOn) {
 		unsigned draw = 1 - fFlipFront;
 
 		if (fShadow != NULL) {
 			fBase = fShadow;
+			fDirect = false;
 		} else {
 			memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
 			fBase = fFlipBuffer[draw];
@@ -1780,43 +1965,82 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	IOLockLock(fLock);
 	bool presented = false;
 
+	/* (the surfaces the panel has left by now: their memory is free for this frame's) */
+	nativeRelease();
+
 	if (fFlipOn && gFBNative == 2 && swapFillsPanel(swap, surfaces, fPanelWidth, fPanelHeight)) {
 		uint64_t physical = 0, nativeBytes = 0;
 		uint32_t nativeStride = 0;
 		MiniIOSurface * s = surfaces[0];
+		bool one = MiniIOSurfacePhysical(s, &physical, &nativeBytes, &nativeStride);
+		bool fits = one && physical + nativeBytes <= 0xffffffffull &&
+		    (uint64_t) nativeStride * fPanelHeight <= nativeBytes;
 
-		if (MiniIOSurfacePhysical(s, &physical, &nativeBytes, &nativeStride) &&
-		    physical + nativeBytes <= 0xffffffffull &&
-		    (uint64_t) nativeStride * fPanelHeight <= nativeBytes) {
+		if (gFBNativeMisses < 3) {
+			gFBNativeMisses++;
+			IOLog("MiniIOMobileFramebuffer: fb_native=2: surface %u %ux%u, %u bytes a row: %s at %#llx + %llu; %s\n",
+			    swapWord(swap, SWAP_SURFACE(0)), s->info.width, s->info.height, s->info.bytesPerRow,
+			    one ? "one contiguous range" : "not one contiguous range",
+			    (unsigned long long) physical, (unsigned long long) nativeBytes,
+			    fits ? "scanning it where it is" : "copied");
+		}
+		if (fits) {
 			nativeInvalidate(s->kpixels, (size_t) nativeBytes);
 			gFlipPipe[POLARIS_DPU_YSTRIDE / 4] = nativeStride;
 			gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = (uint32_t) physical;
 			__asm__ volatile ("dsb sy" ::: "memory");
 			gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
 			__asm__ volatile ("dsb sy" ::: "memory");
-			if (dpuWaitFlush(gFlipCtl)) {
-				presented = true;
-				layers = 1;
-				fFlipFront = 1 - fFlipFront;
-				fBase = fShadow != NULL ? fShadow : fFlipBuffer[1 - fFlipFront];
-				if (++gFBNativeFrames <= 3) {
-					IOLog("MiniIOMobileFramebuffer: fb_native=2: the DPU reads surface %u at %#llx (stride %u, %llu bytes) where it is\n",
-					    swapWord(swap, SWAP_SURFACE(0)), (unsigned long long) physical, nativeStride,
-					    (unsigned long long) nativeBytes);
-				}
+			/* (the flush is taken at the panel's next frame boundary: it is not waited for here, see flipPresent()) */
+			presented = true;
+			recorded = s;
+			layers = 1;
+			fBase = fShadow != NULL ? fShadow : fFlipBuffer[0];
+			fDirect = false;
+			fShadowValid = false;                   /* (the panel has the surface's own pixels now, not a copy of them) */
+			nativeHold(swapWord(swap, SWAP_SURFACE(0)));
+			if (++gFBNativeFrames <= 3) {
+				IOLog("MiniIOMobileFramebuffer: fb_native=2: the DPU reads surface %u at %#llx (stride %u, %llu bytes) where it is\n",
+				    swapWord(swap, SWAP_SURFACE(0)), (unsigned long long) physical, nativeStride,
+				    (unsigned long long) nativeBytes);
 			}
 		}
 	}
+	/*
+	 * The buffer this frame is drawn into must have been left by the panel first: the flush of the frame before is
+	 * checked here, before anything is written, and not after this frame is latched (which would be a wait for a
+	 * boundary that has nothing to do with it -- see flipPresent()).
+	 */
+	if (fFlipOn && !presented && !dpuWaitFlush(gFlipCtl)) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: the DPU did not take the frame before within 40 ms\n");
+		flipDisable();
+	}
 	if (fFlipOn && !presented) {
 		unsigned draw = 1 - fFlipFront;
+		/* (a frame of the whole display, whatever the display is: it is drawn over the whole panel either way) */
+		bool fills = swapFillsPanel(swap, surfaces, fWidth, fHeight);
 
 		if (gFBNative == 2) {
 			gFlipPipe[POLARIS_DPU_YSTRIDE / 4] = fRowBytes;      /* back to the copy path's own buffers */
 		}
 		if (fShadow != NULL) {
-			fBase = fShadow;
+			if (fills && !fSettling) {
+				/* nothing of the frame before is left showing: drawn where it is scanned, and not copied there */
+				fBase = fFlipBuffer[draw];
+				fDirect = true;
+				fShadowValid = false;
+			} else {
+				if (!fShadowValid) {
+					/* what is under these layers was drawn into a scanout buffer a frame ago, and is not read back from it */
+					bzero(fShadow, (size_t) fRowBytes * fPanelHeight);
+					fShadowValid = true;
+					fStatShadowRebuilt++;
+				}
+				fBase = fShadow;
+				fDirect = false;
+			}
 		} else {
-			if (!swapFillsPanel(swap, surfaces, fPanelWidth, fPanelHeight)) {
+			if (!fills) {
 				memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
 			}
 			fBase = fFlipBuffer[draw];
@@ -1839,11 +2063,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
+	uint64_t drawBegan = mach_absolute_time(), drawEnded, flipEnded;
 	for (unsigned layer = 0; !presented && layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
 		MiniIOSurface * s;
 
+		if (layer == 0) {
+			fScaledFrame = false;           /* (whether any layer of it is drawn larger or smaller than it is) */
+		}
 		layers |= sid != 0 ? 1u << layer : 0;
 		/* the frames' surfaces: is it a few, in turn? */
 		for (unsigned i = 0; layer == 0 && sid != 0 && i < 8; i++) {
@@ -1888,6 +2116,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	drawEnded = mach_absolute_time();
 	if (!presented) {
 		flipPresent();
 	} else if (!fGraphics) {
@@ -1895,7 +2124,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fGraphics = true;
 		PE_initialize_console(NULL, kPEGraphicsMode);
 	}
-	drawn = mach_absolute_time();
+	flipEnded = mach_absolute_time();
+	fStatDraw += drawEnded - drawBegan;
+	fStatFlip += flipEnded - drawEnded;
+	drawn = flipEnded;
 	if (recorded != NULL) {
 		record(recorded);
 	}
@@ -1965,6 +2197,20 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		bzero(fStatSurfaces, sizeof(fStatSurfaces));
 		fStatHeld = fStatLost = fStatOnBeat = fStatSettled = 0;
 		fStatWaiting = fStatBeatWait = 0;
+		if (fStatShadowRebuilt != 0) {
+			IOLog("MiniIOMobileFramebuffer: %u frames began on a cleared shadow: their layers do not cover the panel\n",
+			    fStatShadowRebuilt);
+			fStatShadowRebuilt = 0;
+		}
+		if (fStatFrames != 0) {
+			uint64_t drawNs = 0, flipNs = 0;
+
+			absolutetime_to_nanoseconds(fStatDraw, &drawNs);
+			absolutetime_to_nanoseconds(fStatFlip, &flipNs);
+			IOLog("MiniIOMobileFramebuffer: of those, %llu us a frame went into drawing the layers and %llu us into putting "
+			    "the frame in the scanout buffer (the rest: waiting for the GPU, for the swap queue and to be scheduled)\n",
+			    drawNs / fStatFrames / NSEC_PER_USEC, flipNs / fStatFrames / NSEC_PER_USEC);
+		}
 		reportFrameTimes();
 		if (fDiff) {
 			IOLog("MiniIOMobileFramebuffer: %llu pixels of the panel changed a frame, all within %u,%u to %u,%u\n",
@@ -1975,6 +2221,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		fStatFrames = 0;
 		fStatDrawing = 0;
+		fStatDraw = fStatFlip = 0;
 		fStatSince = 0;
 	}
 	IOLockUnlock(fLock);

@@ -86,6 +86,11 @@ static MiniIOSurface *  gSurfaceTable[MINISURF_TABLE_SIZE];     /* index = surfa
 static uint32_t         gSurfaceNext = 1;
 static uint32_t         gSurfaceCount;
 static uint64_t         gSurfaceBytes;
+static uint32_t         gSurfacesContiguous;    /* how many got one run of pages (fb_native=2 can scan those where they are) */
+static uint64_t         gPoolBase;              /* display memory below 4 GiB, for the pixels of full-panel surfaces */
+static uint64_t         gPoolSlot;
+static unsigned         gPoolSlots;
+static bool             gPoolUsed[4];
 static uint32_t         gSurfaceUnheld;         /* surfaces around client memory that could not be made (said a few times) */
 /* what making surfaces and taking them away has cost since it was last asked (MiniIOSurfaceCost()) */
 static uint64_t         gSurfaceMaking, gSurfaceFreeing;
@@ -210,8 +215,19 @@ surfaceMemory(vm_size_t bytes)
 		}
 	}
 	if (memory == NULL) {
-		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
-		    PAGE_SIZE);
+		/*
+		 * One run of pages where the machine can give one: the display reads a frame's surface where it
+		 * is (fb_native=2), and that needs the pixels contiguous. When memory is too fragmented for it,
+		 * the surface is still made, and frames of it are copied as before.
+		 */
+		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, PAGE_SIZE);
+		if (memory != NULL) {
+			gSurfacesContiguous++;
+		} else {
+			memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
+			    bytes, PAGE_SIZE);
+		}
 	}
 	return memory;
 }
@@ -273,6 +289,11 @@ void
 MiniIOSurface::free(void)
 {
 	uint64_t began = mach_absolute_time();
+
+	if (poolSlot != 0) {
+		gPoolUsed[poolSlot - 1] = false;     /* the slot is free for the next full-panel surface */
+		poolSlot = 0;
+	}
 
 	if (traced && kpixels != NULL) {
 		uint32_t nonzero = 0, middle = 0;
@@ -632,7 +653,40 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		}
 	}
 
-	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+	s->memory = NULL;
+	s->poolSlot = 0;
+	/*
+	 * A full-panel surface may put its pixels in the display's own memory, below 4 GiB, so that the
+	 * display can read the picture where it is: the pixels are then the surface's `client` memory,
+	 * the way a surface made around its maker's memory already works.
+	 */
+	if (wrapped == NULL && gPoolBase != 0 && (uint64_t) PAGE_SIZE + alloc <= gPoolSlot) {
+		for (unsigned i = 0; i < gPoolSlots; i++) {
+			if (gPoolUsed[i]) {
+				continue;
+			}
+			s->client = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) (gPoolBase + i * gPoolSlot),
+			    (IOByteCount) gPoolSlot, kIODirectionInOut);
+			if (s->client == NULL || s->client->prepare() != kIOReturnSuccess) {
+				OSSafeReleaseNULL(s->client);
+				continue;
+			}
+			s->clientMap = s->client->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+			if (s->clientMap == NULL) {
+				s->client->complete();
+				OSSafeReleaseNULL(s->client);
+				continue;
+			}
+			gPoolUsed[i] = true;
+			s->poolSlot = i + 1;
+			break;
+		}
+	}
+	if (s->poolSlot != 0) {
+		s->memory = surfaceMemory((vm_size_t) PAGE_SIZE);               /* the page of shared state alone */
+	} else {
+		s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+	}
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
@@ -642,7 +696,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	}
 	s->kbase = (uint8_t *) s->memory->getBytesNoCopy();
 	s->values = OSDictionary::withCapacity(4);
-	s->kpixels = s->kbase + PAGE_SIZE;
+	s->kpixels = s->poolSlot != 0 ? (uint8_t *) s->clientMap->getVirtualAddress() : s->kbase + PAGE_SIZE;
 	if (wrapped != NULL) {
 		s->clientTask = current_task();
 		s->clientAddress = wrapped->unsigned64BitValue();
@@ -816,6 +870,29 @@ MiniIOSurfacePhysical(MiniIOSurface * s, uint64_t * physical, uint64_t * bytes, 
 	*bytes = need;
 	*bytesPerRow = s->info.bytesPerRow;
 	return true;
+}
+
+/* The display's own memory, below 4 GiB, cut into slots a full-panel surface may put its pixels in. */
+void
+MiniIOSurfaceSetScanoutPool(uint64_t physical, uint64_t bytes, uint64_t slot)
+{
+	gPoolBase = 0;
+	gPoolSlot = 0;
+	gPoolSlots = 0;
+	for (unsigned i = 0; i < 4; i++) {
+		gPoolUsed[i] = false;
+	}
+	if (physical == 0 || bytes == 0 || slot == 0 || physical + bytes > 0xffffffffull) {
+		return;
+	}
+	gPoolBase = physical;
+	gPoolSlot = slot;
+	gPoolSlots = (unsigned) (bytes / slot);
+	if (gPoolSlots > 4) {
+		gPoolSlots = 4;
+	}
+	IOLog("MiniIOSurface: scanout pool at %#llx, %u slots of %llu bytes (fb_native=2)\n",
+	    (unsigned long long) physical, gPoolSlots, (unsigned long long) slot);
 }
 
 void
@@ -1085,7 +1162,7 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 	ref->surface = surface;
 	ref->map = map;
 	if (surface->client != NULL && surface->clientTask != fTask) {
-		ref->pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere);
+		ref->pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere | (surface->poolSlot != 0 ? kIOMapWriteCombineCache : 0));
 	}
 	surfaceHold(surface);
 	return ref;

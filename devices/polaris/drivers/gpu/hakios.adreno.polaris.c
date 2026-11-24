@@ -2529,7 +2529,7 @@ gpu_zap_and_command(void)
 #define EVENT_PC_CCU_INV_DEPTH  0x18u
 #define EVENT_PC_CCU_INV_COLOR  0x19u
 #define KEEP_PTE_READ_ONLY      (1ull << 7)
-#define KEEP_ATTR_INDEX         0u     /* Dipper's default: uncached device memory; HakiosGPU flushes client buffers explicitly. */
+#define KEEP_ATTR_INDEX         1u     /* Dipper's default: uncached device memory; HakiosGPU flushes client buffers explicitly. */
 
 static struct { uint64_t start, size; } keep_free[1024];
 static unsigned keep_free_count, keep_free_most;
