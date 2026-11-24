@@ -772,6 +772,52 @@ MiniIOSurfaceUsage(uint32_t * count, uint64_t * bytes)
 	*bytes = gSurfaceBytes;
 }
 
+/*
+ * The pixels of a surface as one physically contiguous range, for the display to read them where they
+ * are (fb_native=2) instead of copying them out every frame. False for anything the DPU cannot be
+ * pointed at: not one 32-bit plane, memory made of more than one run of pages, or no memory at all.
+ */
+bool
+MiniIOSurfacePhysical(MiniIOSurface * s, uint64_t * physical, uint64_t * bytes, uint32_t * bytesPerRow)
+{
+	IOMemoryDescriptor * d;
+	uint64_t offset, need, walked, base = 0;
+	IOPhysicalAddress segment;
+	IOByteCount length = 0;
+
+	if (s == NULL || physical == NULL || bytes == NULL || bytesPerRow == NULL ||
+	    s->info.bytesPerElement != 4 || s->info.planeCount != 0 ||
+	    s->info.height == 0 || s->info.bytesPerRow == 0) {
+		return false;
+	}
+	need = (uint64_t) s->info.bytesPerRow * s->info.height;
+	if (s->client != NULL) {
+		d = s->client;
+		offset = 0;                     /* the client's memory is the pixels */
+	} else if (s->memory != NULL) {
+		d = s->memory;
+		offset = PAGE_SIZE;             /* a page of shared state, then the pixels */
+	} else {
+		return false;
+	}
+	for (walked = 0; walked < offset + need; ) {
+		segment = d->getPhysicalSegment(walked, &length, 0);
+		if (segment == 0 || length == 0) {
+			return false;
+		}
+		if (walked == 0) {
+			base = segment;
+		} else if (segment != base + walked) {
+			return false;           /* not one run: the DPU would read the wrong pages */
+		}
+		walked += length;
+	}
+	*physical = base + offset;
+	*bytes = need;
+	*bytesPerRow = s->info.bytesPerRow;
+	return true;
+}
+
 void
 MiniIOSurfaceDrop(MiniIOSurface * s)
 {

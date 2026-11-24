@@ -165,6 +165,13 @@ void            MiniIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t *
 void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (hakios.gpu.cpp). */
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
+/*
+ * The pixels of a surface as one physically contiguous range, for letting the display read them where
+ * they are (fb_native=2) instead of copying them out: the address, the bytes that follow it, and the
+ * row of the picture. False when the surface is not one 32-bit plane, or its memory is not contiguous.
+ */
+bool            MiniIOSurfacePhysical(MiniIOSurface * surface, uint64_t * physical, uint64_t * bytes,
+    uint32_t * bytesPerRow);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
