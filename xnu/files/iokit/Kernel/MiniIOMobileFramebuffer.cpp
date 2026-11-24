@@ -406,6 +406,8 @@ public:
 	uint32_t        fFlipPhysical[2];
 	IOMemoryDescriptor * fFlipDescriptor;
 	IOMemoryMap *   fFlipMap;
+	IOBufferMemoryDescriptor * fShadowBuffer; /* fb_flip: the picture is drawn here, cached, then written to the scanout buffer */
+	uint8_t *       fShadow;
 	unsigned        fFlipFront;
 	uint32_t        fFlipCount;
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
@@ -705,11 +707,22 @@ IOMobileFramebuffer::flipSetup(void)
 	fFlipPhysical[1] = (uint32_t) slotPhysical;
 	fFlipBuffer[0] = fBase;
 	fFlipBuffer[1] = (uint8_t *) fFlipMap->getVirtualAddress();
-	memcpy(fFlipBuffer[1], fFlipBuffer[0], (size_t) bytes);
+	/*
+	 * The picture is drawn into a cached buffer and written to the scanout buffer once a frame.
+	 * Drawing straight into the write-combined buffer means reading it back as soon as a frame is
+	 * not one opaque surface over the whole panel, and a read of 9 MB of it costs about 200 ms.
+	 */
+	fShadowBuffer = IOBufferMemoryDescriptor::withCapacity((vm_size_t) bytes, kIODirectionInOut);
+	fShadow = fShadowBuffer != NULL ? (uint8_t *) fShadowBuffer->getBytesNoCopy() : NULL;
+	if (fShadow != NULL) {
+		memcpy(fShadow, fFlipBuffer[0], (size_t) bytes);
+	} else {
+		memcpy(fFlipBuffer[1], fFlipBuffer[0], (size_t) bytes);
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	fFlipFront = 0;
 	fFlipOn = true;
-	fBase = fFlipBuffer[1];
+	fBase = fShadow != NULL ? fShadow : fFlipBuffer[1];
 	gFlipPipe = pipe;
 	gFlipCtl = ctl;
 	gFlipBoot = (uint32_t) physical;
@@ -726,7 +739,11 @@ IOMobileFramebuffer::flipDisable(void)
 	if (!fFlipOn) {
 		return;
 	}
-	if (fBase != fFlipBuffer[0]) {
+	if (fShadow != NULL) {
+		memcpy(fFlipBuffer[0], fShadow, (size_t) bytes);
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	else if (fBase != fFlipBuffer[0]) {
 		memcpy(fFlipBuffer[0], fBase, (size_t) bytes);
 		__asm__ volatile ("dsb sy" ::: "memory");
 	}
@@ -756,6 +773,9 @@ IOMobileFramebuffer::flipPresent(void)
 		return;
 	}
 	next = 1 - fFlipFront;
+	if (fShadow != NULL) {
+		memcpy(fFlipBuffer[next], fShadow, (size_t) fRowBytes * fPanelHeight);
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = fFlipPhysical[next];
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -767,7 +787,7 @@ IOMobileFramebuffer::flipPresent(void)
 		return;
 	}
 	fFlipFront = next;
-	fBase = fFlipBuffer[1 - fFlipFront];
+	fBase = fShadow != NULL ? fShadow : fFlipBuffer[1 - fFlipFront];
 	if (++fFlipCount <= 4 || fFlipCount % 300 == 0) {
 		IOLog("MiniIOMobileFramebuffer: fb_flip: latched buffer %u at %#x (flip %u)\n", fFlipFront,
 		    fFlipPhysical[fFlipFront], fFlipCount);
@@ -1631,8 +1651,13 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fSettling = true;
 	if (fFlipOn) {
 		unsigned draw = 1 - fFlipFront;
-		memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
-		fBase = fFlipBuffer[draw];
+
+		if (fShadow != NULL) {
+			fBase = fShadow;
+		} else {
+			memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
+			fBase = fFlipBuffer[draw];
+		}
 	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		MiniIOSurface * s = surfaces[layer];
@@ -1736,10 +1761,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (fFlipOn) {
 		unsigned draw = 1 - fFlipFront;
 
-		if (!swapFillsPanel(swap, surfaces, fPanelWidth, fPanelHeight)) {
-			memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
+		if (fShadow != NULL) {
+			fBase = fShadow;
+		} else {
+			if (!swapFillsPanel(swap, surfaces, fPanelWidth, fPanelHeight)) {
+				memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
+			}
+			fBase = fFlipBuffer[draw];
 		}
-		fBase = fFlipBuffer[draw];
 	}
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
