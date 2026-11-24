@@ -265,12 +265,20 @@ def present(program):
 angels = f'{src_root}/System/Library/LaunchAngels'
 os.makedirs(dest, exist_ok=True)
 for label in labels:
-    with open(f'{src}/{label}.plist', 'rb') as f:
+    path = f'{src}/{label}.plist'
+    if not os.path.exists(path):
+        # an iOS 16 launch "angel": a daemon a session starts on demand, kept out of LaunchDaemons
+        path = f'{angels}/{label}.plist'
+    with open(path, 'rb') as f:
         job = plistlib.load(f)
     job['StandardErrorPath'] = '/dev/console'
     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
     # device tree, which the loader's tree does not have yet
     job.pop('_LimitLoadToDeviceTree', None)
+    # PosterBoard's MachService is a non-launching one: on a phone a session starts the daemon for the
+    # wallpaper scene, and nothing here does, so launchd starts it or SpringBoard has nothing to host
+    if label == 'com.apple.PosterBoard':
+        job['RunAtLoad'] = True
     if 'all' in oslog or label in oslog:
         job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
     with open(f'{dest}/{label}.plist', 'wb') as f:

@@ -110,7 +110,7 @@ DARWIN_JOBS=${JOBS-"
 	com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc com.apple.lsd
 	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
-	com.apple.SpringBoard
+	com.apple.SpringBoard com.apple.PosterBoard
 "}
 # Darwin's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # drivers/wifi/hakios.apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
