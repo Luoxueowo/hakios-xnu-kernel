@@ -112,7 +112,7 @@ DARWIN_JOBS=${JOBS-"
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
 	com.apple.SpringBoard com.apple.PosterBoard
 	com.apple.mediaserverd
-	com.apple.nanoregistryd
+	com.apple.nanoregistryd com.apple.sleepd
 "}
 # mediaserverd is where VideoToolbox decodes for every other process, a HEIC picture included -- the whole
 # wallpaper of Darwin userland 16 is HEIC -- and its decoder, VCPHEVC, is in the dyld shared cache, not on disk.
