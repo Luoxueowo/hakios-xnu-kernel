@@ -1188,7 +1188,7 @@ static uint64_t sound_len;
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50
-#define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
+#define NOTE_SECONDS            180     /* how long the kernel's progress is written down as it happens (3 min, for bring-up) */
 
 static void wdt_pet(void);
 static int wdt_armed;
