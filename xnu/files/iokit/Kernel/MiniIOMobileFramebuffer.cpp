@@ -274,6 +274,26 @@ static TUNABLE(uint64_t, gIntfPhysical, "fb_intf", 0);
 /* DPU register offsets and the FLUSH scanout sequence follow Dipper's SDM845 bring-up (commit 5fcd752). */
 /* fb_flip=1: enable two-buffer scanout with the Polaris SDM845 DPU. */
 static TUNABLE(uint32_t, gFBFlip, "fb_flip", 0);
+/*
+ * fb_native=2: a frame that is one full-panel surface is not copied into a scanout buffer at all --
+ * the DPU is pointed at the surface's own pixels (the Mi 8's fb_native=2, without its pool: here the
+ * surface must already be one physically contiguous run, see MiniIOSurfacePhysical()).
+ */
+static TUNABLE(uint32_t, gFBNative, "fb_native", 0);
+static uint32_t gFBNativeFrames;
+
+/* The pixels the GPU wrote are read by the display, which is not in their cache: drop the lines the processor may still hold. */
+static void
+nativeInvalidate(uint8_t * start, size_t bytes)
+{
+	uintptr_t line = (uintptr_t) start & ~(uintptr_t) 63;
+	uintptr_t end = (uintptr_t) start + bytes;
+
+	for (; line < end; line += 64) {
+		__asm__ volatile ("dc ivac, %0" : : "r" (line) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
 #define POLARIS_DPU_MDSS       0x0ae00000ull
 #define POLARIS_DPU_VERSION    0x40000001u
 #define POLARIS_DPU_SSPP0      0x5000
@@ -1758,9 +1778,41 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
 	IOLockLock(fLock);
-	if (fFlipOn) {
+	bool presented = false;
+
+	if (fFlipOn && gFBNative == 2 && swapFillsPanel(swap, surfaces, fPanelWidth, fPanelHeight)) {
+		uint64_t physical = 0, nativeBytes = 0;
+		uint32_t nativeStride = 0;
+		MiniIOSurface * s = surfaces[0];
+
+		if (MiniIOSurfacePhysical(s, &physical, &nativeBytes, &nativeStride) &&
+		    physical + nativeBytes <= 0xffffffffull &&
+		    (uint64_t) nativeStride * fPanelHeight <= nativeBytes) {
+			nativeInvalidate(s->kpixels, (size_t) nativeBytes);
+			gFlipPipe[POLARIS_DPU_YSTRIDE / 4] = nativeStride;
+			gFlipPipe[POLARIS_DPU_SRC_ADDR / 4] = (uint32_t) physical;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			gFlipCtl[POLARIS_DPU_FLUSH / 4] = 1;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			if (dpuWaitFlush(gFlipCtl)) {
+				presented = true;
+				layers = 1;
+				fFlipFront = 1 - fFlipFront;
+				fBase = fShadow != NULL ? fShadow : fFlipBuffer[1 - fFlipFront];
+				if (++gFBNativeFrames <= 3) {
+					IOLog("MiniIOMobileFramebuffer: fb_native=2: the DPU reads surface %u at %#llx (stride %u, %llu bytes) where it is\n",
+					    swapWord(swap, SWAP_SURFACE(0)), (unsigned long long) physical, nativeStride,
+					    (unsigned long long) nativeBytes);
+				}
+			}
+		}
+	}
+	if (fFlipOn && !presented) {
 		unsigned draw = 1 - fFlipFront;
 
+		if (gFBNative == 2) {
+			gFlipPipe[POLARIS_DPU_YSTRIDE / 4] = fRowBytes;      /* back to the copy path's own buffers */
+		}
 		if (fShadow != NULL) {
 			fBase = fShadow;
 		} else {
@@ -1787,7 +1839,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
-	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+	for (unsigned layer = 0; !presented && layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 		int32_t src[4], dst[4];
 		MiniIOSurface * s;
@@ -1836,7 +1888,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
-	flipPresent();
+	if (!presented) {
+		flipPresent();
+	} else if (!fGraphics) {
+		/* the first picture is on the panel: the kernel's text console must stop drawing over it */
+		fGraphics = true;
+		PE_initialize_console(NULL, kPEGraphicsMode);
+	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
