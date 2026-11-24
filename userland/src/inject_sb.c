@@ -931,10 +931,25 @@ unlock(void)
 static BOOL
 poster_switcher_allowed(__unused id self, __unused SEL selector, id *explanation)
 {
-	if (explanation != NULL) {
+	static int offered = -1;        /* boot-arg poster_switcher=0 withholds it, as HakiOS did while a hosted context drew black */
+	static unsigned told;
+
+	if (offered < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		offered = !(sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
+		    (at = strstr(args, "poster_switcher=0")) != NULL && (at == args || at[-1] == ' '));
+	}
+	if (told++ == 0) {
+		say("hakios: the poster switcher is %s (poster_switcher=0 withholds it)\n",
+		    offered ? "offered; see the comment above for what did not draw" : "not offered");
+	}
+	if (!offered && explanation != NULL) {
 		*explanation = (id)CFSTR("the poster switcher is not shown here (see inject_sb.c)");
 	}
-	return NO;
+	return offered ? YES : NO;
 }
 
 /*
