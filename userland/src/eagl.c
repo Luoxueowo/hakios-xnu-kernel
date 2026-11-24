@@ -310,6 +310,7 @@ struct eagl {
 	/* a frame's worth */
 	unsigned calls, draws, triangles, uploads, clears, last_draws;
 	uint64_t upload_bytes, began, attaching, flushing;
+
 	/* everything so far */
 	unsigned frames, shaders, programs, errors, shared, refused;
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
@@ -1280,8 +1281,8 @@ frame_end(struct eagl *e, bool finished)
 		summary(e);
 	}
 	census_report();
-	if (e->frames == 600 && e->errors == 0) {
-		check_errors = 0;
+	if (e->frames == 60 && e->errors == 0) {
+		check_errors = 0;               /* (sixty frames is enough to see a broken call: after that it costs a query a call) */
 	}
 	e->last_draws = e->draws;
 	e->calls = e->draws = e->triangles = e->uploads = e->clears = 0;
@@ -4314,6 +4315,9 @@ install(void)
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
+		if (strstr(arguments, "glcheck=0") != NULL) {
+			check_errors = 0;
+		}
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
 		}
