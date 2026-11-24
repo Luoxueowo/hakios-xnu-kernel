@@ -184,11 +184,12 @@ static bool gGPUReported;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 /*
  * Whether a surface's pixels are pushed out of the processor's cache on every submission that names them.
- * They have to be when the processor writes them and the GPU reads them. With fb_native=2 the DPU reads the
- * pixels where they are and nothing on the processor does: the push is then 2.8 MB of cache maintenance a
- * submission, some 11 MB a frame, and about 7 ms of the window server's time a frame (24 November, with
- * glFlush() at 7-9 ms a frame and frames at 30 a second). Left out there; gpu_cache=1 asks for it anyway,
- * and without fb_native=2 it stays as it was.
+ * They have to be when the processor writes them and the GPU reads them. A surface the DPU scans out is the one
+ * case where nothing on the processor does: the push there is 2.8 MB of cache maintenance a submission, some
+ * 11 MB a frame, and about 7 ms of the window server's time a frame (24 November, with glFlush() at 7-9 ms a frame
+ * and frames at 30 a second). Left out for those surfaces only, and only with fb_native=2 -- every other surface
+ * (the textures icons and glyphs are drawn into) is cleaned as before, or the screen loses them after a while;
+ * gpu_cache=1 asks for the push on all of them.
  */
 static bool gGPUCacheSurfaces = true;
 
@@ -1049,8 +1050,15 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		if (b->surface != NULL) {
 			uint32_t seed;
 
-			if (!gGPUCacheSurfaces) {
-				continue;                       /* (fb_native=2: the display reads them where they are, the processor does not) */
+			/*
+			 * Only a surface the display scans out is left in the cache: nothing on the processor reads or writes
+			 * its pixels. A surface that is a texture still has to be cleaned to the point of coherency before the
+			 * GPU reads it -- left in the cache, what the processor drew into it (icons, glyphs) comes out blank
+			 * after a while (24 November: the screen kept its first pictures and lost everything the processor
+			 * went on drawing).
+			 */
+			if (!gGPUCacheSurfaces && b->surface->poolSlot != 0) {
+				continue;
 			}
 			seed = b->surface->shared()->seed;
 			if (seed == b->seed && !b->seen && began - b->pushed < again) {
