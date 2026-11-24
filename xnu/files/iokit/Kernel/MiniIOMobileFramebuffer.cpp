@@ -1649,6 +1649,36 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fStatSettled++;
 }
 
+/*
+ * fb_skipcopy=0 turns the shortcut off. A frame of one surface that fills the panel and is drawn
+ * over the whole of it leaves nothing of the buffer behind it on the screen, so the copy of the
+ * front buffer into the back one can be left out: that copy reads 9 MB of write-combined memory,
+ * which on Polaris costs about 200 ms a frame, the difference between 4 and 40 frames a second.
+ */
+static TUNABLE(uint32_t, gFBSkipCopy, "fb_skipcopy", 1);
+
+static bool
+swapFillsPanel(const uint8_t * swap, MiniIOSurface ** surfaces, uint32_t width, uint32_t height)
+{
+	int32_t src[4], dst[4];
+	MiniIOSurface * s;
+
+	if (!gFBSkipCopy || swapWord(swap, SWAP_SURFACE(0)) == 0 ||
+	    swapWord(swap, SWAP_SURFACE(1)) != 0 || swapWord(swap, SWAP_SURFACE(2)) != 0 ||
+	    swapWord(swap, SWAP_SURFACE(3)) != 0) {
+		return false;
+	}
+	s = surfaces[0];
+	if (s == NULL || s->info.bytesPerElement != 4 || s->info.planeCount != 0 ||
+	    s->info.width != width || s->info.height != height) {
+		return false;
+	}
+	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
+	memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
+	return src[0] == 0 && src[1] == 0 && (uint32_t) src[2] == width && (uint32_t) src[3] == height &&
+	    dst[0] == 0 && dst[1] == 0 && (uint32_t) dst[2] == width && (uint32_t) dst[3] == height;
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
@@ -1705,7 +1735,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	IOLockLock(fLock);
 	if (fFlipOn) {
 		unsigned draw = 1 - fFlipFront;
-		memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
+
+		if (!swapFillsPanel(swap, surfaces, fPanelWidth, fPanelHeight)) {
+			memcpy(fFlipBuffer[draw], fFlipBuffer[fFlipFront], (size_t) fRowBytes * fPanelHeight);
+		}
 		fBase = fFlipBuffer[draw];
 	}
 	if (fLastFrame != 0) {
