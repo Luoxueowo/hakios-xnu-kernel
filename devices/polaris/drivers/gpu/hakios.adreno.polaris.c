@@ -2561,43 +2561,102 @@ keep_table_new(uint64_t *phys)
 	return (uint64_t *)v;
 }
 
+/* The second-level table of a 1 GB region: one entry a 2 MB block, or a pointer to a third-level table. */
 static uint64_t *
-keep_l3_get(uint64_t va, bool alloc)
+keep_l2_get(uint64_t va, bool alloc)
 {
+	uint32_t i1;
+	uint64_t *l2;
+
 	if (g3d_tables == 0 || va >= (4ull << 30)) {
 		return NULL;
 	}
-	uint32_t i1 = (uint32_t)(va >> 30);
-	uint32_t i2 = (uint32_t)((va >> 21) & 0x1ff);
-	uint64_t *l2 = keep_l2_virt[i1];
-
+	i1 = (uint32_t) (va >> 30);
+	l2 = keep_l2_virt[i1];
 	if (l2 == NULL) {
+		uint64_t *l1, phys;
+
 		if (!alloc) {
 			return NULL;
 		}
-		uint64_t *l1 = (uint64_t *)g3d_tables, phys;
-
+		l1 = (uint64_t *) g3d_tables;
 		l2 = keep_table_new(&phys);
 		if (l2 == NULL) {
 			return NULL;
 		}
 		l1[i1] = phys | PTE_TABLE;
-		to_memory((vm_offset_t)&l1[i1], 8);
+		to_memory((vm_offset_t) &l1[i1], 8);
 		keep_l2_virt[i1] = l2;
 	}
-	uint64_t *l3 = keep_l3_virt[i1][i2];
+	return l2;
+}
+
+/*
+ * A 2 MB block of the second level turned into a third-level table of 512 pages, so that a page inside it can be
+ * mapped or taken away on its own. The block's own translation becomes those 512 pages.
+ */
+static bool
+keep_block_split(uint64_t va)
+{
+	uint64_t *l2 = keep_l2_get(va, false);
+	uint32_t i2 = (uint32_t) ((va >> 21) & 0x1ff);
+	uint64_t entry, base, attrs, phys_table;
+	uint64_t *l3;
+
+	if (l2 == NULL) {
+		return true;
+	}
+	entry = l2[i2];
+	if ((entry & 3) != 1) {
+		return true;                    /* (not a block: nothing to split) */
+	}
+	l3 = keep_table_new(&phys_table);
 	if (l3 == NULL) {
+		return false;
+	}
+	base = entry & ~0x1fffffull;
+	attrs = (entry & 0x1fffffull) & ~3ull;
+	for (uint32_t i = 0; i < 512; i++) {
+		l3[i] = (base + ((uint64_t) i << 12)) | attrs | PTE_PAGE;
+	}
+	to_memory((vm_offset_t) l3, 512 * sizeof(uint64_t));
+	l2[i2] = phys_table | PTE_TABLE;
+	to_memory((vm_offset_t) &l2[i2], 8);
+	keep_l3_virt[(va >> 30) & 3][i2] = l3;
+	return true;
+}
+
+static uint64_t *
+keep_l3_get(uint64_t va, bool alloc)
+{
+	uint32_t i1 = (uint32_t) (va >> 30);
+	uint32_t i2 = (uint32_t) ((va >> 21) & 0x1ff);
+	uint64_t *l2, *l3;
+
+	if (g3d_tables == 0 || va >= (4ull << 30)) {
+		return NULL;
+	}
+	l2 = keep_l2_get(va, alloc);
+	if (l2 == NULL) {
+		return NULL;
+	}
+	l3 = keep_l3_virt[i1][i2];
+	if (l3 == NULL) {
+		uint64_t phys;
+
 		if (!alloc) {
 			return NULL;
 		}
-		uint64_t phys;
-
+		/* (a 2 MB block there first: its pages are written into the new table) */
+		if (!keep_block_split(va)) {
+			return NULL;
+		}
 		l3 = keep_table_new(&phys);
 		if (l3 == NULL) {
 			return NULL;
 		}
 		l2[i2] = phys | PTE_TABLE;
-		to_memory((vm_offset_t)&l2[i2], 8);
+		to_memory((vm_offset_t) &l2[i2], 8);
 		keep_l3_virt[i1][i2] = l3;
 	}
 	return l3;
@@ -2770,37 +2829,98 @@ hakios_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *ho
 	*refused = keep_refused;
 }
 
-bool
-hakios_gpu_map_range(uint64_t address, uint64_t phys, uint64_t size, bool read_only)
-{
-	if ((address & 0xfff) != 0 || (phys & 0xfff) != 0 || (size & 0xfff) != 0) {
-		return false;
-	}
-	uint64_t pte_flags = PTE_GMU | PTE_AP_UNPRIV | PTE_PAGE | ((uint64_t)KEEP_ATTR_INDEX << 2) |
-	    (read_only ? KEEP_PTE_READ_ONLY : 0);
+static uint64_t keep_blocks;           /* (2 MB blocks written instead of 512 pages: for the log) */
 
+void
+hakios_gpu_blocks(uint64_t *blocks)
+{
+	*blocks = keep_blocks;
+}
+
+/* 4 KB at a time, into third-level tables: what every mapping used to be. */
+static bool
+keep_map_pages(uint64_t address, uint64_t phys, uint64_t size, uint64_t flags)
+{
 	while (size != 0) {
 		uint64_t *l3 = keep_l3_get(address, true);
+		uint32_t idx, avail, chunk;
+		uint64_t step;
 
 		if (l3 == NULL) {
 			return false;
 		}
-		uint32_t idx = (uint32_t)((address >> 12) & 0x1ff);
-		uint32_t avail = 512u - idx;
-		uint64_t pages = size >> 12;
-		uint32_t chunk = pages < avail ? (uint32_t)pages : avail;
-
+		idx = (uint32_t) ((address >> 12) & 0x1ff);
+		avail = 512u - idx;
+		chunk = (size >> 12) < avail ? (uint32_t) (size >> 12) : avail;
 		for (uint32_t i = 0; i < chunk; i++) {
-			l3[idx + i] = (phys + ((uint64_t)i << 12)) | pte_flags;
+			l3[idx + i] = (phys + ((uint64_t) i << 12)) | flags;
 		}
-		to_memory_nodsb((vm_offset_t)&l3[idx], (vm_size_t)chunk * sizeof(uint64_t));
-		uint64_t step = (uint64_t)chunk << 12;
-
+		to_memory_nodsb((vm_offset_t) &l3[idx], (vm_size_t) chunk * sizeof(uint64_t));
+		step = (uint64_t) chunk << 12;
 		address += step;
 		phys += step;
 		size -= step;
 	}
 	return true;
+}
+
+/*
+ * The mapping itself: 2 MB at a time where both sides are lined up on a 2 MB line, which is one entry of the second
+ * level instead of 512 of the third -- a 1080x2160 surface is 2300 entries page by page, about 3 ms of the window
+ * server's time a frame (24 November), and five blocks. The head and the tail of a mapping that does not start (or
+ * end) on such a line are mapped page by page, and so is anything under a table that is already in use.
+ *
+ * ARM SMMUv2 (the Adreno 630's), stage 1: a 2 MB block is a second-level entry with bits[1:0] = 0b01 and the
+ * address in bits[47:21]; a 4 KB page is a third-level entry with 0b11.
+ */
+bool
+hakios_gpu_map_range(uint64_t address, uint64_t phys, uint64_t size, bool read_only)
+{
+	uint64_t pages_flags, block_flags;
+
+	if ((address & 0xfff) != 0 || (phys & 0xfff) != 0 || (size & 0xfff) != 0) {
+		return false;
+	}
+	pages_flags = PTE_GMU | PTE_AP_UNPRIV | PTE_PAGE | ((uint64_t) KEEP_ATTR_INDEX << 2) |
+	    (read_only ? KEEP_PTE_READ_ONLY : 0);
+	block_flags = (pages_flags & ~PTE_PAGE) | 1ull;
+
+	/* The head: pages until the address is on a 2 MB line (only when the physical side is offset the same way). */
+	if ((address & 0x1fffffull) != 0 && (address & 0x1fffffull) == (phys & 0x1fffffull)) {
+		uint64_t pad = 0x200000ull - (address & 0x1fffffull);
+
+		if (pad > size) {
+			pad = size;
+		}
+		pad &= ~0xfffull;
+		if (pad != 0) {
+			if (!keep_map_pages(address, phys, pad, pages_flags)) {
+				return false;
+			}
+			address += pad;
+			phys += pad;
+			size -= pad;
+		}
+	}
+
+	/* The body: 2 MB blocks while both sides allow them and nothing is mapped there yet. */
+	while (size >= 0x200000ull && (address & 0x1fffffull) == 0 && (phys & 0x1fffffull) == 0) {
+		uint64_t *l2 = keep_l2_get(address, true);
+		uint32_t i2 = (uint32_t) ((address >> 21) & 0x1ff);
+
+		if (l2 == NULL || (l2[i2] & 3) != 0) {
+			break;                          /* (a table there: the pages under it are in use) */
+		}
+		l2[i2] = phys | block_flags;
+		to_memory((vm_offset_t) &l2[i2], 8);
+		keep_blocks++;
+		address += 0x200000ull;
+		phys += 0x200000ull;
+		size -= 0x200000ull;
+	}
+
+	/* The tail. */
+	return size == 0 || keep_map_pages(address, phys, size, pages_flags);
 }
 
 bool
@@ -2820,6 +2940,8 @@ static uint32_t keep_unmap_busy;
 void
 hakios_gpu_unmap(uint64_t address, uint64_t size)
 {
+	uint64_t va, rem;
+
 	if (!hakios_gpu_done(keep_fence)) {
 		keep_unmap_busy++;                      /* U-063: taken away while the core still has work */
 		if (keep_unmap_busy <= 8) {
@@ -2827,20 +2949,38 @@ hakios_gpu_unmap(uint64_t address, uint64_t size)
 			    *(volatile uint32_t *)(g3d_regions[2].memory + KEEP_FENCE_AT), keep_fence);
 		}
 	}
-	uint64_t va = address & ~0xfffull;
-	uint64_t rem = (size + 0xfffull) >> 12;
+	va = address & ~0xfffull;
+	rem = (size + 0xfffull) >> 12;
 
 	while (rem != 0) {
-		uint32_t idx = (uint32_t)((va >> 12) & 0x1ff);
+		uint64_t off = va & 0x1fffffull;
+		uint32_t idx = (uint32_t) ((va >> 12) & 0x1ff);
 		uint32_t avail = 512u - idx;
-		uint32_t chunk = rem < avail ? (uint32_t)rem : avail;
-		uint64_t *l3 = keep_l3_get(va, false);
+		uint32_t chunk = rem < avail ? (uint32_t) rem : avail;
+		uint64_t *l3;
 
-		if (l3 != NULL) {
-			bzero(&l3[idx], (size_t)chunk * sizeof(uint64_t));
-			to_memory_nodsb((vm_offset_t)&l3[idx], (vm_size_t)chunk * sizeof(uint64_t));
+		/* A whole 2 MB block taken away: the second-level entry goes. */
+		if (off == 0 && rem >= 512) {
+			uint64_t *l2 = keep_l2_get(va, false);
+
+			if (l2 != NULL && (l2[(va >> 21) & 0x1ff] & 3) == 1) {
+				l2[(va >> 21) & 0x1ff] = 0;
+				to_memory((vm_offset_t) &l2[(va >> 21) & 0x1ff], 8);
+				va += 0x200000ull;
+				rem -= 512;
+				continue;
+			}
 		}
-		va += (uint64_t)chunk << 12;
+		/* Part of one: its pages become a table of their own first. */
+		if (!keep_block_split(va)) {
+			break;
+		}
+		l3 = keep_l3_get(va, false);
+		if (l3 != NULL) {
+			bzero(&l3[idx], (size_t) chunk * sizeof(uint64_t));
+			to_memory_nodsb((vm_offset_t) &l3[idx], (vm_size_t) chunk * sizeof(uint64_t));
+		}
+		va += (uint64_t) chunk << 12;
 		rem -= chunk;
 	}
 	keep_tlb();
@@ -2897,9 +3037,17 @@ static struct { uint64_t address; uint32_t words, submission; } keep_history[KEE
 static uint32_t
 keep_peek(uint64_t va)
 {
-	uint64_t *l3 = keep_l3_get(va, false);
+	uint64_t *l2 = keep_l2_get(va, false), *l3;
 	uint64_t e;
 
+	if (l2 == NULL) {
+		return 0xdeadbeef;
+	}
+	e = l2[(va >> 21) & 0x1ff];
+	if ((e & 3) == 1) {
+		return ml_phys_read_word((e & ~0x1fffffull) + (va & 0x1fffff));
+	}
+	l3 = keep_l3_get(va, false);
 	if (l3 == NULL || (e = l3[(va >> 12) & 0x1ff]) == 0) {
 		return 0xdeadbeef;
 	}
