@@ -2147,8 +2147,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
     auto scratch = r.queue->privateMemory(64, false, &pm, &why);
     CHECK(scratch != nullptr);
     CHECK_EQ(pm.perFiber, 512u);
-    CHECK_EQ(pm.perSp, 512u * 4096u);
-    CHECK_EQ(scratch->length(), 2ull * 512u * 4096u);
+    CHECK_EQ(pm.perSp, 512u * a6xx::kFibersPerSp);
+    CHECK_EQ(scratch->length(), uint64_t(a6xx::kNumSpCores) * 512u * a6xx::kFibersPerSp);
     Bindings fsb;
     fsb.privateMemory = pm;
     Encoded e(r, p, pass, wholeDraw(3), render::Options{}, Bindings{}, fsb);
@@ -2156,8 +2156,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
     if (!e.ok) std::printf("       %s\n", e.error.c_str());
     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 3), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 4), uint32_t(scratch->gpuAddress()));
-    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * 4096u) >> 12);
-    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
+    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * a6xx::kFibersPerSp) >> 12);
+    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * a6xx::kFibersPerSp) >> 11);
     CHECK_EQ(e.reg(REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET + 4), 0u);
     CHECK_EQ(e.reg(REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET), 0u);
     auto cb = drawOnce(r, p, pass, wholeDraw(3));
@@ -4648,7 +4648,7 @@ TEST(a_program_longer_than_the_instruction_cache_is_preloaded_in_part) {
         const uint32_t type = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
         const uint32_t block = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
         if (type == a6xx::ST6_SHADER && block == a6xx::SB6_FS_SHADER) {
-            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, 127u);
+            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, a6xx::kInstrCacheSize);
             w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(128);
             found = true;
         }
@@ -5338,14 +5338,18 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
         CHECK(p.cols * p.binW >= w && (p.cols - 1) * p.binW < w && p.rows * p.binH >= h && (p.rows - 1) * p.binH < h);
         std::printf("       %ux%u %s: %u x %u tiles of %u x %u\n", w, h, t->info().name, p.cols, p.rows, p.binW, p.binH);
     }
-    // the screen at 4 bytes a pixel: two columns of 576 and twelve rows of 208, 24 tiles
+    // the screen at 4 bytes a pixel: A630 has twice the A635 colour GMEM, so its tile rows are twice as tall.
     {
         auto t = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
         RenderPass a;
         a.color0 = t.get();
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
+#if defined(HAKIOS_METAL_A630)
+        CHECK(p.cols == 2 && p.rows == 6 && p.binW == 576 && p.binH == 416);
+#else
         CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
+#endif
     }
     // what stays in sysmem: a second colour attachment of another size, an integer target
     {
@@ -5462,7 +5466,9 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
         a.more[0].load = LoadAction::kLoad;
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
+        const uint32_t perAttachment = a6xx::kGmemCcuColorOffset / 2;
+        const uint32_t expectedHeight = (perAttachment / (576 * 4)) & ~15u;
+        CHECK(p.binW == 576 && p.binH == expectedHeight && p.base[0] == 0 && p.base[1] == perAttachment && p.room[0] == perAttachment && p.room[1] == perAttachment);
         auto cb = r.queue->commandBuffer();
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
@@ -5696,7 +5702,7 @@ TEST(a_clear_in_gmem_comes_out_as_the_fill_does) {
 // (CP_SET_BIN_DATA5) and draws USE_VISIBILITY; the target comes back as it was through the tiles' loads and stores
 TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
     Rig r;
-    auto t = target(r, 1125, 300, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto t = target(r, 2048, 300, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
     fillCoords(*t);
     RenderPass a;
     a.color0 = t.get();
@@ -5705,7 +5711,7 @@ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
     render::Options o;
     o.gmemBinning = true;
     auto cb = r.queue->commandBuffer();
-    for (int i = 0; i < 3; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(3, 1125, 300), Bindings{}, Bindings{}, o));
+    for (int i = 0; i < 3; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(3, 2048, 300), Bindings{}, Bindings{}, o));
     cb->commit();
     cb->waitUntilCompleted();
     CHECK(cb->status() == CommandBuffer::kCompleted);
@@ -5722,7 +5728,7 @@ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
         render::Options twin = o;
         twin.gmemBinningStage = 9;
         auto c2 = r.queue->commandBuffer();
-        for (int i = 0; i < 3; i++) CHECK(c2->draw(flatProgram(), a, wholeDraw(3, 1125, 300), Bindings{}, Bindings{}, twin));
+        for (int i = 0; i < 3; i++) CHECK(c2->draw(flatProgram(), a, wholeDraw(3, 2048, 300), Bindings{}, Bindings{}, twin));
         c2->commit();
         c2->waitUntilCompleted();
         CHECK(r.fake->stats().faults > s.faults);

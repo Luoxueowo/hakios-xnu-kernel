@@ -374,13 +374,14 @@ static const char* dimName(uint8_t dim) {
 }
 
 int main(int argc, char** argv) {
-    bool recover = false, bisect = false, binTrace = false;
+    bool recover = false, bisect = false, binTrace = false, offscreenSmoke = false;
     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
     for (int i = 1; i < argc; i++) {
         recover = recover || strcmp(argv[i], "--recover") == 0;
         bisect = bisect || strcmp(argv[i], "--bisect") == 0;
         binTrace = binTrace || strcmp(argv[i], "--bin-trace") == 0;
+        offscreenSmoke = offscreenSmoke || strcmp(argv[i], "--offscreen-smoke") == 0;
         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
@@ -425,6 +426,105 @@ int main(int argc, char** argv) {
     if (queue == nullptr) {
         report(false, "a queue: " + why);
         return 1;
+    }
+
+    // A narrow A630 hardware gate: compile the AIR modules on the phone, then test the 2D blit's per-chip ECO switch,
+    // a complete GMEM draw/readback and the kernel's completion fence before CoreAnimation is allowed to use this path.
+    if (offscreenSmoke) {
+#if defined(HAKIOS_METAL_A630) && defined(HAKIOS_METAL_MESA)
+        // HakiosGPU deliberately reports GPU_ID=0; MSM_PARAM_CHIP_ID is the authoritative Polaris identifier.
+        const bool deviceMatches = id == 0 && chip == a6xx::kChipId;
+        report(deviceMatches, "A630 profile matches device: GPU " + std::to_string(id) + ", chip " + hex8(uint32_t(chip)) +
+                                  ", expected " + hex8(a6xx::kChipId));
+        if (!deviceMatches) return failures;
+        if (!hasCompiler()) {
+            report(false, "Mesa AIR/ir3 compiler is linked into this probe");
+            return failures;
+        }
+        auto vs = std::shared_ptr<CompiledStage>(compileStage(kernels::tri_flat_vs_bc, kernels::tri_flat_vs_bc_size, &why).release());
+        report(vs != nullptr, "A630 vertex AIR compiled" + (vs ? ", " + std::to_string(vs->stage.k.numWords) + " dwords"
+                                                                  : ": " + why));
+        if (!vs) return failures;
+        auto fs = std::shared_ptr<CompiledStage>(compileStage(kernels::tri_flat_fs_bc, kernels::tri_flat_fs_bc_size, &why).release());
+        report(fs != nullptr, "A630 fragment AIR compiled" + (fs ? ", " + std::to_string(fs->stage.k.numWords) + " dwords"
+                                                                    : ": " + why));
+        if (!fs) return failures;
+        auto program = linkProgram(vs, fs, PixelFormat::kRGBA8Unorm, &why);
+        report(program != nullptr, program ? "A630 vertex/fragment stages linked" : "A630 stage link: " + why);
+        if (!program) return failures;
+
+        TextureDesc desc;
+        desc.format = PixelFormat::kRGBA8Unorm;
+        desc.width = desc.height = 64;
+        desc.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+        auto target = Texture::make(gpu, desc, &why);
+        report(target != nullptr, target ? "64x64 RGBA8 target allocated" : "64x64 RGBA8 target: " + why);
+        if (!target || target->contents() == nullptr) return failures + (target ? 1 : 0);
+
+        RenderPass pass;
+        pass.color0 = target.get();
+        pass.load = LoadAction::kClear;
+        pass.clearColor[0] = 0.25;
+        pass.clearColor[1] = 0.5;
+        pass.clearColor[2] = 0.75;
+        pass.clearColor[3] = 1.0;
+        auto clear = queue->commandBuffer();
+        const bool clearRecorded = clear->clear(pass);
+        if (clearRecorded) {
+            clear->commit();
+            clear->waitUntilCompleted();
+        }
+        const uint32_t clearExpected = 0xffbf8040u;
+        uint32_t clearPixels = 0;
+        const auto cleared = textureBo(*target);
+        for (uint32_t y = 0; y < target->height(); y++) {
+            for (uint32_t x = 0; x < target->width(); x++) {
+                uint32_t pixel = 0;
+                memcpy(&pixel, cleared.data() + uint64_t(y) * target->bytesPerRow() + uint64_t(x) * 4, 4);
+                clearPixels += pixel == clearExpected;
+            }
+        }
+        const bool clearFence = clear->status() == CommandBuffer::kCompleted;
+        report(clearRecorded && clearFence && clearPixels == 4096,
+               "A630 2D clear: " + std::to_string(clearPixels) + "/4096 pixels 40 80 bf ff; fence=" +
+                   (clearFence ? "complete" : "incomplete") + (clear->error().empty() ? "" : "; " + clear->error()));
+
+        fillBo(*target, 0xa5a5a5a5u);
+        pass.load = LoadAction::kDontCare;
+        Draw draw;
+        draw.vertexCount = 6;
+        draw.viewport = Viewport{0, 0, 64, 64, 0, 1};
+        render::Options options;
+        options.gmem = true;
+        auto cb = queue->commandBuffer();
+        const bool drawRecorded = cb->draw(program->program, pass, draw, Bindings{}, Bindings{}, options);
+        if (drawRecorded) {
+            cb->commit();
+            cb->waitUntilCompleted();
+        }
+        const auto pixels = textureBo(*target);
+        uint32_t matched = 0;
+        for (uint32_t y = 0; y < target->height(); y++) {
+            for (uint32_t x = 0; x < target->width(); x++) {
+                uint32_t pixel = 0;
+                memcpy(&pixel, pixels.data() + uint64_t(y) * target->bytesPerRow() + uint64_t(x) * 4, 4);
+                matched += pixel == 0xff804020u;
+            }
+        }
+        const bool fence = cb->status() == CommandBuffer::kCompleted;
+        const bool gmem = cb->counts().gmemPasses == 1 && cb->counts().tiles == 1;
+        report(drawRecorded && fence && gmem && matched == 4096,
+               "A630 GMEM offscreen draw: " + std::to_string(matched) + "/4096 pixels 20 40 80 ff; GMEM=" +
+                   std::to_string(cb->counts().gmemPasses) + ", tiles=" + std::to_string(cb->counts().tiles) +
+                   ", fence=" + (fence ? "complete" : "incomplete") + (cb->error().empty() ? "" : "; " + cb->error()));
+        std::printf("probe: A630_OFFSCREEN_RESULT chip=%s clear=%u/4096 gmem=%u tiles=%u pixels=%u/4096 fence=%s gpu_us=%lld faults=%llu\n",
+                    hex8(uint32_t(chip)).c_str(), clearPixels, cb->counts().gmemPasses, cb->counts().tiles, matched,
+                    fence ? "complete" : "incomplete", (long long)(cb->gpuNanoseconds() / 1000), (unsigned long long)gpu.faults());
+        return failures;
+#else
+        report(false, "--offscreen-smoke requires the A630 Mesa build profile");
+        return failures;
+#endif
     }
 
     // 1. a copy of a megabyte, checked byte for byte and around its edges

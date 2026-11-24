@@ -2441,15 +2441,15 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         case kParamChipId: p->value = kChipId | kSpeedBin << 32; return 0;
         case kParamMaxFreq: p->value = kMaxFrequencyHz; return 0;
         case kParamTimestamp: p->value = uint64_t(nowNs()); return 0;
-        case kParamGmemBase: p->value = 0; return 0;
+        case kParamGmemBase: p->value = kGmemBase; return 0;
         case kParamPriorities: p->value = 1; return 0;
         case kParamPpPgtable: p->value = 0; return 0;
         case kParamFaults: p->value = stats_.recoveries; return 0;
         case kParamSuspends: p->value = 0; return 0;
-        case kParamHighestBankBit: p->value = 14; return 0;
+        case kParamHighestBankBit: p->value = a6xx::kHighestBankBit; return 0;
         case kParamRaytracing: p->value = 0; return 0;
         case kParamUbwcSwizzle: p->value = 6; return 0;
-        case kParamMacrotileMode: p->value = 1; return 0;
+        case kParamMacrotileMode: p->value = a6xx::kMacrotileMode; return 0;
         default: return EINVAL;                                      // (kIOReturnBadArgument there: VA_START, VA_SIZE among them)
         }
     }

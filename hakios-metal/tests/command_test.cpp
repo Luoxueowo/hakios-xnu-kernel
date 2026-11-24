@@ -44,23 +44,27 @@ TEST(gpu_params) {
     CHECK_EQ(r.gpu->param(kParamGpuId, &v), 0);
     CHECK_EQ(v, 0ull);                                      // "GPU_ID: none, the chip ID says it"
     CHECK_EQ(r.gpu->param(kParamChipId, &v), 0);
-    CHECK_EQ(uint32_t(v), 0x06030500u);                     // GPU_CHIP_ID (dt qcom,chipid) ...
+    CHECK_EQ(uint32_t(v), a6xx::kChipId);                   // the selected chip profile
     CHECK_EQ(v >> 32, FakeGpu::kSpeedBin);                  // ... "with the speed bin above it"
-    CHECK_EQ(r.gpu->chipId(), 0x06030500u);
+    CHECK_EQ(r.gpu->chipId(), a6xx::kChipId);
     CHECK_EQ(r.gpu->param(kParamGmemSize, &v), 0);
-    CHECK_EQ(v, 512ull * 1024);
+    CHECK_EQ(v, a6xx::kGmemBytes);
     CHECK_EQ(r.gpu->param(kParamMaxFreq, &v), 0);
-    CHECK_EQ(v, 550000000ull);                              // core_khz * 1000, the default clock
+    CHECK_EQ(v, FakeGpu::kMaxFrequencyHz);                   // core_khz * 1000, the selected profile's default clock
     CHECK_EQ(r.gpu->param(kParamFaults, &v), 0);
     CHECK_EQ(v, 0ull);
     CHECK_EQ(r.gpu->param(kParamPriorities, &v), 0);
     CHECK_EQ(v, 1ull);
     CHECK_EQ(r.gpu->param(kParamHighestBankBit, &v), 0);
-    CHECK_EQ(v, 14ull);
+    CHECK_EQ(v, a6xx::kHighestBankBit);
+    CHECK_EQ(r.gpu->param(kParamGmemBase, &v), 0);
+    CHECK_EQ(v, a6xx::kGmemBase);
+    CHECK_EQ(r.gpu->param(kParamMacrotileMode, &v), 0);
+    CHECK_EQ(v, a6xx::kMacrotileMode);
     CHECK_EQ(r.gpu->param(kParamUbwcSwizzle, &v), 0);
     CHECK_EQ(v, 6ull);
     CHECK_EQ(r.gpu->param(kParamMacrotileMode, &v), 0);
-    CHECK_EQ(v, 1ull);
+    CHECK_EQ(v, a6xx::kMacrotileMode);
     CHECK_EQ(r.gpu->param(0x0e, &v), EINVAL);               // VA_START: "addresses are ours to give"
     CHECK_EQ(r.gpu->param(0x0f, &v), EINVAL);               // VA_SIZE
     CHECK_EQ(r.gpu->param(0x99, &v), EINVAL);

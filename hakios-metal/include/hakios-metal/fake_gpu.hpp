@@ -187,11 +187,16 @@ public:
     void resume();
 
     // what the kernel says about this GPU, for the fake to say the same and for a test to check it does
-    static constexpr uint64_t kChipId = 0x06030500;      // dt qcom,chipid: an A635-family part, "Adreno 7c+ Gen 3" to Mesa
-    static constexpr uint64_t kSpeedBin = 0x75;          // the phone's fuse value above the chip id, as the probe read it
-                                                         // (0x7506030500 on 28 October); Mesa's named row for this part
-    static constexpr uint64_t kGmemBytes = 512 * 1024;
-    static constexpr uint64_t kMaxFrequencyHz = 550000000;
+    static constexpr uint64_t kChipId = a6xx::kChipId;
+    static constexpr uint64_t kSpeedBin = 0x75;
+    static constexpr uint64_t kGmemBytes = a6xx::kGmemBytes;
+    static constexpr uint64_t kGmemBase = a6xx::kGmemBase;
+    static constexpr uint64_t kMaxFrequencyHz =
+#if defined(HAKIOS_METAL_A630)
+        710000000;
+#else
+        550000000;
+#endif
 
 private:
     struct UboDescriptor {

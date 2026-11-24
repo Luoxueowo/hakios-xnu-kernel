@@ -55,7 +55,7 @@ CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.
 HOST      = $(CORE) src/fake_gpu.cpp
 TESTS     = $(wildcard tests/*_test.cpp) tests/main.cpp
 
-.PHONY: test tsan asan check ios darwin clean sweep
+.PHONY: test tsan asan check ios ios-a630 ios-sweep-a630 darwin clean sweep sweep-a630 host-mesa-a630 probe-a630
 
 # (and the front end's archive: a test binary linked before the front end changed passed or failed for the old one)
 $(HOSTOUT)/tests: $(HOST) $(TESTS) $(wildcard include/hakios-metal/*.hpp) $(wildcard tests/fixtures/*.hpp) tests/test.hpp \
@@ -70,6 +70,20 @@ $(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp)
 	$(CXX) $(CXXFLAGS) -pthread -o $@ tools/sweep.cpp $(HOST) $(HOSTLIBS)
 
 sweep: $(HOSTOUT)/sweep
+
+# Compile metallib shaders for Polaris on the host. This binary does not submit GPU commands.
+.PHONY: sweep-a630
+MESA_HOST_A630 ?= $(abspath ../build/mesa-host)
+host-mesa-a630:
+	../tools/air/mk-host.sh
+
+sweep-a630: host-mesa-a630
+	$(MAKE) sweep MESA=1 MESA_HOST=$(MESA_HOST_A630) MESA_SRC=$(MESA_HOST_A630)/mesa-25.0.7 \
+		MESA_BUILD=$(MESA_HOST_A630)/build HOSTOUT=out/host-mesa-a630 CXXFLAGS="$(CXXFLAGS) -DHAKIOS_METAL_A630"
+
+.PHONY: ios-sweep-a630
+ios-sweep-a630:
+	$(MAKE) MESA=1 IOSOUT=out/ios-a630 IOS_PROFILE_FLAGS=-DHAKIOS_METAL_A630 out/ios-a630/sweep-a630
 
 # (with the compiler in, compiler_test compiles every tools/kernels/*.ll against its fixture: their bitcode must be there)
 test: $(HOSTOUT)/tests $(if $(strip $(MESA)),$(KERNEL_BC))
@@ -87,12 +101,22 @@ check: test
 
 # (the probe wants the fixtures, which want a host build of Mesa to be made again: with none here the library alone, which is what
 # the kernel's userland/build.sh links)
-ios: out/ios/libhakios-metal.a $(if $(wildcard $(IR3_CMDLINE_C)),out/ios/hakios-metal-probe)
+IOSOUT ?= out/ios
+IOS_PROFILE_FLAGS ?=
+
+ios: $(IOSOUT)/libhakios-metal.a $(if $(wildcard $(IR3_CMDLINE_C)),$(IOSOUT)/hakios-metal-probe)
+
+# Separate A630 artifacts keep the default A635 reference build intact.
+ios-a630:
+	$(MAKE) MESA=1 IOSOUT=out/ios-a630 IOS_PROFILE_FLAGS=-DHAKIOS_METAL_A630 ios
+
+probe-a630: $(IOSOUT)/hakios-metal-probe
+	$(IOSOUT)/hakios-metal-probe --offscreen-smoke
 
 darwin: ios
 
 # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
-IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
+IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror $(IOS_PROFILE_FLAGS)
 IOS_LIBS     =
 ifneq ($(strip $(MESA)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
@@ -100,23 +124,40 @@ IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)
 # the compiled-stage cache's key (src/compiler.cpp: kCacheBuild): what the compiler is made of -- its source, the
 # driver's headers and the Mesa archives linked in -- and not when it was built, so that a cache kept on the phone
 # across boots (var_store) outlives a rebuild of the plug-in that changed nothing of the compiler
-IOS_CACHE_BUILD := $(shell cat src/compiler.cpp include/hakios-metal/*.hpp $(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))) 2>/dev/null \
+IOS_CACHE_BUILD := $(shell { cat src/compiler.cpp include/hakios-metal/*.hpp; printf '%s\n' '$(IOS_PROFILE_FLAGS)'; cat $(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))); } 2>/dev/null \
 	| (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-24)
 ifneq ($(strip $(IOS_CACHE_BUILD)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_CACHE_BUILD='"$(IOS_CACHE_BUILD)"'
 endif
 endif
 
-out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
-	@mkdir -p out/ios/obj
-	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
+$(IOSOUT)/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
+	@mkdir -p $(IOSOUT)/obj
+	cd $(IOSOUT)/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
 		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
-	rm -f $@ && $(IOS_AR) $@ out/ios/obj/*.o
+	rm -f $@ && $(IOS_AR) $@ $(IOSOUT)/obj/*.o
 
 # (and the front end's archive, as the host tests: a probe linked before the front end changed tests the old one)
-out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
+
+# The fixture headers are generated source files committed to the tree. Fingerprint their checked-in contents without
+# asking make to refresh each generated header (that regeneration needs Mesa's Gallium CLI and is a separate target).
+IOS_PROBE_FIXTURE_HASH := $(shell cat $(wildcard tests/fixtures/*.hpp) 2>/dev/null \
+	| (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-16)
+$(IOSOUT)/.probe-fixtures-$(IOS_PROBE_FIXTURE_HASH):
+	@mkdir -p $(dir $@)
+	@touch $@
+
+$(IOSOUT)/hakios-metal-probe: tools/probe.cpp $(IOSOUT)/libhakios-metal.a $(IOSOUT)/.probe-fixtures-$(IOS_PROBE_FIXTURE_HASH) \
 		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
-	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
+	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp $(IOSOUT)/libhakios-metal.a $(IOS_LIBS) \
+		-framework IOKit -framework CoreFoundation -framework IOSurface
+
+# Use the same iOS Mesa archives as the GL build, without the GPU transport.
+$(IOSOUT)/sweep-a630: tools/sweep.cpp src/compiler.cpp $(IOSOUT)/libhakios-metal.a \
+		$(IOS_MESA_BUILD)/src/compiler/air/libair.a
+	@mkdir -p $(dir $@)
+	$(IOS_CXX) $(IOS_CXXFLAGS) -DHAKIOS_METAL_A630 -Iinclude -o $@ \
+		tools/sweep.cpp src/compiler.cpp $(IOSOUT)/libhakios-metal.a $(IOS_LIBS) \
 		-framework IOKit -framework CoreFoundation -framework IOSurface
 
 

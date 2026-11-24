@@ -51,12 +51,15 @@ namespace {
 
 std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
 
-// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row
 ir3_compiler* theCompiler() {
     static ir3_compiler* compiler = [] {
         fd_dev_id id{};
-        id.gpu_id = 0;
+        id.gpu_id = a6xx::kMesaGpuId;
         id.chip_id = a6xx::kChipId;
+        const auto* info = fd_dev_info_raw(&id);
+        if (info == nullptr) {
+            return static_cast<ir3_compiler*>(nullptr);
+        }
         // A framebuffer fetch (nir_texop_txf_ms_fb) through the FS's own texture table, at the slot after its last
         // texture, as turnip has it (tu_device.cc: -1): the zero default would make it a bindless read of descriptor
         // set 0, which this driver never binds
@@ -65,7 +68,7 @@ ir3_compiler* theCompiler() {
         // the GLSL type cache, which ir3 uses for the driver UBOs' types (get_driver_ubo_type: a module's constant table
         // is read through one); held for the life of the process, as the compiler is
         glsl_type_singleton_init_or_ref();
-        return ir3_compiler_create(nullptr, &id, fd_dev_info_raw(&id), &options);
+        return ir3_compiler_create(nullptr, &id, info, &options);
     }();
     return compiler;
 }

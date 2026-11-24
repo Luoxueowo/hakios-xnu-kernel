@@ -28,7 +28,12 @@ endif
 # The front end's own include dir: `#include "nir_air.h"` as the Mesa tools do.
 HAKIOS_METAL_MESA_CXXFLAGS = $(MESA_DEFS) $(MESA_INC) -isystem $(MESA_SRC)/src/compiler/air
 # libair first in the group: it needs nir and util, nothing needs it but the driver.
+ifeq ($(shell uname),Darwin)
+# ld64 resolves references across the archive list without GNU ld's group flags.
+HAKIOS_METAL_MESA_LIBS = $(MESA_BUILD)/src/compiler/air/libair.a $(MESA_ARCHIVES) -lz -lm -pthread
+else
 HAKIOS_METAL_MESA_LIBS = -Wl,--start-group $(MESA_BUILD)/src/compiler/air/libair.a $(MESA_ARCHIVES) -Wl,--end-group -lz -lm -pthread
+endif
 
 # --- iOS ----------------------------------------------------------------------
 # The cross build: Mesa built for arm64 iOS by hakios's tools/mk-mesa.sh (meson

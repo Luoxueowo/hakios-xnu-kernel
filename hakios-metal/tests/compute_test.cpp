@@ -162,8 +162,8 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
     auto at = [&](uint32_t reg) { size_t i = e.findReg(reg); return i == size_t(-1) ? 0xdeadbeefu : e.stream.words()[i]; };
     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 1), uint32_t(scratch->gpuAddress()));
-    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * 4096u) >> 12);
-    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
+    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * a6xx::kFibersPerSp) >> 12);
+    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * a6xx::kFibersPerSp) >> 11);
     // through a command buffer the queue's own is bound, and the fake takes the dispatch
     auto cb = r.queue->commandBuffer();
     CHECK(cb->dispatch(k, kGroups16, nullptr, {Binding{out.get(), 0}}));
@@ -1187,10 +1187,16 @@ TEST(a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround) {
     {
         Encoded e(r, kernels::chain160_air, kGroups16, local, b);
         CHECK(e.ok);
-        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
         size_t before = 0, after = 0;
         labels(e, &before, &after);
+#if defined(HAKIOS_METAL_A630)
+        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) != size_t(-1));
+        CHECK_EQ(before, size_t(1));
+        CHECK_EQ(after, size_t(1));
+#else
+        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
         CHECK_EQ(before + after, size_t(0));
+#endif
         // the same kernel with its preload cut below its length is fetched past the preload, and gets it
         compute::Options cut;
         cut.preloadCap = 64;

@@ -56,6 +56,21 @@ void regs(pm4::Stream& st, uint32_t r, std::initializer_list<uint32_t> values) {
 // a type-7 packet of one word
 void command1(pm4::Stream& st, uint32_t opcode, uint32_t word) { st.packet(opcode, &word, 1); }
 
+// Mesa's tu_clear_blit.cc changes this non-context register around CP_BLIT on the A630, with a WFI on both sides.
+// The other supported profile has identical values for the draw and blit paths, so it needs no extra packets.
+void run2dBlit(pm4::Stream& st) {
+    const bool switchEco = kMagicRbDbgEcoCntlBlit != kMagicRbDbgEcoCntl;
+    if (switchEco) {
+        st.waitForIdle();
+        reg(st, REG_A6XX_RB_DBG_ECO_CNTL, kMagicRbDbgEcoCntlBlit);
+    }
+    command1(st, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
+    if (switchEco) {
+        st.waitForIdle();
+        reg(st, REG_A6XX_RB_DBG_ECO_CNTL, kMagicRbDbgEcoCntl);
+    }
+}
+
 void event(pm4::Stream& st, vgt_event_type e) {
     uint32_t w = eventWrite0(e, false);
     st.packet(CP_EVENT_WRITE, &w, 1);
@@ -916,7 +931,7 @@ void fillStream(pm4::Stream& stream, const Texture& target, const ClearWords& c,
     regs(stream, REG_A6XX_RB_2D_SRC_SOLID_C0, {c.value[0], c.value[1], c.value[2], c.value[3]});
     regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), tile, f.swap, f.srgb), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
     regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
-    command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
+    run2dBlit(stream);
 }
 
 void clearStream(pm4::Stream& stream, const Texture& target, const ClearWords& c, uint64_t ts, uint32_t level = 0, uint32_t slice = 0) {
@@ -959,7 +974,7 @@ void stencilClearStream(pm4::Stream& stream, const Texture& t, uint32_t value, u
     regs(stream, REG_A6XX_RB_2D_SRC_SOLID_C0, {value & 0xffu, 0, 0, 0});
     regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(FMT6_8_UINT, TILE6_3, WZYX, false), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(t.stencilPitch()))});
     regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
-    command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
+    run2dBlit(stream);
     eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, table + kTableStencilClearFlushAt, kStencilClearFlushValue, false);
     waitForWord(stream, table + kTableStencilClearFlushAt, kStencilClearFlushValue);
     eventTimestamp(stream, PC_CCU_FLUSH_DEPTH_TS, table + kTableStencilClearDepthFlushAt, kStencilClearDepthFlushValue, false);
@@ -2653,7 +2668,7 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
         regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(dstFmt, TILE6_LINEAR, dstSwap, srgb), uint32_t(to), uint32_t(to >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(DL.pitch))});
         regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
     }
-    command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
+    run2dBlit(stream);
     // what a Clear's fill does after it, and then the pass's tail: the copy is in memory when the next thing reads it
     eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, table + kTableClearFlushAt, kClearFlushValue, false);
     waitForWord(stream, table + kTableClearFlushAt, kClearFlushValue);
@@ -2685,7 +2700,7 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
         regs(stream, REG_A6XX_SP_PS_2D_SRC_FLAGS, {0, 0, 0});
         regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(FMT6_8_UNORM, TILE6_LINEAR, WZYX, false), uint32_t(dbase), uint32_t(dbase >> 32), A6XX_RB_2D_DST_PITCH(dpitch)});
         regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
-        command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
+        run2dBlit(stream);
         from += w;
         to += w;
         length -= w;

@@ -285,7 +285,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			[ -f $HM/out/ios/libhakios-metal.a ] || [ ! -f ../../hakios-metal/out/ios/libhakios-metal.a ] || HM=../../hakios-metal
 		fi
 		METAL_GPU=
-		for HM_OUT in $HM/out/ios $HM/out/darwin; do
+		HM_OUTS=${HAKIOS_METAL_OUT:-$HM/out/ios $HM/out/darwin}
+		for HM_OUT in $HM_OUTS; do
 			if [ -f $HM_OUT/libhakios-metal.a ]; then
 				METAL_GPU="-DHAKIOS_METAL_GPU -I$HM/include $HM_OUT/libhakios-metal.a -lc++ -framework IOKit -framework IOSurface"
 				# built with its compiler (make ios MESA=1): Mesa's archives of our iOS build too, as hakios-metal's
@@ -323,7 +324,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 				M2V_OBJS="../xnu-deps/build/m2v/out/frontend.o ../xnu-deps/build/m2v/out/libadreno_metal_bridge.a -framework CoreFoundation -lc++ -Wl,-dead_strip"
 				echo "build.sh: with UniXNU's Metal on Vulkan (metal_m2v=1)"
 			fi
-			$DYN -bundle -framework Foundation -framework IOKit -framework IOSurface -framework Metal -lobjc \
+			$DYN -bundle -Wl,-undefined,dynamic_lookup -framework Foundation -framework IOKit -framework IOSurface -framework Metal -lobjc \
 				-I$HM/include -o obj/HakiosMetal src/HakiosMetalCA.m $METAL_GPU $M2V_OBJS
 		else
 		$DYN -bundle -framework Foundation -framework Metal -lobjc -I$METAL_SRC -o obj/HakiosMetal $METAL_SRC/HakiosMetal.m \
