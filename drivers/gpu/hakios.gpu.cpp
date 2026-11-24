@@ -492,10 +492,19 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 	fBufferCount--;
 	fBufferBytes -= b->size;
 
-	bool busy = hakios_gpu_ready() && b->fence != 0 && !hakios_gpu_done(b->fence);
+	/*
+	 * The fence to wait for is not the one that last named this buffer but the last one given to the core at all:
+	 * taking its pages out of the GPU's address space while a submission is still on its way is what
+	 * "unmap ... while the core has done 1 of 2" was printed about (U-063), and a core that faults on such a
+	 * translation stays stopped for good (24 November). Fences are retired in order, so the last one covers
+	 * everything given before it.
+	 */
+	uint32_t last = hakios_gpu_ready() ? hakios_gpu_last() : 0;
+	uint32_t fence = b->fence > last ? b->fence : last;
+	bool busy = hakios_gpu_ready() && fence != 0 && !hakios_gpu_done(fence);
 
 	if (busy && fLeftCount == GPU_LEFT) {
-		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
+		busy = !gpuWait(fence, 1000);           /* (nowhere to keep it: this one is waited for) */
 	}
 	if (busy && fLeftCount < GPU_LEFT) {
 		struct gpu_left * left = &fLeft[fLeftCount++];
@@ -505,7 +514,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 		left->client = b->client;
 		left->address = b->address;
 		left->size = b->size;
-		left->fence = b->fence;
+		left->fence = fence;
 		left->flags = b->flags;
 	} else {
 		if (busy) {
@@ -1064,7 +1073,19 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			IOLockUnlock(gGPULock);
 			goto out;
 		}
-		addresses[count] = b->address + cmds[i].submit_offset;
+		/*
+		 * The address the core is given is 32 bits: a command buffer that starts near the top of the GPU's address
+		 * space must not wrap around into another buffer's (the sum is checked, not the parts).
+		 */
+		uint64_t at = (uint64_t) b->address + cmds[i].submit_offset;
+
+		if (at + cmds[i].size > 0xffffffffull) {
+			IOLog("HakiosGPU: command buffer %u of a submission ends past the 32-bit address space (buffer %u at %#x, offset %u, %u bytes): not taken\n",
+			    i, cmds[i].submit_idx, b->address, cmds[i].submit_offset, cmds[i].size);
+			IOLockUnlock(gGPULock);
+			goto out;
+		}
+		addresses[count] = (uint32_t) at;
 		words[count++] = cmds[i].size / 4;
 	}
 	request->fence = hakios_gpu_submit(addresses, words, count);
