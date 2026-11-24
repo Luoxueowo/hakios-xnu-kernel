@@ -182,6 +182,15 @@ struct hakios_show {
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
 static bool gGPUReported;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
+/*
+ * Whether a surface's pixels are pushed out of the processor's cache on every submission that names them.
+ * They have to be when the processor writes them and the GPU reads them. With fb_native=2 the DPU reads the
+ * pixels where they are and nothing on the processor does: the push is then 2.8 MB of cache maintenance a
+ * submission, some 11 MB a frame, and about 7 ms of the window server's time a frame (24 November, with
+ * glFlush() at 7-9 ms a frame and frames at 30 a second). Left out there; gpu_cache=1 asks for it anyway,
+ * and without fb_native=2 it stays as it was.
+ */
+static bool gGPUCacheSurfaces = true;
 
 /* What the last seconds' submissions were and cost here, for the log. */
 static struct {
@@ -330,6 +339,15 @@ HakiosGPUStart(void)
 	uint32_t cached = 0;
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
+	{
+		uint32_t native = 0, wanted = 1;
+
+		gGPUCacheSurfaces = !(PE_parse_boot_argn("fb_native", &native, sizeof(native)) && native == 2) ||
+		    (PE_parse_boot_argn("gpu_cache", &wanted, sizeof(wanted)) && wanted != 0);
+	}
+	IOLog("HakiosGPU: a surface's pixels are %s on each submission (fb_native=2 leaves them in the cache; gpu_cache=1 pushes them anyway)\n",
+	    gGPUCacheSurfaces ? "pushed out of the cache" : "left in the cache");
+		
 	gGPULock = IOLockAlloc();
 	gpu = OSTypeAlloc(HakiosGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
@@ -1029,8 +1047,12 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			continue;
 		}
 		if (b->surface != NULL) {
-			uint32_t seed = b->surface->shared()->seed;
+			uint32_t seed;
 
+			if (!gGPUCacheSurfaces) {
+				continue;                       /* (fb_native=2: the display reads them where they are, the processor does not) */
+			}
+			seed = b->surface->shared()->seed;
 			if (seed == b->seed && !b->seen && began - b->pushed < again) {
 				continue;
 			}
