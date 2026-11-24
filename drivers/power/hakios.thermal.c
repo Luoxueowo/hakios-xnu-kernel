@@ -64,6 +64,8 @@ extern void hakios_var_save_on_return(void);
 extern void hakios_adreno_stop(void);
 extern void hakios_wifi_stop(void);
 extern void hakios_adsp_stop(void);
+/* (the SoC, to know whose sensors these are: 0x00100000 is the MIX 2S's SDM845) */
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
 
 SYSCTL_DECL(_kern_hakios);
 
@@ -90,14 +92,19 @@ say(const char *format, ...)
 #define TEMP_MIN_TENTHS         (-400)
 #define TEMP_MAX_TENTHS         1600
 
-/* made by tools/dt-thermal.py from the phone's device tree: name, block, sensor, slow down at, gives up at (millidegrees) */
+/*
+ * The sensors, by name: which TSENS block (the address of its readings), which number there, the temperature the
+ * vendor starts to slow things down at, and the one it gives up at (millidegrees). Both tables are made by
+ * tools/dt-thermal.py from the device trees of the two phones this tree is built for; which one is used is
+ * decided at start from the SoC (see thermal_init()).
+ */
 static const struct sensor_info {
 	const char *    name;
 	uint32_t        tm;
 	uint32_t        number;
 	int32_t         slow_mc;
 	int32_t         limit_mc;
-} sensors[] = {
+} redwood_sensors[] = {
 	{ "aoss-0", 0xc263000, 0, 115000, 125000 },
 	{ "cpu-0-0", 0xc263000, 1, 110000, 125000 },
 	{ "cpu-0-1", 0xc263000, 2, 110000, 125000 },
@@ -126,13 +133,45 @@ static const struct sensor_info {
 	{ "mdmss-3", 0xc265000, 10, 95000, 125000 },
 	{ "camera-0", 0xc265000, 11, 100000, 125000 },
 };
-#define NSENSORS        ((unsigned)(sizeof(sensors) / sizeof(sensors[0])))
+
+/*
+ * The MIX 2S (SDM845), from mu_aloha_platforms/.../xiaomi-polaris/.../android-polaris.dtb:
+ * /soc/tsens@c222000 and tsens@c223000 (qcom,sdm845-tsens, readings at 0xc263000 and 0xc265000). The vendor's
+ * zones are the "-lowf" ones here; their only trip is the 125 degree "give up" one, so slow_mc equals limit_mc.
+ */
+static const struct sensor_info polaris_sensors[] = {
+	{ "aoss0", 0xc263000, 0, 125000, 125000 },
+	{ "cpu0-silver", 0xc263000, 1, 125000, 125000 },
+	{ "cpu1-silver", 0xc263000, 2, 125000, 125000 },
+	{ "cpu2-silver", 0xc263000, 3, 125000, 125000 },
+	{ "cpu3-silver", 0xc263000, 4, 125000, 125000 },
+	{ "kryo-l3-0", 0xc263000, 5, 125000, 125000 },
+	{ "kryo-l3-1", 0xc263000, 6, 125000, 125000 },
+	{ "cpu0-gold", 0xc263000, 7, 125000, 125000 },
+	{ "cpu1-gold", 0xc263000, 8, 125000, 125000 },
+	{ "cpu2-gold", 0xc263000, 9, 125000, 125000 },
+	{ "cpu3-gold", 0xc263000, 10, 125000, 125000 },
+	{ "gpu0", 0xc263000, 11, 125000, 125000 },
+	{ "gpu1", 0xc263000, 12, 125000, 125000 },
+	{ "aoss1", 0xc265000, 0, 125000, 125000 },
+	{ "mdm-dsp", 0xc265000, 1, 125000, 125000 },
+	{ "ddr", 0xc265000, 2, 125000, 125000 },
+	{ "wlan", 0xc265000, 3, 125000, 125000 },
+	{ "compute-hvx", 0xc265000, 4, 125000, 125000 },
+	{ "camera", 0xc265000, 5, 125000, 125000 },
+	{ "mmss", 0xc265000, 6, 125000, 125000 },
+	{ "mdm-core", 0xc265000, 7, 125000, 125000 },
+};
+
+#define MAX_SENSORS     32
+static const struct sensor_info * sensors = redwood_sensors;
+static unsigned nsensors = sizeof(redwood_sensors) / sizeof(redwood_sensors[0]);
 #define REFERENCE_TM0   0xc263000u
 #define REFERENCE_TM1   0xc265000u
 
 static vm_offset_t tm_va[2];
 static uint32_t tm_pa[2] = { REFERENCE_TM0, REFERENCE_TM1 };
-static int32_t tenths[NSENSORS];                /* the last good reading; INT32_MIN: none yet */
+static int32_t tenths[MAX_SENSORS];                /* the last good reading; INT32_MIN: none yet */
 static uint32_t poll_ms = 2000, log_seconds = 60, stop_celsius = 105;
 static uint64_t last_log, reads;
 static int strikes, last_step;
@@ -140,7 +179,7 @@ static bool stopping;
 
 static int thermal_max_mc = -273000;
 static char thermal_hottest[16] = "";
-static char thermal_list[NSENSORS * 16 + 8];
+static char thermal_list[MAX_SENSORS * 16 + 8];
 static int thermal_reads_value;
 
 SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_max_mc, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_max_mc, 0,
@@ -175,7 +214,7 @@ look(void)
 	char list[sizeof(thermal_list)], one[16];
 
 	list[0] = 0;
-	for (unsigned i = 0; i < NSENSORS; i++) {
+	for (unsigned i = 0; i < nsensors; i++) {
 		uint32_t status = *(volatile uint32_t *)(tm_va[sensors[i].tm == REFERENCE_TM0 ? 0 : 1] + TM_STATUS(sensors[i].number));
 		int32_t value = (int32_t)(status << 20) >> 20;
 
@@ -212,7 +251,7 @@ look(void)
 	seconds /= NSEC_PER_SEC;
 	if (step > last_step || last_log == 0 || (log_seconds != 0 && seconds >= log_seconds)) {
 		text_of(one, sizeof(one), hottest);
-		say("thermal: %u of %u sensors read; hottest %s at %s C; %s\n", good, NSENSORS, sensors[hot].name, one, thermal_list);
+		say("thermal: %u of %u sensors read; hottest %s at %s C; %s\n", good, nsensors, sensors[hot].name, one, thermal_list);
 		last_log = now;
 	}
 	last_step = step;
@@ -254,7 +293,12 @@ thermal_init(void)
 	if (!PE_parse_boot_argn("thermal", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
-	for (unsigned i = 0; i < NSENSORS; i++) {
+	/* (which phone's sensors: the same two blocks on both SoCs, but the MIX 2S's SDM845 numbers them its own way) */
+	if (pe_arm_get_soc_base_phys() == 0x00100000UL) {
+		sensors = polaris_sensors;
+		nsensors = sizeof(polaris_sensors) / sizeof(polaris_sensors[0]);
+	}
+	for (unsigned i = 0; i < nsensors; i++) {
 		tenths[i] = INT32_MIN;
 	}
 	(void)PE_parse_boot_argn("thermal_tm0", &tm_pa[0], sizeof(tm_pa[0]));
@@ -275,7 +319,8 @@ thermal_init(void)
 			return;
 		}
 	}
-	say("thermal: %u sensors in two blocks (%#x, %#x), every %u ms; stop at %u C%s\n", NSENSORS, tm_pa[0], tm_pa[1], poll_ms,
+	say("thermal: %s: %u sensors in two blocks (%#x, %#x), every %u ms; stop at %u C%s\n",
+	    sensors == polaris_sensors ? "MIX 2S" : "POCO X5 Pro", nsensors, tm_pa[0], tm_pa[1], poll_ms,
 	    stop_celsius, stop_celsius ? "" : " (off)");
 	call = thread_call_allocate(tick, NULL);
 	tick(NULL, NULL);
