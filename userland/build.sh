@@ -111,7 +111,22 @@ DARWIN_JOBS=${JOBS-"
 	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
 	com.apple.SpringBoard com.apple.PosterBoard
+	com.apple.mediaserverd
+	com.apple.nanoregistryd
 "}
+# mediaserverd is where VideoToolbox decodes for every other process, a HEIC picture included -- the whole
+# wallpaper of Darwin userland 16 is HEIC -- and its decoder, VCPHEVC, is in the dyld shared cache, not on disk.
+# It does not come up on its own here: its main thread reads preferences through NanoPreferencesSync, which goes
+# to NanoRegistry and waits in a synchronous call for com.apple.nano.nanoregistry.paireddeviceregistry, and with
+# nanoregistryd not running nothing ever answers (the sampler of 24 November: NanoPreferencesSync -> NanoRegistry
+# -> dispatch_sync, while the window server waited in a synchronous CoreMedia call for the daemon's reply, drew
+# three frames, had the display blanked under it and never unblanked it again). With nanoregistryd beside it the
+# daemon serves, and the poster's pictures are decoded.
+# chronod (com.apple.chronoservices: the widget timelines) is NOT in the list: with it running some forty
+# widget and poster extensions come up -- MailWidgetExtension aborts, PassbookWidgetsExtension leaves corpses,
+# MusicWidgets, WeatherWidget, StocksWidget, SleepWidgetExtension and the rest stay -- and the frames of the
+# window server fall from 53-55 a second to 5 to 27 (24 November), the display driver itself idle at 0.8 ms a
+# frame. The wallpaper's decode does not need it.
 # Darwin's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # drivers/wifi/hakios.apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
 # networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.
@@ -252,7 +267,13 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
-		$DYN -bundle -framework CoreFoundation -o obj/HakiosAudio src/audio_plugin.c
+		# NOAUDIO=1 leaves it out (24 November: with mediaserverd running the window server stops at 00:01:05 and
+		# the display is never unblanked; this says whether the HAL and this plug-in are what it waits for)
+		if [ -n "${NOAUDIO:-}" ]; then
+			rm -f obj/HakiosAudio
+		else
+			$DYN -bundle -framework CoreFoundation -o obj/HakiosAudio src/audio_plugin.c
+		fi
 		# the plug-in Metal loads when the kernel names it (boot-arg metal=1): a device, its buffers and the libraries it reads
 		# (src/HakiosMetal.m, src/hakios_metallib.c; tools/metal-plugin-test.sh tries the same objects on a Mac)
 		# With hakios-metal (hakios-metal/ in this tree, `make ios` in it; or one beside this tree, or at HAKIOS_METAL=): buffers in
