@@ -123,22 +123,29 @@ HakiosBattery::report(const struct hakios_battery_state * b)
 	/*
 	 * The fuel gauge stops at 99: it rounds its state of charge down, takes a while to learn what a full charge is
 	 * (AppleRawMaxCapacity is a few mAh above what it counts), and on this phone it never reports the charger as
-	 * finished either -- 99% and about 180 mA at 4.35 V for as long as it is plugged in. iOS shows a full battery
-	 * once the charge is done, so the last point is taken when the charger has stopped pushing (charging off), or
-	 * when it is down to a trickle into a battery already at 4.3 V; not while it is still charging hard.
+	 * finished either -- 99% and about 180 mA at 4.35 V for as long as it is plugged in.
+	 *
+	 * iOS shows a full battery from the moment the charge is done and keeps it there when the cable comes out, so
+	 * the last point is taken when the charger has stopped pushing (charging off), when it says it is full, or when
+	 * what is going in is a trickle (1 A or less) into a battery already at 4.30 V -- and then it stays taken until
+	 * the gauge itself comes down to 98, whatever the cable does. (Taken only while the cable is in, it fell back
+	 * to 99% the moment the phone was unplugged.)
 	 */
-	bool trickle = b->current_ua > 0 && b->current_ua <= 500000;    /* (500 mA) */
-
-	if (b->external && percent >= 99 && percent < 100 &&
-	    (!charging || b->status == 4 || (trickle && b->voltage_uv >= 4300000))) {
+	static bool fullLatched;
+	bool trickle = b->current_ua > 0 && b->current_ua <= 1000000;   /* (1 A) */
+	if (b->external && percent >= 99 &&
+	    (b->status == 4 || !charging || (trickle && b->voltage_uv >= 4260000))) {
 		static bool said;
 
-		percent = 100;
-		if (!said) {
+		if (!fullLatched && !said) {
 			said = true;
-			IOLog("HakiosBattery: 99%% on the charger at %d mV and %d mA: shown as a full battery (100%%)\n",
+			IOLog("HakiosBattery: 99%% on the charger at %d mV and %d mA: a full battery, kept until 98%%\n",
 			    b->voltage_uv / 1000, b->current_ua / 1000);
 		}
+		fullLatched = true;
+	}
+	if (fullLatched && percent >= 99) {
+		percent = 100;
 	}
 	setBatteryInstalled(b->present != 0);
 	setExternalConnected(b->external != 0);
