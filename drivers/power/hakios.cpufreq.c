@@ -13,12 +13,14 @@
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
@@ -557,6 +559,469 @@ hakios_ddr_quiesce(void)
 	tell("ddr: memory bandwidth vote %u for the loader: %s\n", rest, done ? "done" : "FAILED");
 }
 
+/*
+ * The OSM: what the SDM845 has in place of EPSS, and what the MIX 2S's cores are clocked by. Two domains of a
+ * table of rows -- the little cores at 0x17d43000, the big at 0x17d45800 -- and one register each to ask for a
+ * row (PERF_STATE, +0x920); the hardware switches clock and supply itself, so one write is all it takes.
+ * Linux: drivers/cpufreq/qcom-cpufreq-hw.c ("osm" variant), sdm845.dtsi (cpufreq@17d43000, domain 0 the little
+ * cores, domain 1 at 17d45800 the big). The register layout is the Mi 8's (dipper-xnu,
+ * patches/xnu-mi8.patch, EXP-0127), which is the same SoC family and was measured on the phone.
+ */
+#define OSM_LITTLE_PHYS         0x17d43000UL
+#define OSM_BIG_PHYS            0x17d45800UL
+#define OSM_DOMAIN_SIZE         0x1400UL
+#define OSM_ENABLE              0x000
+#define OSM_LUT                 0x110           /* a row every 32 bytes: [31:30] clock source, [7:0] multiples of 19.2 MHz */
+#define OSM_LUT_STRIDE          32
+#define OSM_TABLE_ROWS          40
+#define OSM_PERF_STATE          0x920
+
+struct osm_domain {
+	const char *	name;
+	uint64_t	phys;
+	vm_offset_t	base;
+	uint32_t	rows;
+	uint32_t	khz[OSM_TABLE_ROWS];
+	uint32_t	row;			/* the row PERF_STATE holds */
+	uint32_t	top;			/* the row it was in when it was opened: the governor never goes above it */
+	bool		open;
+};
+
+static struct osm_domain osm[2] = {
+	{ .name = "little", .phys = OSM_LITTLE_PHYS },
+	{ .name = "big", .phys = OSM_BIG_PHYS },
+};
+
+static void osm_note(struct osm_domain * d);	/* (the read-only sysctl views of a domain, see below) */
+
+static uint32_t
+osm_rows(vm_offset_t base, uint32_t khz[OSM_TABLE_ROWS])
+{
+	uint32_t rows = 0;
+
+	for (uint32_t row = 0; row < OSM_TABLE_ROWS; row++) {
+		uint32_t entry = *(volatile uint32_t *)(base + OSM_LUT + OSM_LUT_STRIDE * row);
+		uint32_t value;
+
+		if (entry == 0) {
+			break;
+		}
+		value = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
+		/* (the table ends by repeating its last row: the same frequency is not another step) */
+		if (rows > 0 && value <= khz[rows - 1]) {
+			break;
+		}
+		khz[rows++] = value;
+	}
+	return rows;
+}
+
+/* What the table holds and what row the hardware is in. PERF_STATE keeps its value across a kernel run. */
+static bool
+osm_open(struct osm_domain * d, uint32_t cores)
+{
+	uint32_t state;
+
+	d->base = ml_io_map((vm_offset_t) d->phys, OSM_DOMAIN_SIZE);
+	if (d->base == 0) {
+		tell("cpufreq: the OSM's %s domain at %#llx cannot be mapped; left alone\n", d->name, d->phys);
+		return false;
+	}
+	d->rows = osm_rows(d->base, d->khz);
+	state = *(volatile uint32_t *)(d->base + OSM_PERF_STATE);
+	if (d->rows == 0) {
+		tell("cpufreq: the OSM's %s domain at %#llx has %#x in ENABLE and no rows of frequencies; left alone\n",
+		    d->name, d->phys, *(volatile uint32_t *)(d->base + OSM_ENABLE));
+		return false;
+	}
+	d->row = state < d->rows ? state : 0;
+	d->top = d->row;
+	d->open = true;
+	tell("cpufreq: the OSM's %s domain (%u of our cores): %u rows, %u to %u MHz; in row %u, %u MHz\n", d->name,
+	    cores, d->rows, d->khz[0] / 1000, d->khz[d->rows - 1] / 1000, state,
+	    state < d->rows ? d->khz[state] / 1000 : 0);
+	osm_note(d);
+	return true;
+}
+
+/* The governor's one write: the row asked for, and what the hardware made of it two milliseconds later. */
+static void
+osm_set(struct osm_domain * d, uint32_t row)
+{
+	uint32_t now;
+
+	if (!d->open) {
+		return;
+	}
+	if (row >= d->rows) {
+		row = d->rows - 1;
+	}
+	*(volatile uint32_t *)(d->base + OSM_PERF_STATE) = row;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	d->row = row;
+	delay_for_interval(2, NSEC_PER_MSEC);
+	now = *(volatile uint32_t *)(d->base + OSM_PERF_STATE);
+	tell("cpufreq: the OSM's %s domain: row %u asked for (%u MHz); PERF_STATE now %u, %u MHz\n", d->name, row,
+	    d->khz[row] / 1000, now, now < d->rows ? d->khz[now] / 1000 : 0);
+	osm_note(d);
+}
+
+/*
+ * One domain put at the row it is asked for: -1 leaves it where the boot loader left it (and that row is the
+ * ceiling), -2 asks for the top row, anything else for that row. The row written becomes the ceiling the
+ * governor may go back up to.
+ */
+static void
+osm_apply(struct osm_domain * d, int want)
+{
+	if (!d->open) {
+		return;
+	}
+	if (want == -1 || d->rows == 0) {
+		d->top = d->row;
+		return;
+	}
+	if (want == -2 || (uint32_t) want >= d->rows) {
+		want = (int) d->rows - 1;
+	}
+	d->top = (uint32_t) want;
+	osm_set(d, (uint32_t) want);
+}
+
+/*
+ * The frequency the two domains are put at, from the boot-args:
+ *   cpufreq_observe=1        leave both as they are (read only)
+ *   cpufreq_row=N            both domains to row N
+ *   cpufreq_big_row=N        the big cores only; cpufreq_little_row=N the little ones
+ * and, without any of them, the top row of each: the boot loader leaves a modest one and there is no governor
+ * to raise it later. With cpufreq_gov= (see below) the big domain starts at the top and the governor brings it
+ * down as the phone warms, so the same default is right there too.
+ */
+static void
+osm_cpufreq(uint32_t cores_little, uint32_t cores_big)
+{
+	int little = -2, big = -2;              /* (row -2: the top one, unless it is said otherwise below) */
+	uint32_t row = 0, observe = 0;
+
+	if (PE_parse_boot_argn("cpufreq_observe", &observe, sizeof(observe)) && observe != 0) {
+		little = big = -1;              /* (read only: what the boot loader left, for a run that wants to know) */
+	}
+	if (PE_parse_boot_argn("cpufreq_row", &row, sizeof(row))) {
+		little = big = (int) row;
+	}
+	if (PE_parse_boot_argn("cpufreq_big_row", &row, sizeof(row))) {
+		big = (int) row;
+	}
+	if (PE_parse_boot_argn("cpufreq_little_row", &row, sizeof(row))) {
+		little = (int) row;
+	}
+	if (osm_open(&osm[0], cores_little)) {
+		osm_apply(&osm[0], little);
+	}
+	if (osm_open(&osm[1], cores_big)) {
+		osm_apply(&osm[1], big);
+	}
+}
+
+/* ---------------------------------------------------------------------------------------------------------
+ * The governor: the big cores' row from the SoC's own temperature, with hysteresis, as the Mi 8 does it
+ * (dipper-xnu, patches/xnu-mi8.patch: a target in degrees, two strikes to go down, four degrees of headroom to
+ * come back up, and the row it was in as the ceiling). The sensors are drivers/power/hakios.thermal.c's
+ * (boot-arg thermal=1): this reads the hottest of them every cpufreq_gov_ms milliseconds and says what it does.
+ * None of it writes a thermal block: the policy is ours, the hardware's thresholds are untouched.
+ *
+ *   cpufreq_gov=<C>      hold the hottest CPU sensor near C degrees (55 to 110; without it no governor)
+ *   cpufreq_gov_ms=<ms>  how often it is looked at (500 to 60000; 2000)
+ *
+ * Only rows below the one the domain was opened in are asked for, and never below cpufreq_gov_floor MHz (1600,
+ * as the Mi 8): the phone stays usable rather than cool. Ten readings in a row that make no sense (the thermal
+ * driver not started yet, sensors gone) put the big domain back at the top of the range.
+ */
+/*
+ * The CPU cores' own temperatures, read here rather than through drivers/power/hakios.thermal.c: this policy is
+ * the CPU governor's and it wants the cores, not the hottest thing on the SoC (a charging PMIC or the GPU would
+ * otherwise hold the cores down). SDM845's TSENS blocks are the same two the thermal driver reads: the readings
+ * at 0xc263000 and 0xc265000, one status word a sensor (0xa0 + 4*n), bits [11:0] tenths of a degree, signed, bit
+ * 21 set when there is a reading. The numbers are the MIX 2S's own device tree's (android-polaris.dtb,
+ * /soc/tsens@c222000: cpu0-silver 1 ... cpu3-silver 4, cpu0-gold 7 ... cpu3-gold 10).
+ */
+#define TSENS_TM0_PHYS		0xc263000UL
+#define TSENS_TM_SIZE		0x200
+#define TSENS_STATUS(sensor)	(0xa0 + 4 * (sensor))
+#define TSENS_VALID		(1u << 21)
+
+static vm_offset_t	tsens_tm;
+static const uint32_t	cpu_sensors[] = { 1, 2, 3, 4, 7, 8, 9, 10 };	/* (the little cores, then the big) */
+
+/* The hottest of our cores, in millidegrees; -273000 when no sensor has a reading. */
+static int
+cpu_temperature_mc(void)
+{
+	int32_t hottest = INT32_MIN;
+
+	if (tsens_tm == 0) {
+		return -273000;
+	}
+	for (unsigned i = 0; i < sizeof(cpu_sensors) / sizeof(cpu_sensors[0]); i++) {
+		uint32_t status = *(volatile uint32_t *)(tsens_tm + TSENS_STATUS(cpu_sensors[i]));
+		int32_t tenth = (int32_t) (status << 20) >> 20;
+
+		if (!(status & TSENS_VALID) || tenth < -400 || tenth > 1600) {
+			continue;
+		}
+		if (tenth > hottest) {
+			hottest = tenth;
+		}
+	}
+	return hottest == INT32_MIN ? -273000 : (int) hottest * 100;
+}
+
+static bool		govOn;
+static uint32_t		govTarget, govLittle, govMs = 2000, govFloor = 1600000;
+/*
+ * How many samples in a row the temperature has to be over (or under) the target before a row is given or taken
+ * back: going down is the slow one (five samples, ten seconds at the default interval), so a burst that the
+ * scheduler handles by itself does not cost a frequency step and the phone does not stutter on the way; coming
+ * back up is two samples. AOSP's rate limits are the same idea (up_rate_limit_us below down_rate_limit_us).
+ */
+static uint32_t		govDownStrikes = 5, govUpStrikes = 2;
+static uint32_t		govCap, govLow;			/* the row the big cores are allowed, and the lowest it goes to */
+static uint32_t		govCapLittle, govLowLittle;	/* the same for the little cores */
+static unsigned		govHot, govCool, govInvalid;	/* (the big cores' two strikes, and unreadable samples) */
+static unsigned		govLittleHot, govLittleCool;
+static uint64_t		govSamples, govDown, govUp;
+static thread_call_t	govCall;
+static int		cpu_gov_row_value = -1;	/* (the row it allows, for kern.hakios.cpu_gov_row) */
+
+static void govTick(thread_call_param_t p0, thread_call_param_t p1);
+
+/* The lowest row whose frequency is at least the floor: what the governor will go down to. */
+static uint32_t
+osm_floor_row(struct osm_domain * d, uint32_t khz)
+{
+	for (uint32_t row = 0; row < d->rows; row++) {
+		if (d->khz[row] >= khz) {
+			return row;
+		}
+	}
+	return d->rows - 1;
+}
+
+static void
+govApplyBig(uint32_t row, const char *reason)
+{
+	if (!osm[1].open || row > osm[1].top || row == osm[1].row) {
+		return;
+	}
+	cpu_gov_row_value = (int) row;
+	tell("cpufreq: gov: big %u -> %u (%u MHz), reason %s\n", osm[1].row, row, osm[1].khz[row] / 1000, reason);
+	osm_set(&osm[1], row);
+}
+
+/*
+ * The little cores are their own OSM domain with their own table (18 rows here against the big cores' 27), and
+ * they are the last to give: only once the big ones are down and it is still govLittle degrees do they lose a row,
+ * one at a time, and they come back only below govLittle - 4.
+ */
+static void
+govApplyLittle(uint32_t row, const char *reason)
+{
+	if (!osm[0].open || row > osm[0].top || row == osm[0].row) {
+		return;
+	}
+	tell("cpufreq: gov: little %u -> %u (%u MHz), reason %s\n", osm[0].row, row, osm[0].khz[row] / 1000, reason);
+	osm_set(&osm[0], row);
+}
+
+static void
+govSample(void)
+{
+	int mc = cpu_temperature_mc();
+
+	govSamples++;
+	if (mc <= -273000 + 1) {
+		/* (no sensor has a reading: after ten of those, back to the top, where the boot left the phone) */
+		govHot = govCool = govLittleHot = govLittleCool = 0;
+		if (++govInvalid >= 10) {
+			govInvalid = 0;
+			if (osm[1].open && osm[1].row != osm[1].top) {
+				govCap = osm[1].top;
+				govApplyBig(osm[1].top, "no temperature");
+				govUp++;
+			}
+			if (osm[0].open && osm[0].row != osm[0].top) {
+				govCapLittle = osm[0].top;
+				govApplyLittle(osm[0].top, "no temperature");
+			}
+		}
+		return;
+	}
+	govInvalid = 0;
+
+	/* The big cores: the first to answer, a row at a time, two strikes to go down, four degrees of headroom up. */
+	if (mc >= (int) (govTarget * 1000)) {
+		govCool = 0;
+		if (govCap <= govLow) {
+			govHot = 0;                             /* (at the bottom of what it may give) */
+		} else if (++govHot >= govDownStrikes) {
+			govHot = 0;
+			govCap--;
+			govDown++;
+			govApplyBig(govCap, "hot");
+		}
+	} else if (mc <= (int) ((govTarget - 4) * 1000)) {
+		govHot = 0;
+		if (++govCool >= govUpStrikes) {
+			govCool = 0;
+			if (govCap < osm[1].top) {
+				govCap++;
+				govUp++;
+				govApplyBig(govCap, "cool");
+			}
+		}
+	} else {
+		govHot = govCool = 0;
+	}
+
+	/* The little cores: their own, higher threshold, a row at a time (see govApplyLittle()). */
+	if (osm[0].open && mc >= (int) (govLittle * 1000)) {
+		govLittleCool = 0;
+		if (govCapLittle <= govLowLittle) {
+			govLittleHot = 0;
+		} else if (++govLittleHot >= govDownStrikes) {
+			govLittleHot = 0;
+			govCapLittle--;
+			govApplyLittle(govCapLittle, "hot");
+		}
+	} else if (osm[0].open && mc <= (int) ((govLittle - 4) * 1000)) {
+		govLittleHot = 0;
+		if (++govLittleCool >= govUpStrikes && govCapLittle < osm[0].top) {
+			govLittleCool = 0;
+			govCapLittle++;
+			govApplyLittle(govCapLittle, "cool");
+		}
+	} else {
+		govLittleHot = govLittleCool = 0;
+	}
+}
+
+static void
+govTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+
+	govSample();
+	if (!govOn) {
+		return;
+	}
+	clock_interval_to_deadline(govMs, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(govCall, deadline);
+}
+
+/* Boot-args cpufreq_gov=<C> and cpufreq_gov_ms=<ms>: the big domain held near that temperature. */
+static void
+govStart(void)
+{
+	uint32_t target = 0, ms = 0;
+	uint64_t deadline;
+	int mc;
+
+	if (!PE_parse_boot_argn("cpufreq_gov", &target, sizeof(target)) || target == 0) {
+		return;
+	}
+	if (target < 55 || target > 110) {
+		tell("cpufreq: gov: %u degrees is outside 55 to 110; not started\n", target);
+		return;
+	}
+	if (!osm[1].open || osm[1].rows < 3) {
+		tell("cpufreq: gov: the big domain was not opened; not started\n");
+		return;
+	}
+	tsens_tm = ml_io_map((vm_offset_t) TSENS_TM0_PHYS, TSENS_TM_SIZE);
+	if (tsens_tm == 0) {
+		tell("cpufreq: gov: the CPU sensors at %#lx cannot be mapped; not started\n", (unsigned long) TSENS_TM0_PHYS);
+		return;
+	}
+	if (PE_parse_boot_argn("cpufreq_gov_ms", &ms, sizeof(ms)) && ms >= 500 && ms <= 60000) {
+		govMs = ms;
+	}
+	if (PE_parse_boot_argn("cpufreq_gov_down", &ms, sizeof(ms)) && ms >= 1 && ms <= 120) {
+		govDownStrikes = ms;
+	}
+	if (PE_parse_boot_argn("cpufreq_gov_up", &ms, sizeof(ms)) && ms >= 1 && ms <= 120) {
+		govUpStrikes = ms;
+	}
+	govTarget = target;
+	/*
+	 * The little cores are the last to give: cpufreq_gov_little=<C>, eight degrees above the big ones' target
+	 * without it (and never above 110). They go down to the bottom of their own table, a row at a time.
+	 */
+	govLittle = target + 8;
+	if (PE_parse_boot_argn("cpufreq_gov_little", &ms, sizeof(ms)) && ms > target && ms <= 110) {
+		govLittle = ms;
+	}
+	if (govLittle > 110) {
+		govLittle = 110;
+	}
+	govLow = osm_floor_row(&osm[1], govFloor);
+	if (govLow >= osm[1].top) {
+		govLow = osm[1].top >= 2 ? osm[1].top - 2 : 0;   /* (no row at or above the floor: two below the top) */
+	}
+	govCap = osm[1].top;
+	govCapLittle = osm[0].open ? osm[0].top : 0;
+	govLowLittle = 0;
+	cpu_gov_row_value = (int) govCap;
+	govCall = thread_call_allocate(govTick, NULL);
+	if (govCall == NULL) {
+		tell("cpufreq: gov: no thread call; not started\n");
+		return;
+	}
+	govOn = true;
+	mc = cpu_temperature_mc();
+	clock_interval_to_deadline(govMs, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(govCall, deadline);
+	tell("cpufreq: gov: the big cores held near %u degrees (rows %u to %u, %u to %u MHz), the little ones only "
+	    "above %u (rows 0 to %u, up to %u MHz), looked at every %u ms (%u samples down, %u up); %s\n",
+	    govTarget, govLow, osm[1].top, osm[1].khz[govLow] / 1000, osm[1].khz[osm[1].top] / 1000, govLittle,
+	    osm[0].open ? osm[0].top : 0, osm[0].open ? osm[0].khz[osm[0].top] / 1000 : 0, govMs,
+	    govDownStrikes, govUpStrikes,
+	    mc > -273000 + 1 ? "the CPU sensors are being read" : "no CPU sensor has a reading yet");
+}
+
+/*
+ * What the two domains are at, for user space: kern.hakios.cpu_big_mhz, cpu_little_mhz, cpu_big_row,
+ * cpu_little_row and cpu_gov_row (-1: no governor). The rows are the boot-arg/govenor's writing, so these are
+ * read-only views; osm_set() and govApply() keep them up to date.
+ */
+static int	cpu_big_mhz_value, cpu_little_mhz_value;
+static int	cpu_big_row_value, cpu_little_row_value;
+
+static void
+osm_note(struct osm_domain * d)
+{
+	int mhz = d->open && d->row < d->rows ? (int) (d->khz[d->row] / 1000) : 0;
+
+	if (d == &osm[0]) {
+		cpu_little_mhz_value = mhz;
+		cpu_little_row_value = (int) d->row;
+	} else {
+		cpu_big_mhz_value = mhz;
+		cpu_big_row_value = (int) d->row;
+	}
+}
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_INT(_kern_hakios, OID_AUTO, cpu_big_mhz, CTLFLAG_RD | CTLFLAG_LOCKED, &cpu_big_mhz_value, 0,
+    "the clock the big cores' domain is asked for");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cpu_little_mhz, CTLFLAG_RD | CTLFLAG_LOCKED, &cpu_little_mhz_value, 0,
+    "the clock the little cores' domain is asked for");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cpu_big_row, CTLFLAG_RD | CTLFLAG_LOCKED, &cpu_big_row_value, 0,
+    "the row the big cores' domain is in (the last one is the fastest)");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cpu_little_row, CTLFLAG_RD | CTLFLAG_LOCKED, &cpu_little_row_value, 0,
+    "the row the little cores' domain is in");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cpu_gov_row, CTLFLAG_RD | CTLFLAG_LOCKED, &cpu_gov_row_value, 0,
+    "the row the temperature governor allows the big cores (-1: no governor)");
+
 void
 hakios_cpufreq_init(void)
 {
@@ -582,8 +1047,24 @@ hakios_cpufreq_init(void)
 	 * and 0x18591000 is some other block there. Refuse instead of writing rows into it.
 	 */
 	if (pe_arm_get_soc_base_phys() == 0x00100000UL) {
-		tell("cpufreq: the SDM845 has no EPSS at 0x18591000; its cores are left at the boot loader's clock "
-		    "(the OSM is not driven by this file)\n");
+		/*
+		 * The MIX 2S's SDM845 has nothing at the EPSS address: its cores are the OSM's, two domains of them
+		 * (see osm_cpufreq()). How fast a loop runs before and after says what the row asked for is worth.
+		 */
+		uint32_t little = 0, big = 0;
+
+		for (unsigned int i = 0; i < topology->num_cpus; i++) {
+			if (((topology->cpus[i].phys_id >> 8) & 0xff) < 4) {
+				little++;
+			} else {
+				big++;
+			}
+		}
+		here = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;
+		before = loop_speed();
+		osm_cpufreq(little, big);
+		printf("cpufreq: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
+		govStart();
 		return;
 	}
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
