@@ -715,6 +715,9 @@ IOMobileFramebuffer::flipSetup(void)
 	volatile uint32_t * top, * pipe, * ctl;
 	uint64_t physical, bytes, slotSize, slotPhysical;
 	uint32_t source, expectedSize;
+	IOBufferMemoryDescriptor * fallback;
+	IOPhysicalAddress fallbackPhysical;
+	IOByteCount fallbackSegment;
 	bool native;
 
 	if (gFBFlip == 0) {
@@ -816,12 +819,36 @@ IOMobileFramebuffer::flipSetup(void)
 		uint64_t slot = round_page((uint64_t) PAGE_SIZE + (uint64_t) 4352 * 2160);
 
 		if (physical + slotSize + slot * 3 <= POLARIS_DISPLAY_BASE + POLARIS_DISPLAY_BYTES) {
-			fFlipPhysical[0] = fFlipPhysical[1] = (uint32_t) physical;
-			fFlipBuffer[0] = fFlipBuffer[1] = fBase;
 			native = true;
 		} else {
 			IOLog("MiniIOMobileFramebuffer: fb_native=2: three %llu-byte slots after the framebuffer do not fit the 36 MiB region; copying\n",
 			    (unsigned long long) slot);
+		}
+	}
+	/*
+	 * A frame with partial layers cannot scan its IOSurfaces directly. Keep two independent fallback buffers for it:
+	 * aliasing both slots to the firmware framebuffer means flipPresent() rewrites the very memory the DPU is scanning,
+	 * which tears on transitions such as the lock screen. These live outside the reserved IOSurface pool so the three
+	 * native surfaces keep their existing lifetime and the full-screen fast path stays direct.
+	 */
+	if (native) {
+		fallback = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, (mach_vm_size_t) (slotSize * 2), 0xffffffffULL);
+		fallbackSegment = 0;
+		fallbackPhysical = fallback != NULL ? fallback->getPhysicalSegment(0, &fallbackSegment, 0) : 0;
+		if (fallback == NULL || fallbackPhysical == 0 || fallbackSegment < slotSize * 2 ||
+		    fallbackPhysical + slotSize * 2 > 0x100000000ull || fallback->getBytesNoCopy() == NULL) {
+			if (fallback != NULL) {
+				fallback->release();
+			}
+			native = false;
+			IOLog("MiniIOMobileFramebuffer: fb_native=2: no separate low-memory fallback buffers; using the reserved copy buffers\n");
+		} else {
+			fFlipDescriptor = fallback;
+			fFlipBuffer[0] = (uint8_t *) fallback->getBytesNoCopy();
+			fFlipBuffer[1] = fFlipBuffer[0] + slotSize;
+			fFlipPhysical[0] = (uint32_t) fallbackPhysical;
+			fFlipPhysical[1] = (uint32_t) (fallbackPhysical + slotSize);
 		}
 	}
 	if (!native) {
