@@ -138,11 +138,13 @@ python3 xnuloader/mkpayload.py -o "$PAYLOAD_PATH" \
 
 # Guard the resident/md0 contract used by direct boots. A legacy `bootdisk=`
 # entry is ignored by this loader and leaves root.apfs as md0.
-python3 - "$PAYLOAD_PATH" "$BOOT_ARGS" <<'PY'
+python3 - "$PAYLOAD_PATH" "$BOOT_ARGS" "$DEVICE" <<'PY'
+import re
 import struct
+from pathlib import Path
 import sys
 
-path, wanted_cmdline = sys.argv[1:]
+path, wanted_cmdline, device = sys.argv[1:]
 data = open(path, "rb").read()
 if len(data) < 32 or data[:4] != b"XNUP":
     raise SystemExit("build-boot: malformed XNUP payload")
@@ -170,6 +172,21 @@ if "bootdisk" in entries:
 cmdline = entries["cmdline"].split(b"\0", 1)[0].decode("utf-8")
 if cmdline != wanted_cmdline:
     raise SystemExit("build-boot: payload command line differs from BOOT_ARGS")
+if device == "polaris":
+    # Reserve the loader's direct boot prefix, including both shared pages
+    # and the version string from the packaged kernel.
+    prefix = "debug=0x8 ufs_shared_pa=0x" + "0" * 16
+    prefix += " battery_shared_pa=0x" + "0" * 16 + " "
+    version = entries.get("kernel.ver", b"").split(b"\0", 1)[0]
+    if version:
+        prefix += "hakios_kver=" + version.decode("ascii") + " "
+    if "screen_log=1" in cmdline.split():
+        prefix += "-v "
+    used = len(prefix.encode("ascii")) + len(cmdline.encode("utf-8"))
+    loader = Path("xnuloader/loader.c").read_text()
+    capacity = int(re.search(r"^#define BOOT_LINE_LENGTH\s+(\d+)$", loader, re.M)[1]) - 1
+    if used > capacity:
+        raise SystemExit(f"build-boot: Polaris command line needs {used} bytes; limit is {capacity}")
 print("build-boot: payload verified (resident=md0, ramdisk=md1)")
 PY
 

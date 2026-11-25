@@ -49,7 +49,7 @@ struct boot_video {
 	uint64_t v_baseAddr, v_display, v_rowBytes, v_width, v_height, v_depth;
 };
 
-#define BOOT_LINE_LENGTH 608
+#define BOOT_LINE_LENGTH 1024
 
 struct boot_args {
 	uint16_t revision;
@@ -3602,7 +3602,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/*
 	 * The payload's own command line, last. The kernel's boot_args holds BOOT_LINE_LENGTH characters and the
 	 * copy used to stop at the end without a word: a long line lost its tail (the last argument arrived
-	 * shortened and the kernel took it as that). Now it is said, with how much was lost.
+	 * shortened and the kernel took it as that). Refuse to boot with any missing arguments.
 	 */
 	/* Keep the kernel's -v flag consistent with the explicit screen policy. */
 	if (screen_log == 1 && n + 3 < BOOT_LINE_LENGTH) {
@@ -3620,8 +3620,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		ba->commandLine[n++] = *rest;
 	}
 	if (*rest != 0) {
-		print("WARNING: the kernel command line is TRUNCATED: %d characters of the payload's cmdline did not fit in the "
-		    "%d the kernel has; the last argument is cut\n", (uint64_t)str_len(rest), (uint64_t)(BOOT_LINE_LENGTH - 1));
+		print("ERROR: %d characters of the payload's cmdline did not fit in the "
+		    "%d-byte kernel command line; boot refused\n", (uint64_t)str_len(rest), (uint64_t)(BOOT_LINE_LENGTH - 1));
+		flush_log();
+		return 0;
 	}
 	print("cmdline: %d of %d characters\n", (uint64_t)n, (uint64_t)(BOOT_LINE_LENGTH - 1));
 
