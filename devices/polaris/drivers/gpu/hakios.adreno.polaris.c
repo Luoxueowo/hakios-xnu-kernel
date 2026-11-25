@@ -2758,6 +2758,31 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 	}
 }
 
+/*
+ * Pages the core still has work for, kept until a fence it has passed: unmapping them at once is what command
+ * buffers met (25 November: FAR 0x4e7a4400, inside the IOVA range and unmapped, "unmapped while busy 7 times",
+ * the window server waiting five seconds for each). The address is not given back either until then, or the
+ * next buffer would be mapped over pages that are still being read.
+ */
+struct keep_deferred {
+	uint64_t address, size;
+	uint32_t fence;
+};
+static struct keep_deferred keep_defer[64];
+static unsigned keep_defer_count;
+static uint32_t keep_deferred_total;
+
+static bool
+keep_address_deferred(uint64_t address)
+{
+	for (unsigned i = 0; i < keep_defer_count; i++) {
+		if (keep_defer[i].address == address) {
+			return true;
+		}
+	}
+	return false;
+}
+
 uint64_t
 hakios_gpu_address(uint64_t size)
 {
@@ -2777,11 +2802,16 @@ hakios_gpu_address(uint64_t size)
 		}
 	}
 	keep_refused++;
+	if (keep_refused <= 8) {
+		printf("adreno-polaris: gpu: no room for %llu bytes in the IOVA range (%u free blocks, %llu MB used of %llu)\n",
+		    (unsigned long long) size, keep_free_count, (unsigned long long) (keep_used >> 20),
+		    (unsigned long long) (KEEP_VA_SIZE >> 20));
+	}
 	return 0;
 }
 
-void
-hakios_gpu_address_free(uint64_t address, uint64_t size)
+static void
+keep_address_free_now(uint64_t address, uint64_t size)
 {
 	unsigned at;
 
@@ -2810,6 +2840,15 @@ hakios_gpu_address_free(uint64_t address, uint64_t size)
 	} else {
 		keep_lost += size;
 	}
+}
+
+void
+hakios_gpu_address_free(uint64_t address, uint64_t size)
+{
+	if (keep_address_deferred(address)) {
+		return;                 /* (the pages are the core's still: given back when it is done with them) */
+	}
+	keep_address_free_now(address, size);
 }
 
 void
@@ -2944,18 +2983,57 @@ hakios_gpu_mapped(void)
 
 static uint32_t keep_unmap_busy;
 
+static void keep_unmap_pages(uint64_t address, uint64_t size);
+
+/* The ones the core is done with now: pages unmapped, addresses given back. Called as fences pass. */
+static void
+keep_defer_flush(void)
+{
+	unsigned kept = 0;
+
+	for (unsigned i = 0; i < keep_defer_count; i++) {
+		if (!hakios_gpu_done(keep_defer[i].fence)) {
+			keep_defer[kept++] = keep_defer[i];
+			continue;
+		}
+		keep_unmap_pages(keep_defer[i].address, keep_defer[i].size);
+		keep_address_free_now(keep_defer[i].address, keep_defer[i].size);
+	}
+	keep_defer_count = kept;
+}
+
 void
 hakios_gpu_unmap(uint64_t address, uint64_t size)
 {
-	uint64_t va, rem;
+	keep_defer_flush();                             /* (whatever the core has finished with by now) */
 
 	if (!hakios_gpu_done(keep_fence)) {
-		keep_unmap_busy++;                      /* U-063: taken away while the core still has work */
-		if (keep_unmap_busy <= 8) {
-			printf("adreno-polaris: unmap %#llx+%#llx while the core has done %u of %u\n", address, size,
-			    *(volatile uint32_t *)(g3d_regions[2].memory + KEEP_FENCE_AT), keep_fence);
+		keep_unmap_busy++;
+		keep_deferred_total++;
+		if (keep_defer_count < sizeof(keep_defer) / sizeof(keep_defer[0])) {
+			keep_defer[keep_defer_count].address = address;
+			keep_defer[keep_defer_count].size = size;
+			keep_defer[keep_defer_count].fence = keep_fence;
+			keep_defer_count++;
+			if (keep_unmap_busy <= 8) {
+				printf("adreno-polaris: unmap %#llx+%#llx put off until the core has done fence %u\n", address,
+				    size, keep_fence);
+			}
+			return;
+		}
+		/* (the queue full: waited for, as it was before there was one) */
+		for (unsigned i = 0; i < 200 && !hakios_gpu_done(keep_fence); i++) {
+			delay_for_interval(100, NSEC_PER_USEC);
 		}
 	}
+	keep_unmap_pages(address, size);
+}
+
+static void
+keep_unmap_pages(uint64_t address, uint64_t size)
+{
+	uint64_t va, rem;
+
 	va = address & ~0xfffull;
 	rem = (size + 0xfffull) >> 12;
 
@@ -3062,6 +3140,7 @@ keep_peek(uint64_t va)
 }
 
 static uint32_t hakios_gpu_submit_inner(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+static void keep_defer_flush(void);
 
 uint32_t
 hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
@@ -3094,6 +3173,7 @@ hakios_gpu_submit_inner(const uint64_t *addresses, const uint32_t *words, uint32
 	if (++keep_fence == 0) {
 		keep_fence = 1;
 	}
+	keep_defer_flush();
 	keep_ring_cmd(CP_EVENT_WRITE_OP, 1);
 	keep_ring(EVENT_PC_CCU_INV_DEPTH);
 	keep_ring_cmd(CP_EVENT_WRITE_OP, 1);
